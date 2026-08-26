@@ -20,6 +20,8 @@ jobs:
       # lock - mints a short-lived Sigstore identity from this run, no
       # stored signing key.
       id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,5 +75,3 @@ jobs:
             release-lock.json release-lock.json.sig release-lock.json.pem \
             --title "Hof Platform v${{ inputs.release }}" \
             --notes "Signed release lock for the Hof platform. Verify with: cosign verify-blob --certificate release-lock.json.pem --signature release-lock.json.sig --certificate-identity-regexp '^https://github\\.com/vrubovoy/hof-ops/' --certificate-oidc-issuer https://token.actions.githubusercontent.com release-lock.json"
-        env:
-          GH_TOKEN: ${{ github.token }}

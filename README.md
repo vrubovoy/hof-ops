@@ -41,10 +41,16 @@ for the full plan this repo implements in stages.
 
 The contract foundation is implemented and covered by tests: three
 versioned JSON Schemas, the first service catalog, and cross-contract
-validation that schemas alone can't express. Host reconciliation, backup/
-restore, upgrade/rollback, first-admin bootstrap, and the installer are not
-implemented yet — see the Delivery Order in the plan linked above for what
-comes next.
+validation that schemas alone can't express. Every image-publishing repo
+signs its published digests (keyless Cosign) and attests an SBOM and build
+provenance; `scripts/build-release-lock.mjs` resolves and independently
+re-verifies all of that into a real, schema-valid `release-lock.json`, and
+[`.github/workflows/release.yml`](.github/workflows/release.yml) signs that
+file itself and publishes it as a GitHub Release
+(`gh release list --repo vrubovoy/hof-ops`). `hofctl`, host reconciliation,
+backup/restore, upgrade/rollback, first-admin bootstrap, and the installer
+are not implemented yet — see the Delivery Order in the plan linked above
+for what comes next.
 
 ## The three contracts
 
@@ -65,6 +71,33 @@ An operator only ever writes the first one — see
 [`examples/services.yml`](examples/services.yml) and
 [`examples/release-lock.json`](examples/release-lock.json) for filled-in
 examples of all three.
+
+## Cutting a release
+
+```sh
+gh workflow run release.yml --repo vrubovoy/hof-ops -f release=0.1.0
+```
+
+Resolves every catalog artifact's currently published GHCR digest,
+independently re-verifies its Cosign signature and SBOM/provenance
+attestations (a component can't be resolved without a valid one — this
+step doubles as delivery item 6's "verify component CI" and "verify
+signatures/provenance", since nothing gets signed and attested until its
+gating tests pass), assembles and validates `release-lock.json`, signs
+*that file* with its own keyless Cosign signature, and publishes it all as
+a GitHub Release. Verify a published lock file yourself:
+
+```sh
+cosign verify-blob \
+  --certificate release-lock.json.pem --signature release-lock.json.sig \
+  --certificate-identity-regexp '^https://github\.com/vrubovoy/hof-ops/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  release-lock.json
+```
+
+No integration matrix runs yet — bringing the platform up against a
+release lock's pinned digests needs the reconciler (delivery items 7–9),
+which doesn't exist yet.
 
 ## Development
 

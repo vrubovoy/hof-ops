@@ -3,6 +3,11 @@ services:
   - id: tor
     mandatory: true
     hostname: null
+    # Tor ships no custom image of its own - it runs the stock, upstream
+    # caddy:2-alpine image with a mounted Caddyfile. "gateway" pins that
+    # upstream digest for reproducibility; it has no Hof-built signature,
+    # SBOM, or provenance to attest (see the release-lock schema's
+    # thirdParty flag).
     artifacts: [gateway]
     dependsOn: []
     volumes: [caddy-data]
@@ -12,20 +17,24 @@ services:
   - id: schlussel
     mandatory: true
     hostname: auth
-    artifacts: [schlussel-backend, schlussel-frontend]
+    # Published as ghcr.io/vrubovoy/schlussel (no -backend suffix - its
+    # backend lives at the repo root, unlike the app services below).
+    artifacts: [schlussel, schlussel-frontend]
     dependsOn: [tor]
     volumes: [schlussel-data]
     health:
-      component: schlussel-backend
+      component: schlussel
       path: /health
   - id: schloss
     mandatory: true
     hostname: null
-    artifacts: [schloss-frontend]
+    # Frontend-only service; published as ghcr.io/vrubovoy/schloss (no
+    # -frontend suffix, unlike every other frontend image).
+    artifacts: [schloss]
     dependsOn: [tor, schlussel]
     volumes: []
     health:
-      component: schloss-frontend
+      component: schloss
       path: /
   - id: kuvert
     mandatory: false
@@ -84,9 +93,13 @@ services:
   - id: wachter
     mandatory: false
     hostname: null
-    artifacts: [wachter-api, wachter-agent]
+    # The API and its private Docker agent run the same image
+    # (backend/Dockerfile) as two different Compose services/commands -
+    # published as the single ghcr.io/vrubovoy/wachter-backend, not two
+    # separate images.
+    artifacts: [wachter-backend]
     dependsOn: [schloss]
     volumes: []
     health:
-      component: wachter-api
+      component: wachter-backend
       path: /ready

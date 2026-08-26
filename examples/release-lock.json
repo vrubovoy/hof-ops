@@ -11,172 +11,158 @@
   },
   "components": {
     "gateway": {
-      "source": "https://github.com/vrubovoy/hof-ops",
-      "revision": "1111111111111111111111111111111111111111",
-      "image": "ghcr.io/vrubovoy/hof-gateway@sha256:1111111111111111111111111111111111111111111111111111111111111111",
-      "signatureIdentity": "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/tags/v1.0.0",
-      "provenanceDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-      "sbomDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-      "configSchema": 1
+      "image": "docker.io/library/caddy@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "thirdParty": true
     },
-    "schlussel-backend": {
-      "source": "https://github.com/zudaR107/schlussel",
+    "schlussel": {
+      "source": "https://github.com/vrubovoy/schlussel",
       "revision": "50f4ac19508c9e394ad047374cb5157a9b142069",
-      "image": "ghcr.io/vrubovoy/schlussel-backend@sha256:2222222222222222222222222222222222222222222222222222222222222222",
-      "signatureIdentity": "https://github.com/zudaR107/schlussel/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "image": "ghcr.io/vrubovoy/schlussel@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "signatureIdentity": "https://github.com/vrubovoy/schlussel/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
       "sbomDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
       "configSchema": 1,
       "database": { "from": 1, "to": 1, "rollbackCompatible": true }
     },
     "schlussel-frontend": {
-      "source": "https://github.com/zudaR107/schlussel",
+      "source": "https://github.com/vrubovoy/schlussel",
       "revision": "50f4ac19508c9e394ad047374cb5157a9b142069",
       "image": "ghcr.io/vrubovoy/schlussel-frontend@sha256:3333333333333333333333333333333333333333333333333333333333333333",
-      "signatureIdentity": "https://github.com/zudaR107/schlussel/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "signatureIdentity": "https://github.com/vrubovoy/schlussel/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
       "sbomDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
       "configSchema": 1
     },
-    "schloss-frontend": {
-      "source": "https://github.com/zudaR107/schloss",
+    "schloss": {
+      "source": "https://github.com/vrubovoy/schloss",
       "revision": "94f784c678473369b27579b3e763dd51ce109156",
-      "image": "ghcr.io/vrubovoy/schloss-frontend@sha256:4444444444444444444444444444444444444444444444444444444444444444",
-      "signatureIdentity": "https://github.com/zudaR107/schloss/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "image": "ghcr.io/vrubovoy/schloss@sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "signatureIdentity": "https://github.com/vrubovoy/schloss/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
       "sbomDigest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
       "configSchema": 1
     },
     "kuvert-backend": {
-      "source": "https://github.com/zudaR107/kuvert",
+      "source": "https://github.com/vrubovoy/kuvert",
       "revision": "6e53ae9557995d59209bc03d8a6559758dd8522e",
       "image": "ghcr.io/vrubovoy/kuvert-backend@sha256:5555555555555555555555555555555555555555555555555555555555555555",
-      "signatureIdentity": "https://github.com/zudaR107/kuvert/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "signatureIdentity": "https://github.com/vrubovoy/kuvert/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
       "sbomDigest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
       "configSchema": 1,
       "database": { "from": 1, "to": 1, "rollbackCompatible": true }
     },
     "kuvert-frontend": {
-      "source": "https://github.com/zudaR107/kuvert",
+      "source": "https://github.com/vrubovoy/kuvert",
       "revision": "6e53ae9557995d59209bc03d8a6559758dd8522e",
       "image": "ghcr.io/vrubovoy/kuvert-frontend@sha256:6666666666666666666666666666666666666666666666666666666666666666",
-      "signatureIdentity": "https://github.com/zudaR107/kuvert/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "signatureIdentity": "https://github.com/vrubovoy/kuvert/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
       "sbomDigest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
       "configSchema": 1
     },
     "tafel-backend": {
-      "source": "https://github.com/zudaR107/tafel",
+      "source": "https://github.com/vrubovoy/tafel",
       "revision": "81def1e46f78235feb4d2d1406df9a251b7eddd0",
       "image": "ghcr.io/vrubovoy/tafel-backend@sha256:7777777777777777777777777777777777777777777777777777777777777777",
-      "signatureIdentity": "https://github.com/zudaR107/tafel/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "signatureIdentity": "https://github.com/vrubovoy/tafel/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
       "sbomDigest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
       "configSchema": 1,
       "database": { "from": 1, "to": 1, "rollbackCompatible": true }
     },
     "tafel-frontend": {
-      "source": "https://github.com/zudaR107/tafel",
+      "source": "https://github.com/vrubovoy/tafel",
       "revision": "81def1e46f78235feb4d2d1406df9a251b7eddd0",
       "image": "ghcr.io/vrubovoy/tafel-frontend@sha256:8888888888888888888888888888888888888888888888888888888888888888",
-      "signatureIdentity": "https://github.com/zudaR107/tafel/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "signatureIdentity": "https://github.com/vrubovoy/tafel/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
       "sbomDigest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
       "configSchema": 1
     },
     "zettel-backend": {
-      "source": "https://github.com/zudaR107/zettel",
+      "source": "https://github.com/vrubovoy/zettel",
       "revision": "00544fe4773379275f0e0645e2d7e3969644df99",
       "image": "ghcr.io/vrubovoy/zettel-backend@sha256:9999999999999999999999999999999999999999999999999999999999999999",
-      "signatureIdentity": "https://github.com/zudaR107/zettel/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "signatureIdentity": "https://github.com/vrubovoy/zettel/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
       "sbomDigest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
       "configSchema": 1,
       "database": { "from": 1, "to": 1, "rollbackCompatible": true }
     },
     "zettel-frontend": {
-      "source": "https://github.com/zudaR107/zettel",
+      "source": "https://github.com/vrubovoy/zettel",
       "revision": "00544fe4773379275f0e0645e2d7e3969644df99",
       "image": "ghcr.io/vrubovoy/zettel-frontend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "signatureIdentity": "https://github.com/zudaR107/zettel/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "signatureIdentity": "https://github.com/vrubovoy/zettel/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "sbomDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "configSchema": 1
     },
     "glocke-backend": {
-      "source": "https://github.com/zudaR107/glocke",
+      "source": "https://github.com/vrubovoy/glocke",
       "revision": "6a5cb3e9ea0016679906563a2e762aba22e773ac",
       "image": "ghcr.io/vrubovoy/glocke-backend@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "signatureIdentity": "https://github.com/zudaR107/glocke/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "signatureIdentity": "https://github.com/vrubovoy/glocke/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "sbomDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "configSchema": 1,
       "database": { "from": 1, "to": 1, "rollbackCompatible": true }
     },
     "glocke-frontend": {
-      "source": "https://github.com/zudaR107/glocke",
+      "source": "https://github.com/vrubovoy/glocke",
       "revision": "6a5cb3e9ea0016679906563a2e762aba22e773ac",
       "image": "ghcr.io/vrubovoy/glocke-frontend@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-      "signatureIdentity": "https://github.com/zudaR107/glocke/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "signatureIdentity": "https://github.com/vrubovoy/glocke/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
       "sbomDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
       "configSchema": 1
     },
     "schrank-backend": {
-      "source": "https://github.com/zudaR107/schrank",
+      "source": "https://github.com/vrubovoy/schrank",
       "revision": "19b37746299fc6a29eb62844efd312e7e5f2ea3f",
       "image": "ghcr.io/vrubovoy/schrank-backend@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-      "signatureIdentity": "https://github.com/zudaR107/schrank/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "signatureIdentity": "https://github.com/vrubovoy/schrank/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       "sbomDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       "configSchema": 1,
       "database": { "from": 1, "to": 1, "rollbackCompatible": true }
     },
     "schrank-frontend": {
-      "source": "https://github.com/zudaR107/schrank",
+      "source": "https://github.com/vrubovoy/schrank",
       "revision": "19b37746299fc6a29eb62844efd312e7e5f2ea3f",
       "image": "ghcr.io/vrubovoy/schrank-frontend@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-      "signatureIdentity": "https://github.com/zudaR107/schrank/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "signatureIdentity": "https://github.com/vrubovoy/schrank/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
       "sbomDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
       "configSchema": 1
     },
     "herold-backend": {
-      "source": "https://github.com/zudaR107/herold",
+      "source": "https://github.com/vrubovoy/herold",
       "revision": "f0c1efb66e7ea86821d250db4d84f29f07d1f91a",
       "image": "ghcr.io/vrubovoy/herold-backend@sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-      "signatureIdentity": "https://github.com/zudaR107/herold/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "signatureIdentity": "https://github.com/vrubovoy/herold/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "sbomDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "configSchema": 1,
       "database": { "from": 1, "to": 1, "rollbackCompatible": true }
     },
     "herold-frontend": {
-      "source": "https://github.com/zudaR107/herold",
+      "source": "https://github.com/vrubovoy/herold",
       "revision": "f0c1efb66e7ea86821d250db4d84f29f07d1f91a",
       "image": "ghcr.io/vrubovoy/herold-frontend@sha256:1212121212121212121212121212121212121212121212121212121212121212",
-      "signatureIdentity": "https://github.com/zudaR107/herold/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "signatureIdentity": "https://github.com/vrubovoy/herold/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
       "sbomDigest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
       "configSchema": 1
     },
-    "wachter-api": {
+    "wachter-backend": {
       "source": "https://github.com/vrubovoy/wachter",
       "revision": "2b639ceeb5a5ef76b8bbaf89e2493e89b7fefbf3",
-      "image": "ghcr.io/vrubovoy/wachter-api@sha256:1313131313131313131313131313131313131313131313131313131313131313",
-      "signatureIdentity": "https://github.com/vrubovoy/wachter/.github/workflows/publish.yml@refs/tags/v1.0.0",
+      "image": "ghcr.io/vrubovoy/wachter-backend@sha256:1313131313131313131313131313131313131313131313131313131313131313",
+      "signatureIdentity": "https://github.com/vrubovoy/wachter/.github/workflows/test.yml@refs/tags/v1.0.0",
       "provenanceDigest": "sha256:1313131313131313131313131313131313131313131313131313131313131313",
       "sbomDigest": "sha256:1313131313131313131313131313131313131313131313131313131313131313",
-      "configSchema": 1
-    },
-    "wachter-agent": {
-      "source": "https://github.com/vrubovoy/wachter",
-      "revision": "2b639ceeb5a5ef76b8bbaf89e2493e89b7fefbf3",
-      "image": "ghcr.io/vrubovoy/wachter-agent@sha256:1414141414141414141414141414141414141414141414141414141414141414",
-      "signatureIdentity": "https://github.com/vrubovoy/wachter/.github/workflows/publish.yml@refs/tags/v1.0.0",
-      "provenanceDigest": "sha256:1414141414141414141414141414141414141414141414141414141414141414",
-      "sbomDigest": "sha256:1414141414141414141414141414141414141414141414141414141414141414",
       "configSchema": 1
     }
   }

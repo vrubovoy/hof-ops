@@ -4,13 +4,16 @@
   "title": "Hof immutable release lock",
   "type": "object",
   "additionalProperties": false,
-  "required": ["apiVersion", "release", "minimumHofctlVersion", "catalogDigest", "ansibleEnvironment", "components"],
+  "required": ["apiVersion", "release", "minimumHofctlVersion", "catalogDigest", "components"],
   "properties": {
     "apiVersion": { "const": "hof.dev/release-lock/v1" },
     "release": { "$ref": "#/$defs/semver" },
     "minimumHofctlVersion": { "$ref": "#/$defs/semver" },
     "catalogDigest": { "$ref": "#/$defs/sha256" },
-    "ansibleEnvironment": { "$ref": "#/$defs/artifact" },
+    "ansibleEnvironment": {
+      "$comment": "Not required yet: delivery item 8 (Ansible reconciliation) hasn't published a real hof-ansible-ee image. Required once it does - no release-lock should reach hofctl's apply/upgrade path without one.",
+      "$ref": "#/$defs/artifact"
+    },
     "components": {
       "type": "object",
       "minProperties": 1,
@@ -59,7 +62,26 @@
     "component": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["source", "revision", "image", "signatureIdentity", "provenanceDigest", "sbomDigest", "configSchema"],
+      "oneOf": [
+        {
+          "required": ["source", "revision", "image", "signatureIdentity", "provenanceDigest", "sbomDigest", "configSchema"],
+          "properties": { "thirdParty": { "const": false } }
+        },
+        {
+          "$comment": "A pinned upstream image Hof doesn't build (e.g. Tor's stock Caddy base) - no Hof signature, SBOM, or provenance to attest, and no source revision of our own.",
+          "required": ["image", "thirdParty"],
+          "properties": {
+            "thirdParty": { "const": true },
+            "source": false,
+            "revision": false,
+            "signatureIdentity": false,
+            "provenanceDigest": false,
+            "sbomDigest": false,
+            "configSchema": false,
+            "database": false
+          }
+        }
+      ],
       "properties": {
         "source": { "type": "string", "format": "uri", "pattern": "^https://" },
         "revision": { "type": "string", "minLength": 1, "maxLength": 128 },
@@ -68,7 +90,8 @@
         "provenanceDigest": { "$ref": "#/$defs/sha256" },
         "sbomDigest": { "$ref": "#/$defs/sha256" },
         "configSchema": { "type": "integer", "minimum": 1 },
-        "database": { "$ref": "#/$defs/database" }
+        "database": { "$ref": "#/$defs/database" },
+        "thirdParty": { "type": "boolean", "default": false }
       }
     }
   }

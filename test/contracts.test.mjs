@@ -51,3 +51,19 @@ test("release lock must resolve every catalog artifact", async () => {
 
   assert.match(validateContracts(contracts).join("\n"), /missing catalog artifact kuvert-frontend/);
 });
+
+test("a third-party release-lock component cannot also claim a Hof signature", async () => {
+  const contracts = structuredClone(await loadContracts());
+  contracts.releaseLock.components.gateway.signatureIdentity = "https://github.com/vrubovoy/hof-ops";
+
+  const errors = validateContracts(contracts).join("\n");
+  assert.match(errors, /release lock\/components\/gateway: must match exactly one schema in oneOf/);
+});
+
+test("a self-built release-lock component cannot skip its signature", async () => {
+  const contracts = structuredClone(await loadContracts());
+  delete contracts.releaseLock.components["kuvert-backend"].signatureIdentity;
+
+  const errors = validateContracts(contracts).join("\n");
+  assert.match(errors, /release lock\/components\/kuvert-backend: must have required property 'signatureIdentity'/);
+});

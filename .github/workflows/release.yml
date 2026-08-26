@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release version (semver, e.g. 0.1.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      # Needed for keyless Cosign/OIDC signing of the assembled release
+      # lock - mints a short-lived Sigstore identity from this run, no
+      # stored signing key.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.10.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: sigstore/cosign-installer@v3
+
+      # Every catalog artifact is resolved against its real, currently
+      # published GHCR digest and independently re-verified (signature +
+      # SBOM + provenance attestations) here - this step *is* delivery
+      # item 6's "verify component CI / resolve digest / verify
+      # signatures and provenance" (a component can't have a valid,
+      # verifiable attestation without its gating test job having
+      # already passed, since every publish workflow requires that).
+      - name: Build release lock
+        run: node scripts/build-release-lock.mjs --release "${{ inputs.release }}" --out release-lock.json
+
+      - name: Sign release lock with keyless Cosign
+        run: |
+          cosign sign-blob --yes \
+            --output-signature release-lock.json.sig \
+            --output-certificate release-lock.json.pem \
+            release-lock.json
+
+      - name: Verify the signature we just produced
+        run: |
+          cosign verify-blob \
+            --certificate release-lock.json.pem \
+            --signature release-lock.json.sig \
+            --certificate-identity-regexp '^https://github\.com/vrubovoy/hof-ops/' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            release-lock.json
+
+      # No integration matrix yet - deferred. Actually bringing up the
+      # full platform against these pinned digests needs the reconciler
+      # (delivery items 7-9), which doesn't exist yet; running Tor's own
+      # Compose stack here would only prove `latest` still works, which
+      # every sibling repo's own CI already does.
+      - name: Publish GitHub Release
+        run: |
+          gh release create "v${{ inputs.release }}" \
+            release-lock.json release-lock.json.sig release-lock.json.pem \
+            --title "Hof Platform v${{ inputs.release }}" \
+            --notes "Signed release lock for the Hof platform. Verify with: cosign verify-blob --certificate release-lock.json.pem --signature release-lock.json.sig --certificate-identity-regexp '^https://github\\.com/vrubovoy/hof-ops/' --certificate-oidc-issuer https://token.actions.githubusercontent.com release-lock.json"
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -31,7 +31,11 @@ export async function loadContracts() {
 }
 
 export function validateContracts(contracts) {
-  const ajv = new Ajv2020({ allErrors: true, strict: true });
+  // strictRequired is relaxed only for the release-lock schema's
+  // component "third-party pin" branch, which intentionally requires
+  // `thirdParty` without also declaring it in a `properties` block of
+  // its own (that block lives one level up, shared by both branches).
+  const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false });
   addFormats(ajv);
 
   const errors = [];

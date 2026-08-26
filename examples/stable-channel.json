@@ -1,0 +1,8 @@
+{
+  "apiVersion": "hof.dev/channel/v1",
+  "channel": "stable",
+  "release": "1.0.0",
+  "tag": "v1.0.0",
+  "releaseLockDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "releaseUrl": "https://github.com/vrubovoy/hof-ops/releases/tag/v1.0.0"
+}

@@ -4,16 +4,14 @@
   "title": "Hof immutable release lock",
   "type": "object",
   "additionalProperties": false,
-  "required": ["apiVersion", "release", "minimumHofctlVersion", "catalogDigest", "components"],
+  "required": ["apiVersion", "release", "minimumHofctlVersion", "catalogDigest", "composeTemplateDigest", "components"],
   "properties": {
     "apiVersion": { "const": "hof.dev/release-lock/v1" },
     "release": { "$ref": "#/$defs/semver" },
     "minimumHofctlVersion": { "$ref": "#/$defs/semver" },
     "catalogDigest": { "$ref": "#/$defs/sha256" },
-    "ansibleEnvironment": {
-      "$comment": "Not required yet: delivery item 8 (Ansible reconciliation) hasn't published a real hof-ansible-ee image. Required once it does - no release-lock should reach hofctl's apply/upgrade path without one.",
-      "$ref": "#/$defs/artifact"
-    },
+    "composeTemplateDigest": { "$ref": "#/$defs/sha256" },
+    "ansibleEnvironment": { "$ref": "#/$defs/artifact" },
     "components": {
       "type": "object",
       "minProperties": 1,
@@ -28,11 +26,15 @@
     },
     "semver": {
       "type": "string",
-      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
     },
     "sha256": {
       "type": "string",
       "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
     },
     "image": {
       "type": "string",
@@ -41,10 +43,14 @@
     "artifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["image", "signatureIdentity", "provenanceDigest", "sbomDigest"],
+      "required": ["source", "revision", "sourceTag", "image", "signatureIdentity", "signatureOidcIssuer", "provenanceDigest", "sbomDigest"],
       "properties": {
+        "source": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/" },
+        "revision": { "$ref": "#/$defs/commit" },
+        "sourceTag": { "type": "string", "pattern": "^v?(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" },
         "image": { "$ref": "#/$defs/image" },
-        "signatureIdentity": { "type": "string", "minLength": 1 },
+        "signatureIdentity": { "type": "string", "pattern": "^https://github\\.com/" },
+        "signatureOidcIssuer": { "type": "string", "format": "uri", "pattern": "^https://" },
         "provenanceDigest": { "$ref": "#/$defs/sha256" },
         "sbomDigest": { "$ref": "#/$defs/sha256" }
       }
@@ -59,22 +65,33 @@
         "rollbackCompatible": { "type": "boolean" }
       }
     },
+    "thirdPartyTrust": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy", "upstream", "limitation"],
+      "properties": {
+        "policy": { "const": "digest-only" },
+        "upstream": { "type": "string", "minLength": 1 },
+        "limitation": { "type": "string", "minLength": 1 }
+      }
+    },
     "component": {
       "type": "object",
       "additionalProperties": false,
       "oneOf": [
         {
-          "required": ["source", "revision", "image", "signatureIdentity", "provenanceDigest", "sbomDigest", "configSchema"],
+          "required": ["source", "revision", "sourceTag", "image", "signatureIdentity", "signatureOidcIssuer", "provenanceDigest", "sbomDigest", "configSchema"],
           "properties": { "thirdParty": { "const": false } }
         },
         {
-          "$comment": "A pinned upstream image Hof doesn't build (e.g. Tor's stock Caddy base) - no Hof signature, SBOM, or provenance to attest, and no source revision of our own.",
-          "required": ["image", "thirdParty"],
+          "required": ["image", "thirdParty", "trust"],
           "properties": {
             "thirdParty": { "const": true },
             "source": false,
             "revision": false,
+            "sourceTag": false,
             "signatureIdentity": false,
+            "signatureOidcIssuer": false,
             "provenanceDigest": false,
             "sbomDigest": false,
             "configSchema": false,
@@ -83,15 +100,18 @@
         }
       ],
       "properties": {
-        "source": { "type": "string", "format": "uri", "pattern": "^https://" },
-        "revision": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "source": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/" },
+        "revision": { "$ref": "#/$defs/commit" },
+        "sourceTag": { "type": "string", "pattern": "^v?(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" },
         "image": { "$ref": "#/$defs/image" },
-        "signatureIdentity": { "type": "string", "minLength": 1 },
+        "signatureIdentity": { "type": "string", "pattern": "^https://github\\.com/" },
+        "signatureOidcIssuer": { "type": "string", "format": "uri", "pattern": "^https://" },
         "provenanceDigest": { "$ref": "#/$defs/sha256" },
         "sbomDigest": { "$ref": "#/$defs/sha256" },
         "configSchema": { "type": "integer", "minimum": 1 },
         "database": { "$ref": "#/$defs/database" },
-        "thirdParty": { "type": "boolean", "default": false }
+        "thirdParty": { "type": "boolean", "default": false },
+        "trust": { "$ref": "#/$defs/thirdPartyTrust" }
       }
     }
   }

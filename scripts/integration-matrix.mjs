@@ -1,0 +1,109 @@
+#!/usr/bin/env node
+
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+import YAML from "yaml";
+
+import { loadContracts, validateContracts } from "./contracts.mjs";
+import { renderTopology } from "./render-topology.mjs";
+
+const exec = promisify(execFile);
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function parseArgs(argv) {
+  const args = { lock: "examples/release-lock.json", runtime: false };
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--lock") args.lock = argv[++i];
+    else if (argv[i] === "--runtime") args.runtime = true;
+    else throw new Error(`unknown argument: ${argv[i]}`);
+  }
+  return args;
+}
+
+function digest(bytes) {
+  return "sha256:" + createHash("sha256").update(bytes).digest("hex");
+}
+
+async function dockerCompose(file, project, args, environment = process.env) {
+  return exec("docker", ["compose", "--project-name", project, "--file", file, ...args], {
+    maxBuffer: 16 * 1024 * 1024,
+    env: environment,
+  });
+}
+
+export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
+  const contracts = await loadContracts();
+  const fixtureDirectory = path.join(root, "test/fixtures/topologies");
+  const fixtureNames = (await readdir(fixtureDirectory)).filter((name) => name.endsWith(".yml")).sort();
+  if (fixtureNames.length < 2) throw new Error("integration matrix requires at least two topology fixtures");
+
+  const [lockBytes, catalogBytes, templateBytes] = await Promise.all([
+    readFile(path.resolve(root, lockPath)),
+    readFile(path.join(root, "catalog/services-v1.yaml")),
+    readFile(path.join(root, "scripts/render-topology.mjs")),
+  ]);
+  const lock = JSON.parse(lockBytes);
+  const catalog = YAML.parse(catalogBytes.toString("utf8"));
+  if (lock.catalogDigest !== digest(catalogBytes)) throw new Error("release lock catalog digest does not match");
+  if (lock.composeTemplateDigest !== digest(templateBytes)) {
+    throw new Error("release lock Compose-template digest does not match");
+  }
+
+  const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "hof-gate6-"));
+  try {
+    for (const fixtureName of fixtureNames) {
+      const manifest = YAML.parse(await readFile(path.join(fixtureDirectory, fixtureName), "utf8"));
+      const errors = validateContracts({ ...contracts, manifest, catalog, releaseLock: lock });
+      if (errors.length > 0) throw new Error(`${fixtureName}:\n${errors.join("\n")}`);
+      if (manifest.release !== lock.release) throw new Error(`${fixtureName}: release does not match pinned lock`);
+
+      const fixtureId = path.basename(fixtureName, ".yml");
+      const rendered = renderTopology({ ...contracts, manifest, catalog, releaseLock: lock });
+      const compose = rendered.compose;
+      compose.name = `hof-gate6-${fixtureId}`;
+      for (const service of Object.values(compose.services)) {
+        if (!service.image?.includes("@sha256:")) throw new Error(`${fixtureName}: image is not digest-pinned`);
+        if (!Object.values(lock.components).some((component) => component.image === service.image)) {
+          throw new Error(`${fixtureName}: generated Compose image is absent from the pinned lock`);
+        }
+      }
+      const composePath = path.join(temporaryDirectory, `${fixtureId}.json`);
+      await writeFile(composePath, JSON.stringify(compose, null, 2) + "\n");
+      const environment = { ...process.env };
+      for (const match of JSON.stringify(compose).matchAll(/\\?\$\{([A-Z0-9_]+):\?required\}/g)) {
+        environment[match[1]] = "gate6-contract-value";
+      }
+      await dockerCompose(composePath, compose.name, ["config", "--quiet"], environment);
+      const { stdout } = await dockerCompose(composePath, compose.name, ["config", "--images"], environment);
+      const renderedImages = new Set(stdout.trim().split("\n").filter(Boolean));
+      for (const service of Object.values(compose.services)) {
+        if (!renderedImages.has(service.image)) throw new Error(`${fixtureName}: Compose dropped ${service.image}`);
+      }
+
+      if (runtime) {
+        await dockerCompose(composePath, compose.name, ["pull", "--quiet"], environment);
+        try {
+          await dockerCompose(composePath, compose.name, ["create", "--no-build"], environment);
+        } finally {
+          await dockerCompose(composePath, compose.name, ["down", "--remove-orphans"], environment);
+        }
+      }
+      console.log(`${fixtureName}: pinned Compose ${runtime ? "config/runtime" : "config"} contract passed`);
+    }
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  runIntegrationMatrix(parseArgs(process.argv.slice(2))).catch((error) => {
+    console.error(error.stack ?? String(error));
+    process.exitCode = 1;
+  });
+}

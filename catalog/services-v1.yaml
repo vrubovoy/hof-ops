@@ -1,0 +1,92 @@
+apiVersion: hof.dev/catalog/v1
+services:
+  - id: tor
+    mandatory: true
+    hostname: null
+    artifacts: [gateway]
+    dependsOn: []
+    volumes: [caddy-data]
+    health:
+      component: gateway
+      path: /
+  - id: schlussel
+    mandatory: true
+    hostname: auth
+    artifacts: [schlussel-backend, schlussel-frontend]
+    dependsOn: [tor]
+    volumes: [schlussel-data]
+    health:
+      component: schlussel-backend
+      path: /health
+  - id: schloss
+    mandatory: true
+    hostname: null
+    artifacts: [schloss-frontend]
+    dependsOn: [tor, schlussel]
+    volumes: []
+    health:
+      component: schloss-frontend
+      path: /
+  - id: kuvert
+    mandatory: false
+    hostname: kuvert
+    artifacts: [kuvert-backend, kuvert-frontend]
+    dependsOn: [tor, schlussel]
+    volumes: [kuvert-data]
+    health:
+      component: kuvert-backend
+      path: /health
+  - id: tafel
+    mandatory: false
+    hostname: tafel
+    artifacts: [tafel-backend, tafel-frontend]
+    dependsOn: [tor, schlussel]
+    volumes: [tafel-data]
+    health:
+      component: tafel-backend
+      path: /health
+  - id: zettel
+    mandatory: false
+    hostname: zettel
+    artifacts: [zettel-backend, zettel-frontend]
+    dependsOn: [tor, schlussel]
+    volumes: [zettel-data]
+    health:
+      component: zettel-backend
+      path: /health
+  - id: glocke
+    mandatory: false
+    hostname: glocke
+    artifacts: [glocke-backend, glocke-frontend]
+    dependsOn: [tor, schlussel]
+    volumes: [glocke-data]
+    health:
+      component: glocke-backend
+      path: /ready
+  - id: schrank
+    mandatory: false
+    hostname: schrank
+    artifacts: [schrank-backend, schrank-frontend]
+    dependsOn: [tor, schlussel]
+    volumes: [schrank-data]
+    health:
+      component: schrank-backend
+      path: /ready
+  - id: herold
+    mandatory: false
+    hostname: herold
+    artifacts: [herold-backend, herold-frontend]
+    dependsOn: [tor, schlussel]
+    volumes: [herold-data]
+    health:
+      component: herold-backend
+      path: /ready
+  - id: wachter
+    mandatory: false
+    hostname: null
+    artifacts: [wachter-api, wachter-agent]
+    dependsOn: [schloss]
+    volumes: []
+    health:
+      component: wachter-api
+      path: /ready

@@ -1,0 +1,48 @@
+apiVersion: hof.dev/v1alpha1
+release: 1.0.0
+target:
+  host: hof.example.com
+  user: deploy
+  port: 22
+domains:
+  base: example.com
+tls:
+  mode: acme-http01
+  email: admin@example.com
+services:
+  kuvert:
+    enabled: true
+  tafel:
+    enabled: true
+  zettel:
+    enabled: true
+  glocke:
+    enabled: true
+  schrank:
+    enabled: false
+  herold:
+    enabled: true
+  wachter:
+    enabled: true
+features:
+  browserPush:
+    enabled: true
+    subject: mailto:admin@example.com
+backup:
+  schedule: "03:00"
+  destinations:
+    - name: local-primary
+      type: local
+      path: /var/backups/hof/restic
+      secretRef: backup-local
+    - name: s3-offsite
+      type: s3
+      bucket: example-hof-backups
+      prefix: production
+      endpoint: https://s3.example.com
+      region: eu-central-1
+      secretRef: backup-s3
+  retention:
+    daily: 7
+    weekly: 4
+    monthly: 6

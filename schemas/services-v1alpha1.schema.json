@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/services-v1alpha1.schema.json",
+  "title": "Hof desired state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "release", "target", "domains", "tls", "services", "backup"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/v1alpha1" },
+    "release": { "$ref": "#/$defs/semver" },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "user"],
+      "properties": {
+        "host": { "type": "string", "format": "hostname" },
+        "user": { "type": "string", "pattern": "^[a-z_][a-z0-9_-]{0,31}$" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 22 }
+      }
+    },
+    "domains": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base"],
+      "properties": {
+        "base": { "type": "string", "format": "hostname" }
+      }
+    },
+    "tls": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "email"],
+          "properties": {
+            "mode": { "const": "acme-http01" },
+            "email": { "type": "string", "format": "email" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "certificatePath", "privateKeyPath"],
+          "properties": {
+            "mode": { "const": "supplied" },
+            "certificatePath": { "$ref": "#/$defs/absolutePath" },
+            "privateKeyPath": { "$ref": "#/$defs/absolutePath" }
+          }
+        }
+      ]
+    },
+    "services": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kuvert": { "$ref": "#/$defs/serviceSelection" },
+        "tafel": { "$ref": "#/$defs/serviceSelection" },
+        "zettel": { "$ref": "#/$defs/serviceSelection" },
+        "glocke": { "$ref": "#/$defs/serviceSelection" },
+        "schrank": { "$ref": "#/$defs/serviceSelection" },
+        "herold": { "$ref": "#/$defs/serviceSelection" },
+        "wachter": { "$ref": "#/$defs/serviceSelection" }
+      }
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "browserPush": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "subject": {
+              "type": "string",
+              "pattern": "^(mailto:.+@.+|https://.+)$"
+            }
+          }
+        }
+      }
+    },
+    "backup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schedule", "destinations", "retention"],
+      "properties": {
+        "schedule": {
+          "type": "string",
+          "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$"
+        },
+        "destinations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/backupDestination" }
+        },
+        "retention": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["daily", "weekly", "monthly"],
+          "properties": {
+            "daily": { "type": "integer", "minimum": 1 },
+            "weekly": { "type": "integer", "minimum": 0 },
+            "monthly": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+    },
+    "absolutePath": {
+      "type": "string",
+      "pattern": "^/[^\\u0000]+$"
+    },
+    "serviceSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "backupDestination": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "type", "path", "secretRef"],
+          "properties": {
+            "name": { "$ref": "#/$defs/name" },
+            "type": { "const": "local" },
+            "path": { "$ref": "#/$defs/absolutePath" },
+            "secretRef": { "$ref": "#/$defs/name" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "type", "bucket", "secretRef"],
+          "properties": {
+            "name": { "$ref": "#/$defs/name" },
+            "type": { "const": "s3" },
+            "bucket": { "type": "string", "minLength": 3, "maxLength": 63 },
+            "prefix": { "type": "string", "pattern": "^[^/]?(?:.*[^/])?$" },
+            "endpoint": { "type": "string", "format": "uri", "pattern": "^https://" },
+            "region": { "type": "string", "minLength": 1 },
+            "secretRef": { "$ref": "#/$defs/name" }
+          }
+        }
+      ]
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}$"
+    }
+  }
+}

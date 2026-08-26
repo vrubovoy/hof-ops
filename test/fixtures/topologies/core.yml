@@ -1,0 +1,20 @@
+apiVersion: hof.dev/v1alpha1
+release: 1.0.0
+target: { host: core.example.com, user: deploy }
+domains: { base: core.example.com }
+tls: { mode: acme-http01, email: admin@example.com }
+services:
+  kuvert: { enabled: false }
+  tafel: { enabled: false }
+  zettel: { enabled: false }
+  glocke: { enabled: false }
+  schrank: { enabled: false }
+  herold: { enabled: false }
+  wachter: { enabled: false }
+features:
+  browserPush: { enabled: false }
+backup:
+  schedule: "03:00"
+  destinations:
+    - { name: local, type: local, path: /var/backups/hof, secretRef: backup-local }
+  retention: { daily: 7, weekly: 4, monthly: 6 }

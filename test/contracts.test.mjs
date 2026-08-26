@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { loadContracts, validateContracts } from "../scripts/contracts.mjs";
+import { assertReleaseVersion } from "../scripts/build-release-lock.mjs";
 
 test("repository contract examples are valid", async () => {
   const contracts = await loadContracts();
@@ -66,4 +67,36 @@ test("a self-built release-lock component cannot skip its signature", async () =
 
   const errors = validateContracts(contracts).join("\n");
   assert.match(errors, /release lock\/components\/kuvert-backend: must have required property 'signatureIdentity'/);
+});
+
+test("release selection requires every catalog artifact", async () => {
+  const contracts = structuredClone(await loadContracts());
+  delete contracts.releaseSelection.components["tafel-frontend"];
+  assert.match(validateContracts(contracts).join("\n"), /release selection: missing catalog artifact tafel-frontend/);
+});
+
+test("component image tags equal their explicitly selected versions", async () => {
+  const contracts = structuredClone(await loadContracts());
+  contracts.releaseSelection.components.schloss.image = "ghcr.io/vrubovoy/schloss:1.0.1";
+  assert.match(validateContracts(contracts).join("\n"), /image tag must equal v plus selected version/);
+});
+
+test("release versions are canonical stable semver", () => {
+  assert.doesNotThrow(() => assertReleaseVersion("1.2.3"));
+  for (const invalid of ["v1.2.3", "01.2.3", "1.2", "1.2.3-rc.1", "1.2.3+build"]) {
+    assert.throws(() => assertReleaseVersion(invalid), /canonical stable semver/);
+  }
+});
+
+test("third-party selections declare digest-only trust limitations", async () => {
+  const contracts = structuredClone(await loadContracts());
+  delete contracts.releaseSelection.components.gateway.trust.limitation;
+  assert.match(validateContracts(contracts).join("\n"), /must have required property 'limitation'/);
+});
+
+test("persistent backend selections require database compatibility metadata", async () => {
+  const contracts = structuredClone(await loadContracts());
+  contracts.releaseSelection.components["kuvert-backend"].databaseArtifact = false;
+  delete contracts.releaseSelection.components["kuvert-backend"].database;
+  assert.match(validateContracts(contracts).join("\n"), /databaseArtifact does not match catalog persistence/);
 });

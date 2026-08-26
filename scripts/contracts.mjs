@@ -17,17 +17,24 @@ async function readYaml(relativePath) {
 }
 
 export async function loadContracts() {
-  const [servicesSchema, catalogSchema, releaseLockSchema, manifest, catalog, releaseLock] =
+  const [servicesSchema, catalogSchema, releaseLockSchema, releaseSelectionSchema, stableChannelSchema, manifest, catalog, releaseLock, releaseSelection, stableChannel] =
     await Promise.all([
       readJson("schemas/services-v1alpha1.schema.json"),
       readJson("schemas/service-catalog-v1.schema.json"),
       readJson("schemas/release-lock-v1.schema.json"),
+      readJson("schemas/release-selection-v1.schema.json"),
+      readJson("schemas/stable-channel-v1.schema.json"),
       readYaml("examples/services.yml"),
       readYaml("catalog/services-v1.yaml"),
-      readJson("examples/release-lock.json")
+      readJson("examples/release-lock.json"),
+      readYaml("examples/release-selection.yml"),
+      readJson("examples/stable-channel.json")
     ]);
 
-  return { servicesSchema, catalogSchema, releaseLockSchema, manifest, catalog, releaseLock };
+  return {
+    servicesSchema, catalogSchema, releaseLockSchema, releaseSelectionSchema, stableChannelSchema,
+    manifest, catalog, releaseLock, releaseSelection, stableChannel,
+  };
 }
 
 export function validateContracts(contracts) {
@@ -44,6 +51,12 @@ export function validateContracts(contracts) {
     [contracts.catalogSchema, contracts.catalog, "service catalog"],
     [contracts.releaseLockSchema, contracts.releaseLock, "release lock"]
   ];
+  if (contracts.releaseSelectionSchema && contracts.releaseSelection) {
+    checks.push([contracts.releaseSelectionSchema, contracts.releaseSelection, "release selection"]);
+  }
+  if (contracts.stableChannelSchema && contracts.stableChannel) {
+    checks.push([contracts.stableChannelSchema, contracts.stableChannel, "stable channel"]);
+  }
 
   for (const [schema, value, label] of checks) {
     const validate = ajv.compile(schema);
@@ -57,6 +70,32 @@ export function validateContracts(contracts) {
   errors.push(...validateCatalog(contracts.catalog));
   errors.push(...validateManifest(contracts.manifest, contracts.catalog));
   errors.push(...validateReleaseLock(contracts.releaseLock, contracts.catalog));
+  if (contracts.releaseSelection) errors.push(...validateReleaseSelection(contracts.releaseSelection, contracts.catalog));
+  return errors;
+}
+
+function validateReleaseSelection(selection, catalog) {
+  const errors = [];
+  const expected = new Set((catalog.services ?? []).flatMap((service) => service.artifacts ?? []));
+  const databaseArtifacts = new Set(
+    (catalog.services ?? [])
+      .filter((service) => service.id !== "tor" && service.volumes.length > 0)
+      .map((service) => service.health.component)
+  );
+  const actual = new Set(Object.keys(selection.components ?? {}));
+  for (const artifact of expected) {
+    if (!actual.has(artifact)) errors.push(`release selection: missing catalog artifact ${artifact}`);
+  }
+  for (const artifact of actual) {
+    if (!expected.has(artifact)) errors.push(`release selection: unknown catalog artifact ${artifact}`);
+    const component = selection.components[artifact];
+    if (!component.thirdParty && !component.image.endsWith(`:v${component.version}`)) {
+      errors.push(`release selection: ${artifact} image tag must equal v plus selected version`);
+    }
+    if (!component.thirdParty && component.databaseArtifact !== databaseArtifacts.has(artifact)) {
+      errors.push(`release selection: ${artifact} databaseArtifact does not match catalog persistence`);
+    }
+  }
   return errors;
 }
 

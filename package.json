@@ -5,13 +5,18 @@
   "private": true,
   "license": "AGPL-3.0-or-later",
   "type": "module",
+  "bin": {
+    "hofctl": "scripts/hofctl.mjs"
+  },
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "validate": "node scripts/validate-contracts.mjs",
     "test": "node --test test/*.test.mjs",
-    "build-release-lock": "node scripts/build-release-lock.mjs"
+    "render": "node scripts/hofctl.mjs render",
+    "build-release-lock": "node scripts/build-release-lock.mjs",
+    "integration": "node scripts/integration-matrix.mjs"
   },
   "dependencies": {
     "ajv": "8.17.1",

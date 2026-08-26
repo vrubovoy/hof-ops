@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/release-selection-v1.schema.json",
+  "title": "Hof component release selection",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "release", "minimumHofctlVersion", "catalog", "composeTemplate", "components"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/release-selection/v1" },
+    "release": { "$ref": "#/$defs/semver" },
+    "minimumHofctlVersion": { "$ref": "#/$defs/semver" },
+    "catalog": { "$ref": "#/$defs/repositoryPath" },
+    "composeTemplate": { "const": "scripts/render-topology.mjs" },
+    "ansibleEnvironment": { "$ref": "#/$defs/builtArtifact" },
+    "components": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": {
+        "oneOf": [
+          { "$ref": "#/$defs/builtComponent" },
+          { "$ref": "#/$defs/thirdPartyComponent" }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$" },
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "releaseSemver": { "type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" },
+    "repositoryPath": { "type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\u0000]+$" },
+    "repository": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" },
+    "taggedImage": { "type": "string", "pattern": "^[a-z0-9.-]+/[a-z0-9_./-]+:(?!latest$)[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$" },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to", "rollbackCompatible"],
+      "properties": {
+        "from": { "type": "integer", "minimum": 0 },
+        "to": { "type": "integer", "minimum": 0 },
+        "rollbackCompatible": { "type": "boolean" }
+      }
+    },
+    "builtArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "version", "image", "workflowIdentity", "oidcIssuer", "requiredChecks"],
+      "properties": {
+        "repository": { "$ref": "#/$defs/repository" },
+        "version": { "$ref": "#/$defs/releaseSemver" },
+        "image": { "$ref": "#/$defs/taggedImage" },
+        "workflowIdentity": { "type": "string", "pattern": "^https://github\\.com/" },
+        "oidcIssuer": { "type": "string", "format": "uri", "pattern": "^https://" },
+        "requiredChecks": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "builtComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "version", "image", "workflowIdentity", "oidcIssuer", "requiredChecks", "configSchema", "databaseArtifact"],
+      "properties": {
+        "repository": { "$ref": "#/$defs/repository" },
+        "version": { "$ref": "#/$defs/releaseSemver" },
+        "image": { "$ref": "#/$defs/taggedImage" },
+        "workflowIdentity": { "type": "string", "pattern": "^https://github\\.com/" },
+        "oidcIssuer": { "type": "string", "format": "uri", "pattern": "^https://" },
+        "requiredChecks": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "configSchema": { "type": "integer", "minimum": 1 },
+        "databaseArtifact": { "type": "boolean" },
+        "database": { "$ref": "#/$defs/database" }
+      },
+      "if": { "properties": { "databaseArtifact": { "const": true } }, "required": ["databaseArtifact"] },
+      "then": { "required": ["database"] },
+      "else": { "properties": { "database": false } }
+    },
+    "thirdPartyComponent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "thirdParty", "trust"],
+      "properties": {
+        "image": { "$ref": "#/$defs/taggedImage" },
+        "thirdParty": { "const": true },
+        "trust": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["policy", "limitation"],
+          "properties": {
+            "policy": { "const": "digest-only" },
+            "limitation": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  }
+}

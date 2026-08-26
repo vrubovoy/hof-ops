@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/stable-channel-v1.schema.json",
+  "title": "Hof stable release channel",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "channel", "release", "tag", "releaseLockDigest", "releaseUrl"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/channel/v1" },
+    "channel": { "const": "stable" },
+    "release": { "type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" },
+    "tag": { "type": "string", "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" },
+    "releaseLockDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "releaseUrl": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/" }
+  }
+}

@@ -4,8 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: "Release version (semver, e.g. 0.1.0)"
+        description: "Canonical stable semver (for example 1.2.3)"
         required: true
+      selection:
+        description: "Repository-relative release-selection mapping"
+        required: true
+        default: "examples/release-selection.yml"
+
+concurrency:
+  group: release-${{ inputs.release }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -13,15 +21,17 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 60
     permissions:
       contents: write
-      # Needed for keyless Cosign/OIDC signing of the assembled release
-      # lock - mints a short-lived Sigstore identity from this run, no
-      # stored signing key.
       id-token: write
+      attestations: read
+      packages: read
+      checks: read
+      statuses: read
     env:
       GH_TOKEN: ${{ github.token }}
+      SIGNING_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
     steps:
       - uses: actions/checkout@v4
 
@@ -35,43 +45,82 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
-
       - uses: sigstore/cosign-installer@v3
 
-      # Every catalog artifact is resolved against its real, currently
-      # published GHCR digest and independently re-verified (signature +
-      # SBOM + provenance attestations) here - this step *is* delivery
-      # item 6's "verify component CI / resolve digest / verify
-      # signatures and provenance" (a component can't have a valid,
-      # verifiable attestation without its gating test job having
-      # already passed, since every publish workflow requires that).
-      - name: Build release lock
-        run: node scripts/build-release-lock.mjs --release "${{ inputs.release }}" --out release-lock.json
-
-      - name: Sign release lock with keyless Cosign
+      - name: Reject mutable or invalid platform release identifiers
+        env:
+          RELEASE: ${{ inputs.release }}
         run: |
-          cosign sign-blob --yes \
-            --output-signature release-lock.json.sig \
-            --output-certificate release-lock.json.pem \
-            release-lock.json
+          node -e 'if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(process.env.RELEASE)) process.exit(1)'
+          if gh release view "v${RELEASE}" >/dev/null 2>&1; then
+            echo "GitHub Release v${RELEASE} already exists" >&2
+            exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${RELEASE}" >/dev/null 2>&1; then
+            echo "Git tag v${RELEASE} already exists" >&2
+            exit 1
+          fi
 
-      - name: Verify the signature we just produced
+      - name: Validate contracts and tests
         run: |
-          cosign verify-blob \
-            --certificate release-lock.json.pem \
-            --signature release-lock.json.sig \
-            --certificate-identity-regexp '^https://github\.com/vrubovoy/hof-ops/' \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            release-lock.json
+          pnpm validate
+          pnpm test
 
-      # No integration matrix yet - deferred. Actually bringing up the
-      # full platform against these pinned digests needs the reconciler
-      # (delivery items 7-9), which doesn't exist yet; running Tor's own
-      # Compose stack here would only prove `latest` still works, which
-      # every sibling repo's own CI already does.
-      - name: Publish GitHub Release
+      - name: Resolve and verify selected component releases
+        run: >-
+          node scripts/build-release-lock.mjs
+          --release "${{ inputs.release }}"
+          --selection "${{ inputs.selection }}"
+          --out release-lock.json
+
+      - name: Run pinned topology and Compose integration matrix
+        run: node scripts/integration-matrix.mjs --lock release-lock.json --runtime
+
+      - name: Reject component tag, revision, or digest drift
+        run: |
+          node scripts/build-release-lock.mjs \
+            --release "${{ inputs.release }}" \
+            --selection "${{ inputs.selection }}" \
+            --out release-lock.recheck.json
+          cmp release-lock.json release-lock.recheck.json
+          rm release-lock.recheck.json
+
+      - name: Build stable-channel metadata
+        run: >-
+          node scripts/build-channel-metadata.mjs
+          --release "${{ inputs.release }}"
+          --lock release-lock.json
+          --repository "${{ github.repository }}"
+          --out stable-channel.json
+
+      - name: Sign and verify release metadata
+        run: |
+          for artifact in release-lock.json stable-channel.json; do
+            cosign sign-blob --yes \
+              --output-signature "${artifact}.sig" \
+              --output-certificate "${artifact}.pem" \
+              "${artifact}"
+            cosign verify-blob \
+              --certificate "${artifact}.pem" \
+              --signature "${artifact}.sig" \
+              --certificate-identity "${SIGNING_IDENTITY}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${artifact}"
+          done
+
+      - name: Recheck release tag immutability before publication
+        env:
+          RELEASE: ${{ inputs.release }}
+        run: |
+          ! gh release view "v${RELEASE}" >/dev/null 2>&1
+          ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${RELEASE}" >/dev/null 2>&1
+
+      - name: Publish immutable GitHub Release and stable channel reference
         run: |
           gh release create "v${{ inputs.release }}" \
             release-lock.json release-lock.json.sig release-lock.json.pem \
+            stable-channel.json stable-channel.json.sig stable-channel.json.pem \
+            --target "${GITHUB_SHA}" \
+            --latest \
             --title "Hof Platform v${{ inputs.release }}" \
-            --notes "Signed release lock for the Hof platform. Verify with: cosign verify-blob --certificate release-lock.json.pem --signature release-lock.json.sig --certificate-identity-regexp '^https://github\\.com/vrubovoy/hof-ops/' --certificate-oidc-issuer https://token.actions.githubusercontent.com release-lock.json"
+            --notes "Signed immutable release lock and signed stable-channel metadata. See README.md for Cosign verification commands."

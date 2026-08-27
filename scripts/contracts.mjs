@@ -168,8 +168,12 @@ function validateManifest(manifest, catalog) {
     }
   }
 
-  if (manifest.features?.browserPush?.enabled && !manifest.services?.glocke?.enabled) {
-    errors.push("services.yml: browserPush requires glocke");
+  if (manifest.features?.browserPush?.enabled) {
+    if (!manifest.services?.glocke?.enabled) errors.push("services.yml: browserPush requires glocke");
+    if (!manifest.features.browserPush.subject) errors.push("services.yml: browserPush.enabled requires subject");
+    if (!manifest.features.browserPush.allowedEndpointHosts?.length) {
+      errors.push("services.yml: browserPush.enabled requires at least one allowedEndpointHosts entry");
+    }
   }
 
   const destinations = new Set();

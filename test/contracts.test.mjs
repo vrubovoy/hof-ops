@@ -16,6 +16,30 @@ test("browser push requires Glocke", async () => {
   assert.match(validateContracts(contracts).join("\n"), /browserPush requires glocke/);
 });
 
+test("browser push requires a subject", async () => {
+  const contracts = structuredClone(await loadContracts());
+  delete contracts.manifest.features.browserPush.subject;
+
+  assert.match(validateContracts(contracts).join("\n"), /browserPush\.enabled requires subject/);
+});
+
+test("browser push requires at least one allowedEndpointHosts entry - not itself a secret, but a real config value with no safe default", async () => {
+  const contracts = structuredClone(await loadContracts());
+  delete contracts.manifest.features.browserPush.allowedEndpointHosts;
+  assert.match(validateContracts(contracts).join("\n"), /browserPush\.enabled requires at least one allowedEndpointHosts entry/);
+
+  const empty = structuredClone(await loadContracts());
+  empty.manifest.features.browserPush.allowedEndpointHosts = [];
+  assert.match(validateContracts(empty).join("\n"), /browserPush\.enabled requires at least one allowedEndpointHosts entry/);
+});
+
+test("browser push disabled needs neither subject nor allowedEndpointHosts", async () => {
+  const contracts = structuredClone(await loadContracts());
+  contracts.manifest.features.browserPush = { enabled: false };
+  contracts.manifest.services.glocke.enabled = false;
+  assert.deepEqual(validateContracts(contracts), []);
+});
+
 test("mandatory core cannot be downgraded in the catalog", async () => {
   const contracts = structuredClone(await loadContracts());
   contracts.catalog.services.find((service) => service.id === "schlussel").mandatory = false;

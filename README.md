@@ -56,9 +56,13 @@ hardened SSH transport (disk/RAM/CPU/clock/DNS/ports/Docker); `hofctl plan`
 chains both, resolves the last-applied state (or a synthetic bootstrap
 baseline on a genuinely clean host), computes drift against what's actually
 running, and prints one typed, ordered `plan-v1` operation list to stdout -
-never writing anything, anywhere. `hofctl apply` (actually executing a
-plan), backup/restore, upgrade/rollback, first-admin bootstrap, and the
-installer are not implemented yet — see the Delivery Order in the plan
+never writing anything, anywhere. Item 8's own apply-execution contracts
+(exact SSH target binding, `plan-v2`, the operation journal/lock/event
+schemas, a bootstrap action whitelist, secret-safe rendering via `hofctl
+secrets`) are landing ahead of `hofctl apply` itself - see ADR 0004.
+`hofctl apply` (actually executing a plan), backup/restore, upgrade/
+rollback, first-admin bootstrap, and the installer are not implemented
+yet — see the Delivery Order in the plan
 linked above for what comes next.
 
 ## The three contracts
@@ -105,9 +109,43 @@ node scripts/hofctl.mjs render \
 
 The renderer writes `compose.yml`, `Caddyfile`, `runtime-config.json`,
 `service.env`, `topology.json`, and `backup-inventory.json`. Re-running it with
-identical inputs produces byte-identical files. Secret values are not part of
-the contracts or generated files; Compose placeholders refer to the required
-deployment environment only when the corresponding integration is enabled.
+identical inputs produces byte-identical files. Secret values are never part of
+the contracts or generated files, deterministic or not: every secret-bearing
+service gets Docker Compose's own file-based `secrets:` mechanism instead (a
+fixed `<NAME>_FILE=/run/secrets/<name>` environment variable per secret, the
+convention every consuming app already implements), sourced from
+`${HOF_SECRETS_DIR:-/etc/hof/secrets}/<name>` on the target - `hofctl secrets
+ensure` manages the plaintext values themselves, entirely on the operator's own
+workstation, SOPS-encrypted to age (see below).
+
+## Managing secrets
+
+`hofctl secrets ensure` generates and stores every secret a given
+`services.yml` actually needs (inter-service HMAC secrets, Glocke's VAPID
+push keypair, Herold's credential-encryption key, Wächter's agent token) -
+fresh random values the first time each is needed, never regenerated once
+present. The plaintext store never leaves the operator's own workstation
+(matching `tls.certificatePath`'s own "supplied TLS reads from the
+workstation" convention) - it's SOPS-encrypted to age, to both the
+operator's own recipient and a required external recovery recipient, so a
+lost workstation doesn't also mean permanently lost secrets.
+
+```sh
+node scripts/hofctl.mjs secrets ensure \
+  --services examples/services.yml \
+  --store secrets.sops.yaml \
+  --operator-age-recipient age1... \
+  --recovery-age-recipient age1... \
+  --identity-file ~/.config/hof/age-identity.txt
+```
+
+Requires a real `sops` binary on `PATH` (age recipients/identities are
+plain `age1...` public keys and `age-keygen`-produced identity files -
+`hofctl` itself never generates an age keypair, only secret values).
+Prints only the names of any newly-generated secrets as NDJSON - a real
+value never reaches stdout, a log, or any generated file. `hofctl apply`
+(not yet implemented) is the only thing that ever reads the store's real
+values, to deliver them to the target's own fixed secret file paths.
 
 ## Planning a deployment
 

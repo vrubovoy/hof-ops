@@ -1,0 +1,58 @@
+#!/usr/bin/env node
+// Fake "sops" for scripts/secrets.mjs's own tests - answers exactly the
+// two invocations ensureSecrets()/readSecretsStore()/writeSecretsStore()
+// ever make (--encrypt/--decrypt --input-type json --output-type json),
+// without a real Sigstore-adjacent age/SOPS round trip. The real
+// argv shape and real `sops`/`age` behavior this fixture stands in for
+// was independently verified for real (a real sops+age binary pair,
+// downloaded and run by hand) before this fake was written, matching
+// the same "verify for real once, fake for the fast suite" pattern
+// already used for cosign.
+//
+// The "encrypted" format here is deliberately NOT real encryption -
+// just enough structure to prove hofctl's OWN plumbing (which
+// recipients it asked for, whether an identity file was supplied, that
+// a wrong/missing identity is refused) without re-testing SOPS/age's
+// own, already-trusted cryptography.
+const fs = require("node:fs");
+
+const args = process.argv.slice(2);
+const mode = args.find((a) => a === "--encrypt" || a === "--decrypt");
+const inputPath = args.at(-1);
+
+if (mode === "--encrypt") {
+  const ageIndex = args.indexOf("--age");
+  const recipients = args[ageIndex + 1].split(",");
+  const payload = fs.readFileSync(inputPath, "utf8");
+  process.stdout.write(JSON.stringify({ __hof_test_sops_mock: true, recipients, payload: Buffer.from(payload).toString("base64") }));
+  process.exit(0);
+}
+
+if (mode === "--decrypt") {
+  const identityFile = process.env.SOPS_AGE_KEY_FILE;
+  if (!identityFile) {
+    process.stderr.write("no age identities configured (SOPS_AGE_KEY_FILE not set)\n");
+    process.exit(1);
+  }
+  let identity;
+  try {
+    identity = fs.readFileSync(identityFile, "utf8").trim();
+  } catch {
+    process.stderr.write(`failed to open identity file: ${identityFile}\n`);
+    process.exit(1);
+  }
+  const encrypted = JSON.parse(fs.readFileSync(inputPath, "utf8"));
+  if (!encrypted.__hof_test_sops_mock) {
+    process.stderr.write("not a mock-encrypted file\n");
+    process.exit(1);
+  }
+  if (!encrypted.recipients.includes(identity)) {
+    process.stderr.write("Failed to get the data key required to decrypt the SOPS file.\n");
+    process.exit(1);
+  }
+  process.stdout.write(Buffer.from(encrypted.payload, "base64").toString("utf8"));
+  process.exit(0);
+}
+
+process.stderr.write(`fake sops: unrecognized invocation: ${args.join(" ")}\n`);
+process.exit(1);

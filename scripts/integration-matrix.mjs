@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 
 import { execFile } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
 import { statSync } from "node:fs";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +12,8 @@ import YAML from "yaml";
 
 import { loadContracts, validateContracts } from "./contracts.mjs";
 import { sha256 as digest } from "./digest.mjs";
-import { renderTopology } from "./render-topology.mjs";
+import { enabledServiceIds, renderTopology } from "./render-topology.mjs";
+import { generateSecretValue, requiredSecrets, vapidPublicKeyFor } from "./secrets.mjs";
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -26,28 +26,6 @@ function parseArgs(argv) {
     else throw new Error(`unknown argument: ${argv[i]}`);
   }
   return args;
-}
-
-// GLOCKE_VAPID_PUBLIC_KEY/PRIVATE_KEY need real, matching P-256 key
-// material - Glocke's own config validates the key format, not just its
-// presence, so a generic placeholder string fails the same way a
-// too-short or non-distinct one did for the other secrets. VAPID's usual
-// encoding (the "web-push" package's own convention): the public key is
-// the uncompressed SEC1 point (0x04 || X || Y), the private key is the
-// raw scalar - both base64url, no padding.
-function generateVapidKeyPair() {
-  const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
-  const publicJwk = publicKey.export({ format: "jwk" });
-  const privateJwk = privateKey.export({ format: "jwk" });
-  const uncompressedPoint = Buffer.concat([
-    Buffer.from([0x04]),
-    Buffer.from(publicJwk.x, "base64url"),
-    Buffer.from(publicJwk.y, "base64url"),
-  ]);
-  return {
-    publicKey: uncompressedPoint.toString("base64url"),
-    privateKey: Buffer.from(privateJwk.d, "base64url").toString("base64url"),
-  };
 }
 
 async function dockerCompose(file, project, args, environment = process.env) {
@@ -91,7 +69,17 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
       if (errors.length > 0) throw new Error(`${fixtureName}:\n${errors.join("\n")}`);
 
       const fixtureId = path.basename(fixtureName, ".yml");
-      const rendered = renderTopology({ ...contracts, manifest, catalog, releaseLock: lock });
+      // Generated once per fixture regardless of whether this one
+      // actually enables browserPush - renderTopology() only ever uses
+      // vapidPublicKey when it does, so an unused extra value here is
+      // harmless, and every fixture's own secrets.mjs-generated values
+      // stay realistic (real >=32-byte tokens, a real matching P-256
+      // pair) rather than the old ad hoc placeholder strings.
+      const secretValues = Object.fromEntries(
+        requiredSecrets(manifest, enabledServiceIds(manifest, catalog)).map((secret) => [secret.name, generateSecretValue(secret.kind)]),
+      );
+      const vapidPrivateKey = secretValues["glocke-vapid-private-key"];
+      const rendered = renderTopology({ ...contracts, manifest, catalog, releaseLock: lock, vapidPublicKey: vapidPrivateKey ? vapidPublicKeyFor(vapidPrivateKey) : undefined });
       const compose = rendered.compose;
       compose.name = `hof-gate6-${fixtureId}`;
       for (const service of Object.values(compose.services)) {
@@ -122,23 +110,22 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
           // fallback in place rather than failing the whole matrix over it.
         }
       }
-      // Unique per variable name, not one shared constant, and at least
-      // 32 bytes - both found by actually running this against schlussel
-      // with Glocke enabled: its own directional-secret distinctness
-      // check ("Directional HMAC secrets must be distinct") rejected
-      // every producer sharing one placeholder value, and resolveSecret()
-      // separately enforces a 32-byte minimum on each of them.
-      const vapidKeyPair = generateVapidKeyPair();
+      // Every secret went through render-topology.mjs's own `_FILE`
+      // wiring now, except GLOCKE_VAPID_PUBLIC_KEY (glocke's own app
+      // reads it as a plain value, not `_FILE`-aware - see
+      // render-topology.mjs's own comment) - a regression guard, not
+      // just a convenience: if a future change reintroduced a raw
+      // `${VAR:?required}` secret placeholder by mistake, this fails
+      // loudly here instead of silently needing yet another ad hoc
+      // environment entry.
       for (const match of JSON.stringify(compose).matchAll(/\\?\$\{([A-Z0-9_]+):\?required\}/g)) {
-        if (match[1] === "GLOCKE_VAPID_PUBLIC_KEY") environment[match[1]] = vapidKeyPair.publicKey;
-        else if (match[1] === "GLOCKE_VAPID_PRIVATE_KEY") environment[match[1]] = vapidKeyPair.privateKey;
-        else environment[match[1]] = `gate6-contract-placeholder-${match[1].toLowerCase()}-0123456789`;
+        if (match[1] !== "GLOCKE_VAPID_PUBLIC_KEY") {
+          throw new Error(`${fixtureName}: unexpected unmigrated secret placeholder \${${match[1]}:?required} - every real secret must go through the _FILE convention (see render-topology.mjs's wireSecret())`);
+        }
       }
-      // WACHTER_AGENT_TOKEN is an either/or with _FILE, so the render
-      // template can't mark it `:?required` (Compose has no "one of"
-      // syntax) - it's genuinely required by the running agent/API,
-      // though, and must clear its own 32-byte minimum.
-      if (compose.services.wachter) environment.WACHTER_AGENT_TOKEN = "gate6-integration-matrix-wachter-agent-token";
+      if (rendered.compose.services["glocke-backend"]?.environment.GLOCKE_VAPID_PUBLIC_KEY?.includes(":?required")) {
+        environment.GLOCKE_VAPID_PUBLIC_KEY = vapidPublicKeyFor(vapidPrivateKey);
+      }
       await dockerCompose(composePath, compose.name, ["config", "--quiet"], environment);
       const { stdout } = await dockerCompose(composePath, compose.name, ["config", "--images"], environment);
       const renderedImages = new Set(stdout.trim().split("\n").filter(Boolean));
@@ -147,6 +134,17 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
       }
 
       if (runtime) {
+        // Real files this fixture's own containers will actually read at
+        // `up` time - config/--images (above) never touch the
+        // filesystem for a secret's `file:` path, but a real container
+        // start does. HOF_SECRETS_DIR overrides render-topology.mjs's
+        // own `${HOF_SECRETS_DIR:-/etc/hof/secrets}` default, so this
+        // never needs real root or `/etc` write access.
+        const secretsDirectory = path.join(temporaryDirectory, "secrets", fixtureId);
+        await mkdir(secretsDirectory, { recursive: true });
+        await Promise.all(Object.entries(secretValues).map(([name, value]) => writeFile(path.join(secretsDirectory, name), value, { mode: 0o600 })));
+        environment.HOF_SECRETS_DIR = secretsDirectory;
+
         await dockerCompose(composePath, compose.name, ["pull", "--quiet"], environment);
         // render-topology.mjs now renders MIGRATE_ON_STARTUP=false - a
         // fresh volume's schema is only ever brought current by an

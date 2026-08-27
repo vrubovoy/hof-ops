@@ -89,12 +89,14 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
       // path and the bind mount fails at container start.
       if (compose.services.gateway) await writeFile(path.join(temporaryDirectory, "Caddyfile"), rendered.caddyfile);
       const environment = { ...process.env };
-      // At least 32 bytes: several of these are HMAC secrets whose own
-      // resolveSecret() enforces a 32-byte minimum (found by actually
-      // running this against schlussel with Glocke enabled - the shorter
-      // placeholder crashed it at startup instead of letting it come up).
+      // Unique per variable name, not one shared constant, and at least
+      // 32 bytes - both found by actually running this against schlussel
+      // with Glocke enabled: its own directional-secret distinctness
+      // check ("Directional HMAC secrets must be distinct") rejected
+      // every producer sharing one placeholder value, and resolveSecret()
+      // separately enforces a 32-byte minimum on each of them.
       for (const match of JSON.stringify(compose).matchAll(/\\?\$\{([A-Z0-9_]+):\?required\}/g)) {
-        environment[match[1]] = "gate6-contract-placeholder-value-0123456789";
+        environment[match[1]] = `gate6-contract-placeholder-${match[1].toLowerCase()}-0123456789`;
       }
       // WACHTER_AGENT_TOKEN is an either/or with _FILE, so the render
       // template can't mark it `:?required` (Compose has no "one of"

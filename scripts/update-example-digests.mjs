@@ -4,16 +4,13 @@
 // changes - previously a manual sha256+edit step, repeated (and missed)
 // several times. Run this after touching either file.
 
-import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+import { sha256 } from "./digest.mjs";
 
-function sha256(bytes) {
-  return "sha256:" + createHash("sha256").update(bytes).digest("hex");
-}
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const lockPath = path.join(root, "examples/release-lock.json");
 const [catalogBytes, templateBytes, lockBytes] = await Promise.all([

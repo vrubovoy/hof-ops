@@ -9,7 +9,6 @@
 // hofctl, and is it genuinely signed.
 
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,14 +17,11 @@ import { promisify } from "node:util";
 import YAML from "yaml";
 
 import { validateContracts } from "./contracts.mjs";
+import { sha256 } from "./digest.mjs";
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOFCTL_VERSION = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")).version;
-
-function sha256(bytes) {
-  return "sha256:" + createHash("sha256").update(bytes).digest("hex");
-}
 
 // Same ordering rule as semver itself, restricted to the plain MAJOR.MINOR.PATCH
 // the release-lock/services.yml schemas already require - no prerelease/build

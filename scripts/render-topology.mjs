@@ -310,10 +310,23 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
     return { service: id, component, url: `http://${component}:${port}${service.health.path}`, dependsOn: service.dependsOn };
   });
   const backupVolumes = enabledIds.flatMap((id) => catalogById.get(id).volumes.map((volume) => ({ service: id, volume })));
+  // hofctl plan's database.migrate operations (see PLATFORM-OPS-PLAN.md)
+  // need to know, per enabled persistent service, which schema version
+  // this release's pinned image actually expects - the release lock
+  // already carries that per component (build-release-lock.mjs's own
+  // schema check depends on it), this just surfaces it alongside the
+  // rest of the rendered topology instead of making plan.mjs reach back
+  // into the release lock a second time.
+  const databaseSchemas = Object.fromEntries(
+    enabledIds
+      .map((id) => catalogById.get(id))
+      .filter((service) => service.database)
+      .map((service) => [service.id, releaseLock.components[service.database.component].database]),
+  );
   const topology = {
     apiVersion: "hof.dev/rendered-topology/v1", release: releaseLock.release, enabledServices: enabledIds,
     serviceFlags: appFlags, publicOrigins: origins, trustedOrigins, exportTargets, deletionTargets,
-    glockeProducers: producers, healthTargets, backupVolumes,
+    glockeProducers: producers, healthTargets, backupVolumes, databaseSchemas,
   };
 
   return {

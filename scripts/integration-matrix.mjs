@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFile } from "node:child_process";
-import { createHash, generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync } from "node:crypto";
 import { statSync } from "node:fs";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -12,6 +12,7 @@ import { promisify } from "node:util";
 import YAML from "yaml";
 
 import { loadContracts, validateContracts } from "./contracts.mjs";
+import { sha256 as digest } from "./digest.mjs";
 import { renderTopology } from "./render-topology.mjs";
 
 const exec = promisify(execFile);
@@ -25,10 +26,6 @@ function parseArgs(argv) {
     else throw new Error(`unknown argument: ${argv[i]}`);
   }
   return args;
-}
-
-function digest(bytes) {
-  return "sha256:" + createHash("sha256").update(bytes).digest("hex");
 }
 
 // GLOCKE_VAPID_PUBLIC_KEY/PRIVATE_KEY need real, matching P-256 key

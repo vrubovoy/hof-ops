@@ -56,14 +56,24 @@ hardened SSH transport (disk/RAM/CPU/clock/DNS/ports/Docker); `hofctl plan`
 chains both, resolves the last-applied state (or a synthetic bootstrap
 baseline on a genuinely clean host), computes drift against what's actually
 running, and prints one typed, ordered `plan-v1` operation list to stdout -
-never writing anything, anywhere. Item 8's own apply-execution contracts
-(exact SSH target binding, `plan-v2`, the operation journal/lock/event
-schemas, a bootstrap action whitelist, secret-safe rendering via `hofctl
-secrets`) are landing ahead of `hofctl apply` itself - see ADR 0004.
-`hofctl apply` (actually executing a plan), backup/restore, upgrade/
-rollback, first-admin bootstrap, and the installer are not implemented
-yet — see the Delivery Order in the plan
-linked above for what comes next.
+never writing anything, anywhere.
+
+`hofctl apply` is implemented for delivery item 8's own scope - a bootstrap
+onto a genuinely clean host (see ADR 0004): exact SSH target binding,
+`--approve-plan-id` (approving a plan approves those exact bytes, never "the
+latest one"), an exclusive durable target lock, a durable operation journal
+(bounded NDJSON progress on stdout), a stale-plan recheck under the lock,
+Cosign verification of the pinned Ansible Execution Environment image before
+it ever runs, a fixed bootstrap-only action whitelist dispatched into that
+image (never local Ansible, never a generic command), and safe, bounded
+resume after an interruption. The Execution Environment's own ten roles
+(`ansible/roles/`) are still a skeleton as of item 8's own PR sequence -
+each asserts its real variable contract and reports itself not yet
+implemented; real host/secret/volume/network/image/config/database/service/
+readiness/state logic is the next slice of this same delivery item. Applied-
+mode reconciliation (update/remove), backup/restore, upgrade/rollback,
+first-admin bootstrap, and the installer UI are later delivery items - see
+the Delivery Order in the plan linked above.
 
 ## The three contracts
 
@@ -176,9 +186,45 @@ A resource Docker already shows drifted from the last apply is reported and
 blocks by default; pass `--repair-drift` to fold a manual container change
 or a hand-modified generated file back into the plan (an unmanaged
 resource, or a persistent volume that's simply gone, is never auto-adopted
-or auto-recreated, `--repair-drift` or not). `hofctl apply` — actually
-executing a plan against the target — is a separate, not-yet-implemented
-delivery item.
+or auto-recreated, `--repair-drift` or not).
+
+## Applying a deployment
+
+`hofctl apply` runs a bootstrap plan for real, onto a genuinely clean host
+(see ADR 0004 - applied-mode reconciliation is a later delivery item). It
+recomputes the plan itself from the given inputs (never trusts a plan
+handed to it on disk), so `--approve-plan-id` must match that
+recomputation's own `planId` byte for byte:
+
+```sh
+node scripts/hofctl.mjs apply \
+  --services examples/services.yml \
+  --release-lock examples/release-lock.json \
+  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/tags/v1.0.0" \
+  --known-hosts ~/.ssh/known_hosts \
+  --identity-file ~/.ssh/id_ed25519 \
+  --recovery-age-recipient age1... \
+  --approve-plan-id sha256:...
+```
+
+Every operation the plan contains runs inside the pinned, Cosign-signed
+Ansible Execution Environment (`ansible/`) - never the operator's own local
+Ansible installation - and is recorded, before and after it runs, in a
+durable on-target journal (`/var/lib/hof/state/journal/`) that never holds a
+secret value, decrypted content, or an SSH private-key path. Progress
+streams to stdout as bounded NDJSON, one `operation-event-v1` record per
+line, nothing else interleaved. An apply interrupted mid-run (a crashed
+workstation, a dropped network) resumes with `--resume` instead of
+`--approve-plan-id` - it reclaims the same target lock and journal, skips
+every step that already recorded a real `succeeded` event, and refuses
+outright (never guesses) if a step's own outcome can't be determined from
+the journal, or if the plan recomputed from the current inputs no longer
+matches what was originally approved. `--target-mode local` is not
+supported for `apply` (unlike `plan`/`preflight`) - the Execution
+Environment runs as a container, and a local Ansible connection inside it
+would mutate that container's own filesystem, never the real host's; a
+loopback SSH target is the way to exercise `apply` locally (see
+`test/apply-acceptance.mjs`).
 
 ## Cutting a release
 
@@ -230,6 +276,8 @@ pnpm install
 pnpm validate   # schema + cross-contract validation
 pnpm test       # node --test
 pnpm integration # render fixtures and run pinned Compose config contracts
+pnpm test:ssh   # real ephemeral-container SSH transport acceptance (needs Docker)
+pnpm test:apply-ssh # real ephemeral-container hofctl apply acceptance (needs Docker)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.

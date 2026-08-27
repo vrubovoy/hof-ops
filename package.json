@@ -15,6 +15,7 @@
     "validate": "node scripts/validate-contracts.mjs",
     "test": "node --test test/*.test.mjs",
     "test:ssh": "node test/ssh-acceptance.mjs",
+    "test:apply-ssh": "node test/apply-acceptance.mjs",
     "render": "node scripts/hofctl.mjs render",
     "build-release-lock": "node scripts/build-release-lock.mjs",
     "integration": "node scripts/integration-matrix.mjs"

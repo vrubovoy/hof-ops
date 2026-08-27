@@ -1,0 +1,19 @@
+---
+# The one playbook hofctl apply ever runs inside this image - a single
+# generic dispatcher, never a per-operation generated YAML file (apply
+# never writes Ansible source at all, only extra-vars - see
+# scripts/apply.mjs's own ACTION_TO_ROLE mapping). hof_role/hof_* are
+# supplied per invocation via `ansible-playbook -e`; the bootstrap
+# action whitelist (scripts/bootstrap-actions.mjs) is what actually
+# keeps hof_role restricted to one of this image's own ten roles - this
+# playbook itself has no opinion on that, it just dispatches whatever
+# role name it's given.
+- hosts: all
+  gather_facts: false
+  become: true
+  become_method: sudo
+  become_flags: "-n"
+  tasks:
+    - name: Run this operation's own role
+      include_role:
+        name: "{{ hof_role }}"

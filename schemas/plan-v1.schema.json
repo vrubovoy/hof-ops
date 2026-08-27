@@ -55,22 +55,29 @@
       "type": "string",
       "pattern": "^[0-9]{3}\\.[a-z][a-z0-9.-]{0,80}$"
     },
+    "digestOrNull": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
     "services": {
       "type": "object",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["enabled", "artifacts"],
+        "required": ["enabled", "units"],
         "properties": {
           "enabled": { "type": "boolean" },
-          "artifacts": {
+          "units": {
+            "description": "Keyed by hof.unit (the actual Compose service key), not by catalog artifact - Wachter's API and its agent share one artifact but are two units, and collapsing them loses one entirely.",
             "type": "object",
             "additionalProperties": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["image"],
+              "required": ["artifact", "image", "configFingerprint"],
               "properties": {
-                "image": { "type": ["string", "null"] }
+                "artifact": { "$ref": "#/$defs/identifier" },
+                "image": { "type": ["string", "null"] },
+                "configFingerprint": {
+                  "description": "sha256 of this unit's own full rendered Compose service definition (image, environment, labels, volumes, ...) - catches a domain/CORS/browserPush/TLS-driven env change even when the image itself didn't change.",
+                  "$ref": "#/$defs/digestOrNull"
+                }
               }
             }
           },
@@ -90,11 +97,17 @@
       "description": "The last-applied state this plan is diffing from - either loaded from /var/lib/hof/state, or the synthetic empty baseline (mode: bootstrap, generation: 0) on a truly clean host.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["mode", "generation", "release", "services", "volumes"],
+      "required": ["mode", "generation", "release", "manifestDigest", "releaseLockDigest", "topologyDigest", "services", "volumes"],
       "properties": {
         "mode": { "enum": ["bootstrap", "applied"] },
         "generation": { "type": "integer", "minimum": 0 },
         "release": { "type": ["string", "null"], "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "manifestDigest": { "$ref": "#/$defs/digestOrNull" },
+        "releaseLockDigest": { "$ref": "#/$defs/digestOrNull" },
+        "topologyDigest": {
+          "description": "sha256 over the rendered topology, backup config, and Caddyfile together - the one field that catches a change (like a backup schedule edit) with no per-unit Compose footprint at all.",
+          "$ref": "#/$defs/digestOrNull"
+        },
         "services": { "$ref": "#/$defs/services" },
         "volumes": { "$ref": "#/$defs/volumes" }
       }
@@ -103,9 +116,12 @@
       "description": "What services.yml + the catalog + the release lock render to right now - a plain snapshot, not itself a generation.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["release", "services", "volumes"],
+      "required": ["release", "manifestDigest", "releaseLockDigest", "topologyDigest", "services", "volumes"],
       "properties": {
         "release": { "type": ["string", "null"], "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "manifestDigest": { "$ref": "#/$defs/digestOrNull" },
+        "releaseLockDigest": { "$ref": "#/$defs/digestOrNull" },
+        "topologyDigest": { "$ref": "#/$defs/digestOrNull" },
         "services": { "$ref": "#/$defs/services" },
         "volumes": { "$ref": "#/$defs/volumes" }
       }
@@ -140,6 +156,16 @@
         },
         "resource": { "type": "string" },
         "image": { "type": "string" },
+        "argv": {
+          "description": "Only for database.migrate - the catalog's own database.command for this component, so an approved plan is self-sufficient and apply never has to re-interpret the catalog to know what to run.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "volume": {
+          "description": "Only for database.migrate/backup.create - the catalog's own database.volume (or the volume backup.create is protecting).",
+          "$ref": "#/$defs/identifier"
+        },
         "schema": {
           "type": "object",
           "additionalProperties": false,

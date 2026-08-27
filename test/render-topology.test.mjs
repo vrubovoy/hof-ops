@@ -149,9 +149,18 @@ test("every generated service is labeled with hofctl plan's ownership metadata",
     assert.equal(service.labels["hof.generation"], "7", name);
     assert.ok(service.labels["hof.service"], name);
     assert.ok(service.labels["hof.artifact"], name);
+    // hof.unit must be the actual Compose key - the one thing guaranteed
+    // unique within one Compose file, unlike hof.artifact (Wachter's two
+    // containers share one).
+    assert.equal(service.labels["hof.unit"], name, name);
   }
   assert.equal(rendered.compose.services["kuvert-backend"].labels["hof.service"], "kuvert");
   assert.equal(rendered.compose.services["kuvert-backend"].labels["hof.artifact"], "kuvert-backend");
+  // Wachter's API and agent must be distinguishable even though they
+  // share one catalog artifact.
+  assert.equal(rendered.compose.services.wachter.labels["hof.artifact"], "wachter-backend");
+  assert.equal(rendered.compose.services["wachter-agent"].labels["hof.artifact"], "wachter-backend");
+  assert.notEqual(rendered.compose.services.wachter.labels["hof.unit"], rendered.compose.services["wachter-agent"].labels["hof.unit"]);
 });
 
 test("ownership labels default to an empty installation id and generation zero when unset", async () => {

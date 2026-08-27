@@ -26,3 +26,45 @@ jobs:
       - run: pnpm test
       - name: Real SSH transport acceptance (ephemeral pinned Debian 12 sshd container)
         run: pnpm test:ssh
+
+  ansible:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ansible-core==2.17.*
+      - name: Syntax-check every role against its own real variable contract
+        working-directory: ansible
+        run: |
+          cat > /tmp/hof-role-syntax-check.yml << 'PLAYBOOK'
+          ---
+          - hosts: localhost
+            connection: local
+            gather_facts: false
+            tasks:
+              - include_role:
+                  name: "{{ item }}"
+                vars:
+                  hof_operation_id: "001.ci-syntax-check"
+                  hof_secret_name: "x"
+                  hof_volume_name: "x"
+                  hof_network_name: "x"
+                  hof_image_reference: "x"
+                  hof_image_trust: { policy: "digest-only" }
+                  hof_generated_files: []
+                  hof_migrate_argv: ["true"]
+                  hof_migrate_volume: "x"
+                  hof_migrate_schema: { from: 1, to: 2, rollbackCompatible: true }
+                  hof_service_unit: "x"
+                  hof_service_image: "x"
+                  hof_readiness_unit: "x"
+                  hof_readiness_condition: "running"
+                  hof_state_generation: 1
+                loop: [host, secret, volume, network, image, config, database, service, readiness, state]
+          PLAYBOOK
+          ANSIBLE_CONFIG=ansible.cfg ANSIBLE_ROLES_PATH=roles ansible-playbook /tmp/hof-role-syntax-check.yml
+      - name: Execution Environment image builds
+        run: docker build --file ansible/Dockerfile ansible

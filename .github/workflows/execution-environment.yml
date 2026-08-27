@@ -1,0 +1,106 @@
+name: Execution Environment
+
+# Deliberately its own tag namespace (ee-vX.Y.Z), never plain vX.Y.Z -
+# hof-ops's own platform release (release.yml) creates a plain vX.Y.Z
+# git tag on this same repository via `gh release create`, and
+# scripts/build-release-lock.mjs's own resolveRevision() always looks
+# up a component's tag as literally `v${version}` - the Execution
+# Environment versions independently of the platform release (like
+# every other component in examples/release-selection.yml versions
+# independently of it), so its own tag must never collide with a
+# platform release tag that happens to share the same version number.
+on:
+  push:
+    tags: ["ee-v*"]
+
+concurrency:
+  group: execution-environment-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      # Keyless Cosign/OIDC signing and the SBOM/provenance attestations
+      # below both mint a short-lived Sigstore identity from this
+      # workflow run - no stored signing key, matching every other
+      # image-publishing workflow in this platform.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Derive the plain vX.Y.Z image tag from the ee-vX.Y.Z git tag
+        id: version
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          if [[ ! "$tag" =~ ^ee-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Execution Environment tag must be ee-vX.Y.Z SemVer: $tag" >&2
+            exit 1
+          fi
+          echo "image_tag=${tag#ee-}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: sigstore/cosign-installer@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to overwrite an existing, immutable Execution Environment tag
+        run: |
+          ref="ghcr.io/vrubovoy/hof-ops-ee:${{ steps.version.outputs.image_tag }}"
+          if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+            echo "::error::${ref} already exists - Execution Environment tags are immutable, use a new version." >&2
+            exit 1
+          fi
+
+      - uses: docker/build-push-action@v7
+        id: build
+        with:
+          context: ansible
+          file: ansible/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/vrubovoy/hof-ops-ee:${{ github.sha }}
+            ghcr.io/vrubovoy/hof-ops-ee:${{ steps.version.outputs.image_tag }}
+
+      # Keyless: cosign mints a short-lived certificate from this
+      # workflow's own OIDC identity (no stored signing key) and records
+      # the signature in the public Rekor transparency log. Signs the
+      # immutable digest, not a mutable tag.
+      - name: Sign image with keyless Cosign
+        run: cosign sign --yes "ghcr.io/vrubovoy/hof-ops-ee@${{ steps.build.outputs.digest }}"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/vrubovoy/hof-ops-ee@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ghcr.io/vrubovoy/hof-ops-ee
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/vrubovoy/hof-ops-ee
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

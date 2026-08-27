@@ -1,0 +1,9 @@
+---
+# host.prepare - the one operation with no per-invocation identity of
+# its own beyond the fixed resource name "host" (see plan-v1.schema.json's
+# operation def) - there's nothing to parameterize yet. Real
+# implementation (PR #28): OS package baseline, Docker Engine + Compose
+# plugin installation when target-inspector.mjs's own Docker-absent
+# probe (see ADR 0004) confirmed it isn't there yet, kernel/sysctl
+# baseline, the fixed directory layout under /etc/hof and /var/lib/hof.
+hof_operation_id: null

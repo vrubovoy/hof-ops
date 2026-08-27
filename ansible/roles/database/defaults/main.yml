@@ -1,0 +1,7 @@
+---
+# database.migrate - hof_migrate_argv is the plan's own carried argv (the catalog's database.command, see plan-v1.schema.json's operation.argv) - never re-read from the catalog on the target.
+# Real implementation (PR #28/#29): runs argv inside a one-shot container against hof_migrate_volume, exactly like integration-matrix.mjs's own real `docker compose run --rm --no-deps` verification already does.
+hof_operation_id: null
+hof_migrate_argv: null
+hof_migrate_volume: null
+hof_migrate_schema: null

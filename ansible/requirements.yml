@@ -1,0 +1,24 @@
+---
+# Pinned exactly, resolved once here into the Execution Environment
+# image at build time - never floated to "whatever's current" against a
+# live target. Versions are the latest stable releases of each
+# collection as of this pass; bump deliberately, the same way any other
+# pinned dependency in this platform is bumped.
+collections:
+  # Docker/Compose module family (docker_container, docker_compose_v2,
+  # docker_volume, docker_network, docker_image, docker_secret, ...) -
+  # every host/volume/network/image/service role's own real
+  # implementation (PR #28/#29) is built on this, never a raw `command:`
+  # shelling out to `docker` itself.
+  - name: community.docker
+    version: "4.4.0"
+  # Generic file/mount/user/group primitives every role touching the
+  # target's filesystem needs (the host/config/secret roles in
+  # particular).
+  - name: ansible.posix
+    version: "2.0.0"
+  # community.crypto's certificate/key inspection modules - used by the
+  # config role to validate a supplied TLS certificate/key pair
+  # actually matches before writing it to the target (PR #28).
+  - name: community.crypto
+    version: "2.24.0"

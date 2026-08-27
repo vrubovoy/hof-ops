@@ -1,0 +1,5 @@
+---
+# config.write - copies hofctl render's own output (compose.yml, Caddyfile, service.env, ...) to the target's fixed generated-artifact paths.
+# Real implementation (PR #28/#29): writes each file, verifies its digest lands where target-probe.sh's own generated-artifacts check expects it, and (only when the Caddyfile specifically changed) folds in the gateway restart plan.mjs's own foldGatewayRestartForCaddyfile already scheduled as a separate service.stop/service.start pair.
+hof_operation_id: null
+hof_generated_files: null

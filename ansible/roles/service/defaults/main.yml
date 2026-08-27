@@ -1,0 +1,6 @@
+---
+# service.start / service.stop / service.remove - one Compose unit.
+# Real implementation (PR #28/#29): community.docker.docker_compose_v2 (or docker_container directly), scoped to exactly the one unit a given operation names - never a blanket `compose up`/`compose down` for the whole stack.
+hof_operation_id: null
+hof_service_unit: null
+hof_service_image: null

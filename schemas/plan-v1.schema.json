@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/plan-v1.schema.json",
+  "title": "Hof deployment plan",
+  "description": "hofctl plan's output contract - a typed, ordered operation list plus the desired diff and observed drift it was computed from. Never a shell string: every operation is a fixed action type with typed fields, per the reconciler's 'no generic shell endpoint' rule in PLATFORM-OPS-PLAN.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "planId", "mode", "executable", "baseline", "desired", "drift", "summary", "operations", "warnings", "blockers"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/plan/v1" },
+    "planId": {
+      "description": "sha256 of the plan's own inputs+baseline, deterministic - never includes a timestamp, so a future hofctl apply can reject a plan whose inputs changed underneath it.",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "mode": { "enum": ["bootstrap", "applied"] },
+    "executable": {
+      "description": "false when blockers is non-empty - apply must refuse a plan that isn't executable.",
+      "type": "boolean"
+    },
+    "baseline": { "$ref": "#/$defs/baselineState" },
+    "desired": { "$ref": "#/$defs/desiredState" },
+    "drift": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/driftEntry" }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "update", "remove", "migrate"],
+      "properties": {
+        "create": { "type": "integer", "minimum": 0 },
+        "update": { "type": "integer", "minimum": 0 },
+        "remove": { "type": "integer", "minimum": 0 },
+        "migrate": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "operations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/operation" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
+    "operationId": {
+      "description": "A three-digit sequence prefix (this plan's own execution order) plus a descriptive suffix - unlike volume/service identifiers, operation ids legitimately start with a digit.",
+      "type": "string",
+      "pattern": "^[0-9]{3}\\.[a-z][a-z0-9.-]{0,80}$"
+    },
+    "services": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["enabled", "artifacts"],
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "artifacts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["image"],
+              "properties": {
+                "image": { "type": ["string", "null"] }
+              }
+            }
+          },
+          "schemaVersion": {
+            "description": "Present only for a service with a catalog database entry - the release lock's declared schema version for its database component (from/to, see the catalog schema).",
+            "type": ["integer", "null"]
+          }
+        }
+      }
+    },
+    "volumes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/identifier" }
+    },
+    "baselineState": {
+      "description": "The last-applied state this plan is diffing from - either loaded from /var/lib/hof/state, or the synthetic empty baseline (mode: bootstrap, generation: 0) on a truly clean host.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "generation", "release", "services", "volumes"],
+      "properties": {
+        "mode": { "enum": ["bootstrap", "applied"] },
+        "generation": { "type": "integer", "minimum": 0 },
+        "release": { "type": ["string", "null"], "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "services": { "$ref": "#/$defs/services" },
+        "volumes": { "$ref": "#/$defs/volumes" }
+      }
+    },
+    "desiredState": {
+      "description": "What services.yml + the catalog + the release lock render to right now - a plain snapshot, not itself a generation.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release", "services", "volumes"],
+      "properties": {
+        "release": { "type": ["string", "null"], "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "services": { "$ref": "#/$defs/services" },
+        "volumes": { "$ref": "#/$defs/volumes" }
+      }
+    },
+    "driftEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resource", "kind", "detail"],
+      "properties": {
+        "resource": { "type": "string" },
+        "kind": {
+          "description": "manual-change: observed doesn't match the last-applied baseline for a resource desired still wants. missing: a managed resource baseline expects is gone from Docker. unmanaged: a resource matching this installation's naming exists but carries no hof.managed label.",
+          "enum": ["manual-change", "missing", "unmanaged"]
+        },
+        "detail": { "type": "string" }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "phase", "action", "resource", "reason"],
+      "properties": {
+        "id": { "$ref": "#/$defs/operationId" },
+        "phase": {
+          "enum": ["host", "secret", "volume", "image", "config", "backup", "service", "database", "readiness", "state"]
+        },
+        "action": {
+          "enum": [
+            "host.prepare", "secret.ensure", "volume.ensure", "image.verify", "image.pull", "config.write",
+            "backup.create", "service.stop", "database.migrate", "service.start", "readiness.wait", "state.commit"
+          ]
+        },
+        "resource": { "type": "string" },
+        "image": { "type": "string" },
+        "schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["from", "to", "rollbackCompatible"],
+          "properties": {
+            "from": { "type": "integer", "minimum": 0 },
+            "to": { "type": "integer", "minimum": 0 },
+            "rollbackCompatible": { "type": "boolean" }
+          }
+        },
+        "reason": { "type": "string" }
+      }
+    }
+  }
+}

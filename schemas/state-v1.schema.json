@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/state-v1.schema.json",
+  "title": "Hof last-applied deployment state",
+  "description": "/var/lib/hof/state/current.json - the authoritative record of what hofctl apply last actually did. Written only by a fully successful apply (out of scope for delivery item 7); hofctl plan reads it as the baseline for its desired diff. Never holds secrets or plaintext environment values - digests and identifiers only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion", "installationId", "generation", "lastSuccessfulOperationId", "appliedAt", "release",
+    "manifestDigest", "releaseLockDigest", "catalogDigest", "composeTemplateDigest", "topologyDigest",
+    "generatedArtifacts"
+  ],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/state/v1" },
+    "installationId": {
+      "description": "Assigned once, at first successful bootstrap, and never changed for the lifetime of this installation - it's what ties Docker resources (via the hof.installation-id label) back to this state file.",
+      "type": "string",
+      "minLength": 1
+    },
+    "generation": {
+      "description": "0 only for the synthetic bootstrap baseline that never touched a real host; every real apply is generation 1, 2, 3, ...",
+      "type": "integer",
+      "minimum": 0
+    },
+    "lastSuccessfulOperationId": { "type": ["string", "null"] },
+    "appliedAt": { "type": ["string", "null"], "format": "date-time" },
+    "release": { "type": ["string", "null"], "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "manifestDigest": { "$ref": "#/$defs/digestOrNull" },
+    "releaseLockDigest": { "$ref": "#/$defs/digestOrNull" },
+    "catalogDigest": { "$ref": "#/$defs/digestOrNull" },
+    "composeTemplateDigest": { "$ref": "#/$defs/digestOrNull" },
+    "topologyDigest": { "$ref": "#/$defs/digestOrNull" },
+    "generatedArtifacts": {
+      "description": "Filename -> sha256 for every file hofctl render produced (compose.yml, Caddyfile, service.env, ...) - lets a drift check notice a generated file was hand-edited after the fact.",
+      "type": "object",
+      "additionalProperties": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+    }
+  },
+  "$defs": {
+    "digestOrNull": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

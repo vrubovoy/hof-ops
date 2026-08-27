@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -28,6 +28,28 @@ function parseArgs(argv) {
 
 function digest(bytes) {
   return "sha256:" + createHash("sha256").update(bytes).digest("hex");
+}
+
+// GLOCKE_VAPID_PUBLIC_KEY/PRIVATE_KEY need real, matching P-256 key
+// material - Glocke's own config validates the key format, not just its
+// presence, so a generic placeholder string fails the same way a
+// too-short or non-distinct one did for the other secrets. VAPID's usual
+// encoding (the "web-push" package's own convention): the public key is
+// the uncompressed SEC1 point (0x04 || X || Y), the private key is the
+// raw scalar - both base64url, no padding.
+function generateVapidKeyPair() {
+  const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const publicJwk = publicKey.export({ format: "jwk" });
+  const privateJwk = privateKey.export({ format: "jwk" });
+  const uncompressedPoint = Buffer.concat([
+    Buffer.from([0x04]),
+    Buffer.from(publicJwk.x, "base64url"),
+    Buffer.from(publicJwk.y, "base64url"),
+  ]);
+  return {
+    publicKey: uncompressedPoint.toString("base64url"),
+    privateKey: Buffer.from(privateJwk.d, "base64url").toString("base64url"),
+  };
 }
 
 async function dockerCompose(file, project, args, environment = process.env) {
@@ -95,8 +117,11 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
       // check ("Directional HMAC secrets must be distinct") rejected
       // every producer sharing one placeholder value, and resolveSecret()
       // separately enforces a 32-byte minimum on each of them.
+      const vapidKeyPair = generateVapidKeyPair();
       for (const match of JSON.stringify(compose).matchAll(/\\?\$\{([A-Z0-9_]+):\?required\}/g)) {
-        environment[match[1]] = `gate6-contract-placeholder-${match[1].toLowerCase()}-0123456789`;
+        if (match[1] === "GLOCKE_VAPID_PUBLIC_KEY") environment[match[1]] = vapidKeyPair.publicKey;
+        else if (match[1] === "GLOCKE_VAPID_PRIVATE_KEY") environment[match[1]] = vapidKeyPair.privateKey;
+        else environment[match[1]] = `gate6-contract-placeholder-${match[1].toLowerCase()}-0123456789`;
       }
       // WACHTER_AGENT_TOKEN is an either/or with _FILE, so the render
       // template can't mark it `:?required` (Compose has no "one of"

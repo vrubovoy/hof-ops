@@ -3,32 +3,91 @@ import path from "node:path";
 import process from "node:process";
 
 import { renderFiles } from "./render-topology.mjs";
+import { validateDeployment } from "./validate-deployment.mjs";
+
+const BOOLEAN_FLAGS = new Set(["--skip-signature"]);
 
 function usage(message) {
   if (message) console.error(message);
   console.error("usage: hofctl render --services <services.yml> --release-lock <release-lock.json> --catalog <catalog.yaml> --out <directory>");
+  console.error("       hofctl validate --services <services.yml> --release-lock <release-lock.json> [--catalog <catalog.yaml>] [--release-selection <file>] [--stable-channel <file>] [--release-lock-signature <file>] [--release-lock-certificate <file>] [--release-lock-identity <identity>] [--release-lock-oidc-issuer <issuer>] [--skip-signature]");
   process.exitCode = 2;
 }
 
-const [command, ...args] = process.argv.slice(2);
-if (command !== "render") usage(command ? `unknown command: ${command}` : "a command is required");
-else {
+// Shared "--flag value" (or bare boolean "--flag") parser for every
+// subcommand - `--release-lock-identity` becomes `releaseLockIdentity`,
+// matching validateDeployment's own option shape.
+function parseFlags(args) {
   const options = {};
-  for (let index = 0; index < args.length; index += 2) {
+  for (let index = 0; index < args.length; index++) {
     const flag = args[index];
-    const value = args[index + 1];
-    if (!flag?.startsWith("--") || !value) { usage("render options must be --name value pairs"); break; }
-    options[flag.slice(2).replaceAll("-", "")] = path.resolve(value);
+    if (!flag?.startsWith("--")) { usage(`unexpected argument: ${flag}`); return null; }
+    const key = flag.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+    if (BOOLEAN_FLAGS.has(flag)) { options[key] = true; continue; }
+    const value = args[++index];
+    if (!value) { usage(`${flag} requires a value`); return null; }
+    options[key] = value;
   }
-  const normalized = { services: options.services, releaseLock: options.releaselock, catalog: options.catalog, out: options.out };
-  if (!process.exitCode && Object.values(normalized).some((value) => !value)) usage("render requires --services, --release-lock, --catalog, and --out");
-  if (!process.exitCode) {
-    try {
-      const files = await renderFiles(normalized);
-      console.log(`rendered ${files.join(", ")} to ${normalized.out}`);
-    } catch (error) {
-      console.error(error instanceof Error ? error.message : error);
-      process.exitCode = 1;
+  return options;
+}
+
+// Every path-valued option gets resolved against the CWD up front so the
+// rest of each subcommand never has to think about relative paths.
+function resolvePaths(options, keys) {
+  for (const key of keys) {
+    if (typeof options[key] === "string") options[key] = path.resolve(options[key]);
+  }
+  return options;
+}
+
+const [command, ...args] = process.argv.slice(2);
+
+if (command === "render") {
+  const options = parseFlags(args);
+  if (options) {
+    resolvePaths(options, ["services", "releaseLock", "catalog", "out"]);
+    const normalized = { services: options.services, releaseLock: options.releaseLock, catalog: options.catalog, out: options.out };
+    if (Object.values(normalized).some((value) => !value)) usage("render requires --services, --release-lock, --catalog, and --out");
+    else {
+      try {
+        const files = await renderFiles(normalized);
+        console.log(`rendered ${files.join(", ")} to ${normalized.out}`);
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : error);
+        process.exitCode = 1;
+      }
     }
   }
+} else if (command === "validate") {
+  const options = parseFlags(args);
+  if (options) {
+    resolvePaths(options, [
+      "servicesPath", "catalogPath", "releaseLockPath", "releaseSelectionPath", "stableChannelPath",
+      "releaseLockSignature", "releaseLockCertificate",
+    ]);
+    // hofctl's own CLI vocabulary matches render's (--services,
+    // --release-lock, --catalog); validateDeployment's option names are
+    // the more explicit *Path forms shared with its own standalone CLI.
+    const normalized = {
+      ...options,
+      servicesPath: options.services ? path.resolve(options.services) : options.servicesPath,
+      releaseLockPath: options.releaseLock ? path.resolve(options.releaseLock) : options.releaseLockPath,
+      catalogPath: options.catalog ? path.resolve(options.catalog) : options.catalogPath,
+    };
+    if (!normalized.servicesPath || !normalized.releaseLockPath) {
+      usage("validate requires --services and --release-lock");
+    } else {
+      try {
+        const errors = await validateDeployment(normalized);
+        for (const error of errors) console.log(JSON.stringify({ type: "validate.error", message: error }));
+        console.log(JSON.stringify({ type: "validate.result", valid: errors.length === 0, errorCount: errors.length }));
+        if (errors.length > 0) process.exitCode = 1;
+      } catch (error) {
+        console.log(JSON.stringify({ type: "validate.fatal", message: error instanceof Error ? error.message : String(error) }));
+        process.exitCode = 1;
+      }
+    }
+  }
+} else {
+  usage(command ? `unknown command: ${command}` : "a command is required");
 }

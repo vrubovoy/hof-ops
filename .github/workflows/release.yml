@@ -108,6 +108,13 @@ jobs:
               "${artifact}"
           done
 
+      - name: Confirm hofctl validate accepts the freshly signed release lock
+        run: |
+          node scripts/hofctl.mjs validate \
+            --services examples/services.yml \
+            --release-lock release-lock.json \
+            --release-lock-identity "${SIGNING_IDENTITY}"
+
       - name: Recheck release tag immutability before publication
         env:
           RELEASE: ${{ inputs.release }}

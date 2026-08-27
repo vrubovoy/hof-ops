@@ -1,0 +1,148 @@
+// Real transport acceptance test for target-inspector.mjs - run via
+// `pnpm test:ssh`, deliberately NOT matched by `test/*.test.mjs` (the
+// fast default `pnpm test` glob), since this needs Docker and takes
+// noticeably longer. Builds and starts a genuinely ephemeral, pinned
+// Debian 12 sshd container (ports and keys fresh per run, nothing
+// baked in, nothing left behind), and exercises inspectTarget()'s real
+// OpenSSH handshake end to end - both trust modes, a rejected stale
+// fingerprint, a rejected wrong identity, and the real target-probe.sh
+// parsing real host facts over the wire. No production host, ever.
+
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test, { after, before } from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+import { inspectTarget } from "../scripts/target-inspector.mjs";
+
+const exec = promisify(execFile);
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const fixtureDir = path.join(root, "test/fixtures/ssh-acceptance");
+const imageTag = "hof-ops-ssh-acceptance:test";
+const containerName = `hof-ssh-acceptance-${randomUUID()}`;
+
+let workDir;
+let hostPort;
+let userKeyPath;
+let knownHostsPath;
+let hostKeyFingerprint;
+
+async function waitForPort(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await exec("ssh-keyscan", ["-p", String(port), "-T", "2", "127.0.0.1"]);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+  throw new Error(`sshd on port ${port} never became reachable within ${timeoutMs}ms`);
+}
+
+before(async () => {
+  await exec("docker", ["build", "--quiet", "--tag", imageTag, fixtureDir], { timeout: 180_000 });
+
+  workDir = await mkdtemp(path.join(tmpdir(), "hof-ssh-acceptance-"));
+  const hostKeyPath = path.join(workDir, "host_key");
+  userKeyPath = path.join(workDir, "user_key");
+  await exec("ssh-keygen", ["-t", "ed25519", "-f", hostKeyPath, "-N", "", "-q"]);
+  await exec("ssh-keygen", ["-t", "ed25519", "-f", userKeyPath, "-N", "", "-q"]);
+  const { stdout: publicKey } = await exec("cat", [`${userKeyPath}.pub`]);
+  await writeFile(path.join(workDir, "authorized_keys"), publicKey, { mode: 0o644 });
+
+  await exec("docker", [
+    "run", "--detach", "--rm", "--name", containerName,
+    "--publish", "127.0.0.1::22",
+    "--volume", `${workDir}/host_key:/hof-keys/host_key:ro`,
+    "--volume", `${workDir}/authorized_keys:/hof-keys/authorized_keys:ro`,
+    imageTag,
+  ]);
+  const { stdout: containerPort } = await exec("docker", ["port", containerName, "22/tcp"]);
+  hostPort = Number(containerPort.trim().split(":").pop());
+
+  await waitForPort(hostPort, 30_000);
+
+  knownHostsPath = path.join(workDir, "known_hosts");
+  const { stdout: scanned } = await exec("ssh-keyscan", ["-p", String(hostPort), "-t", "ed25519", "127.0.0.1"]);
+  await writeFile(knownHostsPath, scanned);
+
+  const { stdout: fingerprintLine } = await exec("ssh-keygen", ["-l", "-E", "sha256", "-f", `${hostKeyPath}.pub`]);
+  hostKeyFingerprint = fingerprintLine.trim().split(/\s+/)[1];
+});
+
+after(async () => {
+  await exec("docker", ["rm", "--force", containerName]).catch(() => {});
+  if (workDir) await rm(workDir, { recursive: true, force: true });
+});
+
+test("real SSH handshake in known-hosts mode returns a genuine host snapshot", async () => {
+  const snapshot = await inspectTarget({
+    targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
+    identityFile: userKeyPath, knownHostsFile: knownHostsPath, connectTimeoutSeconds: 10,
+  });
+  assert.equal(snapshot.mode, "ssh");
+  assert.equal(snapshot.transport.verified, true);
+  assert.equal(snapshot.host.os.id, "debian");
+  assert.equal(snapshot.host.os.versionId, "12");
+  assert.equal(snapshot.host.architecture, "x86_64");
+  assert.ok(snapshot.host.cpuCores > 0);
+  assert.ok(snapshot.host.totalMemoryBytes > 0);
+});
+
+test("real SSH handshake in host-key-sha256 mode matches the real fingerprint and never leaves a temp known_hosts behind", async () => {
+  const before = await import("node:fs/promises").then((m) => m.readdir(tmpdir()));
+  const snapshot = await inspectTarget({
+    targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
+    identityFile: userKeyPath, hostKeySha256: hostKeyFingerprint, connectTimeoutSeconds: 10,
+  });
+  assert.equal(snapshot.transport.trustDigest, hostKeyFingerprint);
+  const after = await import("node:fs/promises").then((m) => m.readdir(tmpdir()));
+  assert.deepEqual(after.filter((n) => n.startsWith("hof-known-hosts-")), before.filter((n) => n.startsWith("hof-known-hosts-")));
+});
+
+test("a wrong host-key fingerprint is refused before any connection is attempted", async () => {
+  await assert.rejects(
+    () => inspectTarget({
+      targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
+      identityFile: userKeyPath, hostKeySha256: "SHA256:wrongwrongwrongwrongwrongwrongwrongwrongwro", connectTimeoutSeconds: 10,
+    }),
+    /no host key offered by 127\.0\.0\.1:\d+ matches the expected fingerprint/,
+  );
+});
+
+test("a stale known_hosts entry (real key rotation) is rejected by StrictHostKeyChecking, not silently accepted", async () => {
+  const staleDir = await mkdtemp(path.join(tmpdir(), "hof-ssh-stale-"));
+  try {
+    await exec("ssh-keygen", ["-t", "ed25519", "-f", path.join(staleDir, "other_key"), "-N", "", "-q"]);
+    const { stdout: otherPublic } = await exec("cat", [path.join(staleDir, "other_key.pub")]);
+    const staleKnownHosts = path.join(staleDir, "known_hosts");
+    await writeFile(staleKnownHosts, `[127.0.0.1]:${hostPort} ${otherPublic.trim().split(" ").slice(0, 2).join(" ")}\n`);
+
+    await assert.rejects(() => inspectTarget({
+      targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
+      identityFile: userKeyPath, knownHostsFile: staleKnownHosts, connectTimeoutSeconds: 10,
+    }));
+  } finally {
+    await rm(staleDir, { recursive: true, force: true });
+  }
+});
+
+test("a wrong identity key is refused by real publickey auth, not silently treated as an empty host", async () => {
+  const wrongKeyDir = await mkdtemp(path.join(tmpdir(), "hof-ssh-wrongkey-"));
+  try {
+    const wrongKeyPath = path.join(wrongKeyDir, "wrong_key");
+    await exec("ssh-keygen", ["-t", "ed25519", "-f", wrongKeyPath, "-N", "", "-q"]);
+    await assert.rejects(() => inspectTarget({
+      targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
+      identityFile: wrongKeyPath, knownHostsFile: knownHostsPath, connectTimeoutSeconds: 10,
+    }), /Permission denied/);
+  } finally {
+    await rm(wrongKeyDir, { recursive: true, force: true });
+  }
+});

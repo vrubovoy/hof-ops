@@ -37,6 +37,27 @@ function publicOrigin(service, manifest, catalogById) {
   return `https://${hostname ? `${hostname}.` : ""}${manifest.domains.base}`;
 }
 
+// Shared with hofctl preflight's DNS check, which needs the exact same
+// "which services get their own public hostname" answer renderCaddy
+// already computes, without pulling in a release lock (preflight has
+// no need for one - it's checking the host, not the release).
+export function enabledServiceIds(manifest, catalog) {
+  return catalog.services
+    .filter((service) => service.mandatory || manifest.services?.[service.id]?.enabled === true)
+    .map((service) => service.id);
+}
+
+export function publicHostnames(manifest, catalog) {
+  const catalogById = new Map(catalog.services.map((service) => [service.id, service]));
+  const hostnames = enabledServiceIds(manifest, catalog)
+    .filter((id) => id === "schloss" || catalogById.get(id).hostname !== null)
+    .map((id) => {
+      const hostname = catalogById.get(id).hostname;
+      return hostname ? `${hostname}.${manifest.domains.base}` : manifest.domains.base;
+    });
+  return [...new Set(hostnames)];
+}
+
 function envName(service) {
   return service.toUpperCase().replaceAll("-", "_");
 }
@@ -82,9 +103,7 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
   }
 
   const catalogById = new Map(catalog.services.map((service) => [service.id, service]));
-  const enabledIds = catalog.services
-    .filter((service) => service.mandatory || manifest.services?.[service.id]?.enabled === true)
-    .map((service) => service.id);
+  const enabledIds = enabledServiceIds(manifest, catalog);
   const enabled = new Set(enabledIds);
   for (const id of enabled) {
     for (const dependency of catalogById.get(id).dependsOn) {

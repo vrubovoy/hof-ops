@@ -1,0 +1,5 @@
+---
+# volume.ensure - a named, Hof-labeled Docker volume (see render-topology.mjs's own resourceOwnershipLabels).
+# Real implementation (PR #28/#29): community.docker.docker_volume, idempotent, with the exact same hof.managed/installation-id/generation/kind/resource labels the renderer already puts on it.
+hof_operation_id: null
+hof_volume_name: null

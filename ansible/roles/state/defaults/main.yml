@@ -1,0 +1,5 @@
+---
+# state.commit - always the last operation in any plan, only once every prior operation has already succeeded (see plan.mjs's own buildOperations ordering).
+# Real implementation (PR #28/#29): writes /var/lib/hof/state/current.json (and topology.json) atomically (write-then-rename, see ADR 0004) - a host must never be observable with Docker resources but no committed generation, or a commit with a prior operation that actually failed.
+hof_operation_id: null
+hof_state_generation: null

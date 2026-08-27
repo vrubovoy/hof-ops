@@ -1,0 +1,21 @@
+---
+# Skeleton only (item 8, PR #26) - real database implementation lands in
+# a later item-8 PR (see defaults/main.yml). Every role in this
+# Execution Environment enforces its own operation's variable contract
+# even before it does real work, so a caller (hofctl apply's own
+# dispatcher, PR #27) that got the typed operation-to-role mapping
+# wrong fails loudly here, not deep inside a half-applied task.
+- name: Assert this operation's own required variables are present
+  ansible.builtin.assert:
+    that:
+      - hof_operation_id is not none
+      - hof_migrate_argv is not none
+      - hof_migrate_volume is not none
+      - hof_migrate_schema is not none
+    fail_msg: "database role requires hof_operation_id, hof_migrate_argv, hof_migrate_volume, hof_migrate_schema - never invoked without them"
+
+- name: database is not yet implemented
+  ansible.builtin.debug:
+    msg: >-
+      database skeleton reached for operation {{ hof_operation_id }} -
+      real implementation lands in a later item-8 PR.

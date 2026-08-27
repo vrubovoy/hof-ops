@@ -1,0 +1,6 @@
+---
+# image.verify / image.pull - hof_image_trust is the plan-v2 operation's own carried policy ({policy: signed, signatureIdentity, signatureOidcIssuer} or {policy: digest-only} - see plan-v2.schema.json), never re-derived from the release lock on the target.
+# Real implementation (PR #28/#29): community.docker.docker_image pull by digest, plus (for policy: signed only) a real cosign verify against the carried identity/issuer before the image is trusted.
+hof_operation_id: null
+hof_image_reference: null
+hof_image_trust: null

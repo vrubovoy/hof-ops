@@ -3,6 +3,16 @@ release: 1.0.0
 minimumHofctlVersion: 0.1.0
 catalog: catalog/services-v1.yaml
 composeTemplate: scripts/render-topology.mjs
+# Versions independently of the platform release, like every other
+# component here - see ansible/README.md's own "Versioning" section for
+# why its tag is ee-vX.Y.Z, never plain vX.Y.Z.
+ansibleEnvironment:
+  repository: vrubovoy/hof-ops
+  version: 0.1.0
+  image: ghcr.io/vrubovoy/hof-ops-ee:v0.1.0
+  workflowIdentity: https://github.com/vrubovoy/hof-ops/.github/workflows/execution-environment.yml@refs/tags/ee-v0.1.0
+  oidcIssuer: https://token.actions.githubusercontent.com
+  requiredChecks: [ansible]
 components:
   gateway:
     image: docker.io/library/caddy:2.10.2-alpine

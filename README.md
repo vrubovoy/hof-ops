@@ -47,10 +47,19 @@ provenance; `scripts/build-release-lock.mjs` resolves and independently
 re-verifies all of that into a real, schema-valid `release-lock.json`, and
 [`.github/workflows/release.yml`](.github/workflows/release.yml) signs that
 file itself and publishes it as a GitHub Release
-(`gh release list --repo vrubovoy/hof-ops`). Host reconciliation,
-backup/restore, upgrade/rollback, first-admin bootstrap, and the installer
-are not implemented yet — see the Delivery Order in the plan linked above
-for what comes next.
+(`gh release list --repo vrubovoy/hof-ops`).
+
+`hofctl`'s read-only pipeline is implemented end to end: `hofctl validate`
+checks a real deployment's contracts, digests, and the release lock's own
+Cosign signature; `hofctl preflight` inspects the actual target host over a
+hardened SSH transport (disk/RAM/CPU/clock/DNS/ports/Docker); `hofctl plan`
+chains both, resolves the last-applied state (or a synthetic bootstrap
+baseline on a genuinely clean host), computes drift against what's actually
+running, and prints one typed, ordered `plan-v1` operation list to stdout -
+never writing anything, anywhere. `hofctl apply` (actually executing a
+plan), backup/restore, upgrade/rollback, first-admin bootstrap, and the
+installer are not implemented yet — see the Delivery Order in the plan
+linked above for what comes next.
 
 ## The three contracts
 
@@ -99,6 +108,39 @@ The renderer writes `compose.yml`, `Caddyfile`, `runtime-config.json`,
 identical inputs produces byte-identical files. Secret values are not part of
 the contracts or generated files; Compose placeholders refer to the required
 deployment environment only when the corresponding integration is enabled.
+
+## Planning a deployment
+
+`hofctl plan` is strictly read-only: it validates the deployment (schema,
+cross-contract, digest freshness, and the release lock's real Cosign
+signature — never skippable here, unlike `validate`), inspects the target
+host exactly once over the same hardened SSH transport `preflight` uses,
+refuses to proceed against an incomplete observation (a partial Docker
+listing, an unreadable state file, missing generated-artifact checksums),
+resolves the last-applied state (or a synthetic bootstrap baseline on a
+genuinely clean host), and prints one typed, ordered operation list to
+stdout as a single `plan-v1` JSON document — nothing else ever reaches
+stdout, so it composes cleanly with `jq` or any other tool.
+
+```sh
+node scripts/hofctl.mjs plan \
+  --services examples/services.yml \
+  --release-lock examples/release-lock.json \
+  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/tags/v1.0.0" \
+  --known-hosts ~/.ssh/known_hosts
+```
+
+Exit code `0` means the plan is executable as-is; `1` means it's blocked
+(drift, an incomplete observation, or a failed validation/inspection) or a
+runtime failure occurred; `2` means a usage error (a missing, duplicate, or
+unknown flag — `--skip-signature` is one of the flags it refuses outright).
+A resource Docker already shows drifted from the last apply is reported and
+blocks by default; pass `--repair-drift` to fold a manual container change
+or a hand-modified generated file back into the plan (an unmanaged
+resource, or a persistent volume that's simply gone, is never auto-adopted
+or auto-recreated, `--repair-drift` or not). `hofctl apply` — actually
+executing a plan against the target — is a separate, not-yet-implemented
+delivery item.
 
 ## Cutting a release
 

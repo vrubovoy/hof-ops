@@ -79,6 +79,11 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
       for (const match of JSON.stringify(compose).matchAll(/\\?\$\{([A-Z0-9_]+):\?required\}/g)) {
         environment[match[1]] = "gate6-contract-value";
       }
+      // WACHTER_AGENT_TOKEN is an either/or with _FILE, so the render
+      // template can't mark it `:?required` (Compose has no "one of"
+      // syntax) - it's genuinely required by the running agent/API,
+      // though, and must clear its own 32-byte minimum.
+      if (compose.services.wachter) environment.WACHTER_AGENT_TOKEN = "gate6-integration-matrix-wachter-agent-token";
       await dockerCompose(composePath, compose.name, ["config", "--quiet"], environment);
       const { stdout } = await dockerCompose(composePath, compose.name, ["config", "--images"], environment);
       const renderedImages = new Set(stdout.trim().split("\n").filter(Boolean));
@@ -89,9 +94,19 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
       if (runtime) {
         await dockerCompose(composePath, compose.name, ["pull", "--quiet"], environment);
         try {
-          await dockerCompose(composePath, compose.name, ["create", "--no-build"], environment);
+          // --wait blocks until every service with a healthcheck reports
+          // healthy (or fails loudly if one doesn't within the timeout) -
+          // this is what actually exercises the wrong-port/wrong-command/
+          // migration-never-runs class of bug that `create` alone (no
+          // process ever starts) and `config` alone (static text only)
+          // both silently pass.
+          await dockerCompose(composePath, compose.name, ["up", "--detach", "--wait", "--wait-timeout", "180"], environment);
+        } catch (error) {
+          const { stdout: logs } = await dockerCompose(composePath, compose.name, ["logs", "--no-color", "--tail", "40"], environment)
+            .catch(() => ({ stdout: "(could not fetch logs)" }));
+          throw new Error(`${fixtureName}: services did not become healthy\n${logs}\n${error.message}`);
         } finally {
-          await dockerCompose(composePath, compose.name, ["down", "--remove-orphans"], environment);
+          await dockerCompose(composePath, compose.name, ["down", "--remove-orphans", "--volumes"], environment);
         }
       }
       console.log(`${fixtureName}: pinned Compose ${runtime ? "config/runtime" : "config"} contract passed`);

@@ -42,6 +42,19 @@ function resolvePaths(options, keys) {
   return options;
 }
 
+// Number("nope") is NaN, and NaN < anything is false - a garbage
+// --min-free-disk-gb would otherwise make every threshold check
+// silently pass instead of failing loudly on bad input. Returns
+// undefined when the flag wasn't given at all; throws a flagName-
+// tagged error (caught by the caller, turned into one usage() call) on
+// a given-but-invalid value.
+function parsePositiveNumber(rawValue, flagName) {
+  if (rawValue === undefined) return undefined;
+  const value = Number(rawValue);
+  if (!Number.isFinite(value) || value < 0) throw new Error(`${flagName} must be a non-negative number, got ${JSON.stringify(rawValue)}`);
+  return value;
+}
+
 const [command, ...args] = process.argv.slice(2);
 
 if (command === "render") {
@@ -104,26 +117,34 @@ if (command === "render") {
     } else if (targetMode === "local" && (options.knownHosts || options.hostKeySha256 || options.identityFile)) {
       usage("--target-mode local does not accept --known-hosts/--host-key-sha256/--identity-file");
     } else {
-      const preflightOptions = {
-        manifestPath: options.services,
-        catalogPath: options.catalog,
-        targetMode,
-        knownHostsFile: options.knownHosts,
-        hostKeySha256: options.hostKeySha256,
-        identityFile: options.identityFile,
-        connectTimeoutSeconds: options.connectTimeoutSeconds ? Number(options.connectTimeoutSeconds) : undefined,
-      };
-      if (options.minFreeDiskGb) preflightOptions.minFreeDiskBytes = Number(options.minFreeDiskGb) * 1024 ** 3;
-      if (options.minMemoryGb) preflightOptions.minTotalMemoryBytes = Number(options.minMemoryGb) * 1024 ** 3;
-      if (options.minCpuCores) preflightOptions.minCpuCores = Number(options.minCpuCores);
       try {
+        const connectTimeoutSeconds = parsePositiveNumber(options.connectTimeoutSeconds, "--connect-timeout-seconds");
+        const minFreeDiskGb = parsePositiveNumber(options.minFreeDiskGb, "--min-free-disk-gb");
+        const minMemoryGb = parsePositiveNumber(options.minMemoryGb, "--min-memory-gb");
+        const minCpuCores = parsePositiveNumber(options.minCpuCores, "--min-cpu-cores");
+        const preflightOptions = {
+          manifestPath: options.services,
+          catalogPath: options.catalog,
+          targetMode,
+          knownHostsFile: options.knownHosts,
+          hostKeySha256: options.hostKeySha256,
+          identityFile: options.identityFile,
+          connectTimeoutSeconds,
+          ...(minFreeDiskGb !== undefined ? { minFreeDiskBytes: minFreeDiskGb * 1024 ** 3 } : {}),
+          ...(minMemoryGb !== undefined ? { minTotalMemoryBytes: minMemoryGb * 1024 ** 3 } : {}),
+          ...(minCpuCores !== undefined ? { minCpuCores } : {}),
+        };
         const { checks, ok } = await runPreflight(preflightOptions);
         for (const entry of checks) console.log(JSON.stringify({ type: "preflight.check", ...entry }));
         console.log(JSON.stringify({ type: "preflight.result", ok }));
         if (!ok) process.exitCode = 1;
       } catch (error) {
-        console.log(JSON.stringify({ type: "preflight.fatal", message: error instanceof Error ? error.message : String(error) }));
-        process.exitCode = 1;
+        if (/must be a non-negative number/.test(error?.message ?? "")) {
+          usage(error.message);
+        } else {
+          console.log(JSON.stringify({ type: "preflight.fatal", message: error instanceof Error ? error.message : String(error) }));
+          process.exitCode = 1;
+        }
       }
     }
   }

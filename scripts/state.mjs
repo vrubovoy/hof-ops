@@ -23,6 +23,16 @@ function stableStringify(value) {
   return JSON.stringify(value);
 }
 
+// Bookkeeping labels a real apply changes on every single run by design
+// (the generation counter bumps every time, whether or not anything
+// else did) - fingerprinting them would make every unit look "changed"
+// on every apply, defeating the whole no-op guarantee. hof.installation-
+// id is excluded too (fixed for the life of an installation in
+// practice, but never something a *configuration* change legitimately
+// touches). hof.service/hof.unit/hof.artifact/hof.managed stay in scope
+// - they're stable identity, not per-apply bookkeeping.
+const FINGERPRINT_EXCLUDED_LABELS = new Set(["hof.installation-id", "hof.generation"]);
+
 // A unit's full rendered Compose definition, not just its image - a
 // domain/CORS/browserPush/TLS-driven environment change must register as
 // a real diff even when the pinned image tag didn't move. The gateway
@@ -30,7 +40,38 @@ function stableStringify(value) {
 // one generated artifact a Compose service definition alone doesn't
 // capture at all (it's a bind-mounted file, not an env var).
 function unitConfigFingerprint(definition, unit, rendered) {
-  return sha256(Buffer.from(stableStringify({ definition, caddyfile: unit === "gateway" ? rendered.caddyfile : undefined })));
+  const stableLabels = definition.labels
+    ? Object.fromEntries(Object.entries(definition.labels).filter(([key]) => !FINGERPRINT_EXCLUDED_LABELS.has(key)))
+    : definition.labels;
+  const stableDefinition = { ...definition, labels: stableLabels };
+  return sha256(Buffer.from(stableStringify({ definition: stableDefinition, caddyfile: unit === "gateway" ? rendered.caddyfile : undefined })));
+}
+
+// topologyToServiceState() is handed either a freshly rendered
+// renderTopology() output (always well-formed) or a loaded, previously
+// untrusted JSON blob (managedState.topology, over the wire from
+// target-probe.sh). This is the state directory's own topology.json -
+// deliberately NOT the same shape as `hofctl render`'s own topology.json
+// output file (which is just the inner `.topology` object, for a
+// different purpose - a human/installer-facing summary). A future
+// hofctl apply must write the FULL wrapper ({compose, caddyfile,
+// topology, backup, ...}) to /var/lib/hof/state/topology.json, or this
+// throws a clear error instead of a confusing "cannot read properties
+// of undefined" deep inside the loop below.
+function assertRenderedShape(rendered) {
+  if (
+    !rendered || typeof rendered !== "object"
+    || !rendered.compose || typeof rendered.compose.services !== "object"
+    || typeof rendered.caddyfile !== "string"
+    || !rendered.topology || !Array.isArray(rendered.topology.enabledServices)
+    || !rendered.backup
+  ) {
+    throw new Error(
+      "managed state's topology.json is not a full rendered-topology wrapper " +
+      "({compose, caddyfile, topology, backup}) - it must never be just the inner " +
+      "`topology` object (that shape is hofctl render's own output file, a different thing)",
+    );
+  }
 }
 
 // Turns a renderTopology() output into the same {services, volumes, ...}
@@ -46,6 +87,7 @@ function unitConfigFingerprint(definition, unit, rendered) {
 // topology.json doesn't have the original files to hash, and trusts
 // current.json's own recorded digests instead (see resolveBaseline).
 export function topologyToServiceState(rendered, catalog, { manifest, releaseLock } = {}) {
+  assertRenderedShape(rendered);
   const enabledIds = new Set(rendered.topology.enabledServices);
   const services = {};
   for (const service of catalog.services) {

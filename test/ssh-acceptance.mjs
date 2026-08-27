@@ -78,6 +78,9 @@ before(async () => {
 
 after(async () => {
   await exec("docker", ["rm", "--force", containerName]).catch(() => {});
+  // Doesn't leave a stale, unpinned local image sitting around after
+  // the run - the fixture is meant to be genuinely ephemeral end to end.
+  await exec("docker", ["rmi", "--force", imageTag]).catch(() => {});
   if (workDir) await rm(workDir, { recursive: true, force: true });
 });
 
@@ -144,5 +147,67 @@ test("a wrong identity key is refused by real publickey auth, not silently treat
     }), /Permission denied/);
   } finally {
     await rm(wrongKeyDir, { recursive: true, force: true });
+  }
+});
+
+test("Docker genuinely absent from the target is reported as unavailable, not an empty-but-fine host", async () => {
+  const snapshot = await inspectTarget({
+    targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
+    identityFile: userKeyPath, knownHostsFile: knownHostsPath, connectTimeoutSeconds: 10,
+  });
+  assert.equal(snapshot.docker.engineAvailable, false);
+  assert.equal(snapshot.docker.composeAvailable, false);
+  assert.equal(snapshot.docker.resourcesStatus, "unavailable");
+});
+
+test("managed state genuinely absent on a fresh container reads as absent, not unreadable", async () => {
+  const snapshot = await inspectTarget({
+    targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
+    identityFile: userKeyPath, knownHostsFile: knownHostsPath, connectTimeoutSeconds: 10,
+  });
+  assert.equal(snapshot.managedState.currentStatus, "absent");
+  assert.equal(snapshot.managedState.current, null);
+  assert.equal(snapshot.managedState.topologyStatus, "absent");
+});
+
+test("a real, readable current.json on the target parses through as genuine JSON content over the real transport", async () => {
+  const current = {
+    apiVersion: "hof.dev/state/v1", installationId: "real-transport-test", generation: 2,
+    lastSuccessfulOperationId: "op-1", appliedAt: "2026-08-27T10:00:00Z", release: "0.1.1",
+    manifestDigest: "sha256:" + "1".repeat(64), releaseLockDigest: "sha256:" + "2".repeat(64),
+    catalogDigest: "sha256:" + "3".repeat(64), composeTemplateDigest: "sha256:" + "4".repeat(64),
+    topologyDigest: "sha256:" + "5".repeat(64), generatedArtifacts: {},
+  };
+  await exec("docker", [
+    "exec", containerName, "sh", "-c",
+    `mkdir -p /var/lib/hof/state && cat > /var/lib/hof/state/current.json <<'JSON'\n${JSON.stringify(current)}\nJSON\nchmod 644 /var/lib/hof/state/current.json`,
+  ]);
+  try {
+    const snapshot = await inspectTarget({
+      targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
+      identityFile: userKeyPath, knownHostsFile: knownHostsPath, connectTimeoutSeconds: 10,
+    });
+    assert.equal(snapshot.managedState.currentStatus, "present");
+    assert.deepEqual(snapshot.managedState.current, current);
+  } finally {
+    await exec("docker", ["exec", containerName, "rm", "-f", "/var/lib/hof/state/current.json"]);
+  }
+});
+
+test("a state file that exists but this user genuinely cannot read (no sudo, mode 600, root-owned) reports unreadable - never silently treated as absent", async () => {
+  await exec("docker", [
+    "exec", containerName, "sh", "-c",
+    "mkdir -p /var/lib/hof/state && echo '{}' > /var/lib/hof/state/current.json && chown root:root /var/lib/hof/state/current.json && chmod 600 /var/lib/hof/state/current.json",
+  ]);
+  try {
+    const snapshot = await inspectTarget({
+      targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
+      identityFile: userKeyPath, knownHostsFile: knownHostsPath, connectTimeoutSeconds: 10,
+    });
+    assert.equal(snapshot.host.sudoNonInteractive, false, "hofprobe has no sudoers entry in this fixture, by design");
+    assert.equal(snapshot.managedState.currentStatus, "unreadable");
+    assert.equal(snapshot.managedState.current, null);
+  } finally {
+    await exec("docker", ["exec", containerName, "rm", "-f", "/var/lib/hof/state/current.json"]);
   }
 });

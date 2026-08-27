@@ -11,12 +11,16 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { after, before } from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { inspectTarget } from "../scripts/target-inspector.mjs";
 
+const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const fakeBinDir = path.join(root, "test/fixtures/target-probe-fake-docker");
 
@@ -44,11 +48,45 @@ function fakeDockerEnv(scenario) {
   return { PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH}`, HOF_TEST_SCENARIO: scenario };
 }
 
+// A real, from-scratch PATH containing every tool target-probe.sh
+// itself needs (resolved off the real system PATH, via `which`) plus
+// the existing fake sudo (its generic true/cat/test/sha256sum handlers
+// keep sudo_reads working) - but genuinely NO docker binary anywhere on
+// it, real or fake. `command -v docker` fails for real here, exactly
+// like it would on a fresh host Ansible hasn't provisioned yet - there
+// is no way to fake "absent" by exiting 1 from a stub, since the whole
+// point is that no file named "docker" exists on PATH at all.
+let noDockerBinDir;
+const REQUIRED_TOOLS = ["awk", "sed", "sort", "cat", "base64", "df", "uname", "nproc", "tr", "sh", "node"];
+const OPTIONAL_TOOLS = ["ss", "netstat", "timedatectl"];
+
+before(async () => {
+  noDockerBinDir = await mkdtemp(path.join(tmpdir(), "hof-no-docker-path-"));
+  for (const tool of REQUIRED_TOOLS) {
+    const { stdout } = await exec("which", [tool]);
+    await symlink(stdout.trim(), path.join(noDockerBinDir, tool));
+  }
+  for (const tool of OPTIONAL_TOOLS) {
+    try {
+      const { stdout } = await exec("which", [tool]);
+      await symlink(stdout.trim(), path.join(noDockerBinDir, tool));
+    } catch {
+      // Genuinely optional - target-probe.sh itself already falls back
+      // to "unknown"/tries the next tool when one of these is missing.
+    }
+  }
+  await symlink(path.join(fakeBinDir, "sudo"), path.join(noDockerBinDir, "sudo"));
+});
+
+after(async () => {
+  if (noDockerBinDir) await rm(noDockerBinDir, { recursive: true, force: true });
+});
+
 test("Docker reachable only via sudo: docker_run()'s plain-then-sudo fallback actually reaches a real container listing", async () => {
   const snapshot = await inspectTarget({ targetMode: "local", run: runWithEnv(fakeDockerEnv("sudo-only-success")) });
 
   assert.equal(snapshot.host.sudoNonInteractive, true);
-  assert.equal(snapshot.docker.engineAvailable, true);
+  assert.equal(snapshot.docker.engineStatus, "available");
   assert.equal(snapshot.docker.composeAvailable, true);
   assert.equal(snapshot.docker.containersStatus, "available");
   assert.equal(snapshot.docker.resources.length, 1);
@@ -78,8 +116,31 @@ test("one of several docker inspect calls failing taints the whole containers ba
   // Docker itself is still genuinely reachable (engine/compose both
   // answered) - this is specifically a listing/inspect failure, not
   // "Docker is down".
-  assert.equal(snapshot.docker.engineAvailable, true);
+  assert.equal(snapshot.docker.engineStatus, "available");
   assert.equal(snapshot.docker.composeAvailable, true);
+});
+
+test("Docker genuinely absent from PATH (no docker binary at all, real or fake) is reported absent on the engine and all three resource kinds, not unavailable", async () => {
+  const snapshot = await inspectTarget({ targetMode: "local", run: runWithEnv({ PATH: noDockerBinDir }) });
+
+  assert.equal(snapshot.docker.engineStatus, "absent");
+  assert.equal(snapshot.docker.composeAvailable, false);
+  assert.equal(snapshot.docker.containersStatus, "absent");
+  assert.equal(snapshot.docker.volumesStatus, "absent");
+  assert.equal(snapshot.docker.networksStatus, "absent");
+  assert.deepEqual(snapshot.docker.resources, []);
+  assert.deepEqual(snapshot.docker.volumes, []);
+  assert.deepEqual(snapshot.docker.networks, []);
+});
+
+test("Docker installed but genuinely unreachable (every call fails, even via sudo) is reported unavailable, never confused with absent", async () => {
+  const snapshot = await inspectTarget({ targetMode: "local", run: runWithEnv(fakeDockerEnv("docker-down")) });
+
+  assert.equal(snapshot.docker.engineStatus, "unavailable");
+  assert.equal(snapshot.docker.composeAvailable, false);
+  assert.equal(snapshot.docker.containersStatus, "unavailable");
+  assert.equal(snapshot.docker.volumesStatus, "unavailable");
+  assert.equal(snapshot.docker.networksStatus, "unavailable");
 });
 
 // The positive-confirmation-only absence policy's "yes, genuinely

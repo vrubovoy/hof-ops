@@ -96,6 +96,13 @@ test("real SSH handshake in known-hosts mode returns a genuine host snapshot", a
   assert.equal(snapshot.host.architecture, "x86_64");
   assert.ok(snapshot.host.cpuCores > 0);
   assert.ok(snapshot.host.totalMemoryBytes > 0);
+  // ADR 0004's exact target binding: known-hosts mode must return the
+  // real accepted key's own fingerprint (parsed from a real ssh -v
+  // transcript), not null - and it must match the same real host key
+  // this whole fixture was built from, independently confirmed here via
+  // the exact same `ssh-keygen -l -E sha256` ground truth the
+  // host-key-sha256 test below already trusts.
+  assert.equal(snapshot.transport.trustDigest, hostKeyFingerprint);
 });
 
 test("real SSH handshake in host-key-sha256 mode matches the real fingerprint and never leaves a temp known_hosts behind", async () => {
@@ -150,16 +157,22 @@ test("a wrong identity key is refused by real publickey auth, not silently treat
   }
 });
 
-test("Docker genuinely absent from the target is reported as unavailable on all three resource kinds, not an empty-but-fine host", async () => {
+// This fixture container never installs Docker at all (see its own
+// Dockerfile - openssh-server/sudo/ca-certificates only) - a real
+// stand-in for a genuinely fresh, un-provisioned host. Per ADR 0004's
+// "Docker Absent" rules, that must report "absent", a legitimate
+// bootstrap candidate, never "unavailable" (which means installed but
+// unreachable - a real, different failure).
+test("Docker genuinely absent (never installed) from the target is reported absent on the engine and all three resource kinds, not unavailable", async () => {
   const snapshot = await inspectTarget({
     targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
     identityFile: userKeyPath, knownHostsFile: knownHostsPath, connectTimeoutSeconds: 10,
   });
-  assert.equal(snapshot.docker.engineAvailable, false);
+  assert.equal(snapshot.docker.engineStatus, "absent");
   assert.equal(snapshot.docker.composeAvailable, false);
-  assert.equal(snapshot.docker.containersStatus, "unavailable");
-  assert.equal(snapshot.docker.volumesStatus, "unavailable");
-  assert.equal(snapshot.docker.networksStatus, "unavailable");
+  assert.equal(snapshot.docker.containersStatus, "absent");
+  assert.equal(snapshot.docker.volumesStatus, "absent");
+  assert.equal(snapshot.docker.networksStatus, "absent");
   assert.deepEqual(snapshot.docker.resources, []);
   assert.deepEqual(snapshot.docker.volumes, []);
   assert.deepEqual(snapshot.docker.networks, []);

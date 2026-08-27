@@ -24,7 +24,7 @@ function fakeSnapshot(overrides = {}) {
     },
     ports: [{ port: 80, state: "free", owner: null }, { port: 443, state: "free", owner: null }],
     docker: {
-      engineAvailable: true, composeAvailable: true,
+      engineStatus: "available", composeAvailable: true,
       containersStatus: "available", resources: [],
       volumesStatus: "available", volumes: [],
       networksStatus: "available", networks: [],
@@ -113,7 +113,7 @@ test("checkPort: unknown state, or a missing record entirely, fails closed as un
 
 test("checkDocker requires engine, compose, and successful containers/volumes/networks listings, each independently", () => {
   assert.equal(checkDocker(fakeSnapshot()).status, "pass");
-  assert.equal(checkDocker(fakeSnapshot({ docker: { ...fakeSnapshot().docker, engineAvailable: false } })).status, "fail");
+  assert.equal(checkDocker(fakeSnapshot({ docker: { ...fakeSnapshot().docker, engineStatus: "unavailable" } })).status, "fail");
   assert.equal(checkDocker(fakeSnapshot({ docker: { ...fakeSnapshot().docker, composeAvailable: false } })).status, "fail");
 
   const containersDown = checkDocker(fakeSnapshot({ docker: { ...fakeSnapshot().docker, containersStatus: "unavailable" } }));
@@ -134,6 +134,23 @@ test("checkDocker requires engine, compose, and successful containers/volumes/ne
   const allDown = checkDocker(fakeSnapshot({ docker: { ...fakeSnapshot().docker, containersStatus: "unavailable", volumesStatus: "unavailable", networksStatus: "unavailable" } }));
   assert.equal(allDown.status, "fail");
   assert.match(allDown.message, /its containers\/volumes\/networks listing could not be read/);
+});
+
+// A fresh host that never had Docker installed is a legitimate
+// bootstrap candidate, not a failed preflight - "Docker Engine is not
+// reachable" would wrongly suggest something's broken. See ADR 0004's
+// "Docker Absent" rules: preflight reports that Docker WILL be
+// installed, never that it's already available.
+test("checkDocker passes (not fails) when Docker is genuinely absent, with an informational message rather than a false 'not reachable'", () => {
+  const result = checkDocker(fakeSnapshot({ docker: { engineStatus: "absent", composeAvailable: false, containersStatus: "absent", resources: [], volumesStatus: "absent", volumes: [], networksStatus: "absent", networks: [] } }));
+  assert.equal(result.status, "pass");
+  assert.match(result.message, /will be installed during bootstrap apply/);
+});
+
+test("checkDocker still fails closed when Docker is unavailable (installed but unreachable), never confused with absent", () => {
+  const result = checkDocker(fakeSnapshot({ docker: { ...fakeSnapshot().docker, engineStatus: "unavailable" } }));
+  assert.equal(result.status, "fail");
+  assert.match(result.message, /Docker Engine is not reachable/);
 });
 
 test("checkManagedStateReadable fails when either state file exists but couldn't be read, even with sudo", () => {
@@ -269,7 +286,7 @@ test("runPreflight: ok is true when every check genuinely passes against a faked
 });
 
 test("runPreflight: ok is false whenever any single check fails or is unknown", async () => {
-  const inspect = async () => fakeSnapshot({ host: { ...fakeSnapshot().host, clockSynchronized: null }, docker: { ...fakeSnapshot().docker, engineAvailable: false } });
+  const inspect = async () => fakeSnapshot({ host: { ...fakeSnapshot().host, clockSynchronized: null }, docker: { ...fakeSnapshot().docker, engineStatus: "unavailable" } });
   const { checks, ok } = await runPreflight({
     manifestPath: path.join(root, "examples/services.yml"), inspect,
     minFreeDiskBytes: 1, minTotalMemoryBytes: 1, minCpuCores: 1,

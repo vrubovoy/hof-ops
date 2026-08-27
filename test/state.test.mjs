@@ -215,6 +215,25 @@ test("resolveBaseline: fails closed when only the networks listing failed", asyn
   );
 });
 
+// "absent" (Docker genuinely not installed) is just as good as
+// "available and empty" for bootstrap eligibility - a fresh host with
+// no Docker at all has trivially nothing that could be a leftover
+// managed resource. See ADR 0004's "Docker Absent" rules.
+test("resolveBaseline: a genuinely Docker-absent host (never installed) is still a valid bootstrap candidate", async () => {
+  const contracts = await loadContracts();
+  const observation = { ...available, containersStatus: "absent", volumesStatus: "absent", networksStatus: "absent" };
+  const baseline = resolveBaseline({ managedState: null, catalog: contracts.catalog, observation });
+  assert.deepEqual(baseline, emptyBaseline());
+});
+
+test("resolveBaseline: still fails closed when Docker is unavailable (installed but unreachable), never confused with absent", async () => {
+  const contracts = await loadContracts();
+  assert.throws(
+    () => resolveBaseline({ managedState: null, catalog: contracts.catalog, observation: { ...available, containersStatus: "unavailable" } }),
+    /refusing to assume a clean bootstrap/,
+  );
+});
+
 test("resolveBaseline: fails closed when state is missing but Docker already has a managed container", async () => {
   const contracts = await loadContracts();
   const observation = { ...available, resources: [{ service: "kuvert", unit: "kuvert-backend", managed: true, image: "x", state: "running" }] };

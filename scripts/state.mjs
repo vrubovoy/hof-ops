@@ -204,11 +204,17 @@ export function resolveBaseline({ managedState, catalog, observation }) {
     };
   }
 
+  // "absent" (Docker genuinely isn't installed on this host at all) is
+  // just as good as "available and empty" for bootstrap eligibility -
+  // there is trivially nothing that could be a leftover managed
+  // resource. Only "unavailable" (installed but couldn't be safely
+  // inspected) still fails closed. See ADR 0004's "Docker Absent" rules.
+  const ACCEPTABLE_FOR_BOOTSTRAP = new Set(["available", "absent"]);
   const availability = [observation.containersStatus, observation.volumesStatus, observation.networksStatus];
-  if (availability.some((status) => status !== "available")) {
+  if (availability.some((status) => !ACCEPTABLE_FOR_BOOTSTRAP.has(status))) {
     throw new Error(
       "cannot confirm this host has no existing managed resources - containers/volumes/networks observation " +
-      "is not all available, refusing to assume a clean bootstrap",
+      "is not all available or positively confirmed absent, refusing to assume a clean bootstrap",
     );
   }
   const anyManaged = [...observation.resources, ...observation.volumes, ...observation.networks].some((entry) => entry.managed);

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/operation-event-v1.schema.json",
+  "title": "Hof apply operation event",
+  "description": "One record of the append-only log a running `hofctl apply` both streams to stdout (bounded NDJSON - one line per event, no other output interleaved on stdout) and durably appends to the target's own operation journal (see operation-journal-v1.schema.json) - the exact same shape for both, so `hofctl apply`'s own live progress output is never a lossy or reformatted view of what's actually durable. `step` is one plan-v2 operation's own `id` (e.g. \"003.service.start.gateway\") - never a free-form message. Resumability: for a given step, its most recent event (by attempt, then phase) decides what a later `apply --resume` does - `succeeded` skips it; `failed` is fatal unless the operator starts a fresh bootstrap; a `started` with no later `succeeded`/`failed` for the same step+attempt is an unknown outcome and blocks resume entirely, never guessed at.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "operationId", "step", "attempt", "phase", "at"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/operation-event/v1" },
+    "operationId": {
+      "description": "The whole apply run this event belongs to - matches the run's own operation-journal-v1 and operation-lock-v1 operationId.",
+      "$ref": "#/$defs/operationId"
+    },
+    "step": {
+      "description": "The bound plan-v2's own operation id this event is about - see plan-v1/v2's operationId pattern.",
+      "type": "string",
+      "pattern": "^[0-9]{3}\\.[a-z][a-z0-9.-]{0,80}$"
+    },
+    "attempt": {
+      "description": "1 for a step's first try; a resumed step that previously failed and is being retried increments this, never reuses attempt 1's own record.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "phase": {
+      "description": "started: about to run this step, before any target-side effect. succeeded: the step's own target-side effect completed and was confirmed. failed: the step did not complete - `error` is always present and sanitized.",
+      "enum": ["started", "succeeded", "failed"]
+    },
+    "at": { "type": "string", "format": "date-time" },
+    "error": {
+      "description": "Only for phase: failed - a short, sanitized diagnostic. Never a raw exception dump, a secret value, decrypted content, an environment variable's value, or an SSH private-key path.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "phase": { "const": "failed" } } },
+      "then": { "required": ["error"] },
+      "else": { "not": { "required": ["error"] } }
+    }
+  ],
+  "$defs": {
+    "operationId": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" }
+  }
+}

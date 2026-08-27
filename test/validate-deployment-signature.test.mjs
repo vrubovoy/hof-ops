@@ -98,7 +98,13 @@ test("the pinned temp blob file is always cleaned up, on both a passing and a fa
   await withFakeCosign({ HOF_TEST_COSIGN_OUTCOME: "failure" }, () => validateDeployment(baseOptions()));
 
   const after = (await readdir(tmpdir())).filter((name) => name.startsWith("hof-release-lock-"));
-  assert.deepEqual(after, before, "no leftover pinned release-lock temp file after either outcome");
+  // Not a strict equality - node:test runs separate test *files*
+  // concurrently, and another file's own verifyReleaseLockSignature
+  // call can legitimately add/remove a same-prefixed temp file in the
+  // shared OS tmpdir during this exact window. The real invariant this
+  // test owns is narrower: its own two calls above must not leave a NET
+  // increase behind, regardless of what else is happening concurrently.
+  assert.ok(after.length <= before.length, `no leftover pinned release-lock temp file from this test's own two calls (before=${before.length}, after=${after.length})`);
 });
 
 test("a real cosign signature failure is reported as a genuine deployment error, not silently ignored", async () => {

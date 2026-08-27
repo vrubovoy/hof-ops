@@ -1,5 +1,5 @@
 #!/bin/sh
-# HOF-PROBE-V4 - a single, fixed, versioned, read-only probe run on the
+# HOF-PROBE-V5 - a single, fixed, versioned, read-only probe run on the
 # target host (over SSH via `sh -s`, or locally under --target-mode
 # local). Never takes arguments, manifest values, or any other
 # caller-supplied input - the one thing this script does is describe the
@@ -27,7 +27,7 @@ record() {
   printf 'R %s %s\n' "$1" "$(b64 "$2")"
 }
 
-echo 'HOF-PROBE-V4'
+echo 'HOF-PROBE-V5'
 
 # --- os / arch --------------------------------------------------------
 if [ -r /etc/os-release ]; then
@@ -147,8 +147,28 @@ docker_run() {
   return 1
 }
 
-docker_engine=$(docker_run version --format '{{.Server.Version}}') || docker_engine=""
-docker_compose=$(docker_run compose version --short) || docker_compose=""
+# docker-engine-status is a real tri-state, not the old available/
+# unavailable boolean: "absent" (the docker binary genuinely isn't on
+# PATH at all - a fresh host that never had Docker installed, a
+# perfectly legitimate bootstrap candidate) must never be
+# indistinguishable from "unavailable" (docker exists but couldn't be
+# reached - daemon down, permission denied even via sudo - genuinely
+# unsafe to assume either way). Only "unavailable" fails closed;
+# "absent" is a real, expected state on a clean host Ansible hasn't
+# provisioned yet.
+if ! command -v docker >/dev/null 2>&1; then
+  docker_engine_status=absent
+  docker_engine=""
+  docker_compose=""
+elif docker_engine=$(docker_run version --format '{{.Server.Version}}'); then
+  docker_engine_status=available
+  docker_compose=$(docker_run compose version --short) || docker_compose=""
+else
+  docker_engine_status=unavailable
+  docker_engine=""
+  docker_compose=""
+fi
+record docker-engine-status "$docker_engine_status"
 record docker "${docker_engine}|${docker_compose}"
 
 sep=$(printf '\037')
@@ -162,30 +182,39 @@ sep=$(printf '\037')
 # "unavailable" rather than silently emitting a partial, misleadingly-
 # "complete" result (a container that failed to inspect must not simply
 # vanish from the snapshot while everything else looks fine).
+#
+# "absent" (docker itself genuinely isn't on PATH) is reported
+# separately from "unavailable" (docker exists but a list/inspect call
+# still failed) - a clean host with no Docker at all has trivially
+# nothing to be missing or orphaned, and must be a legitimate bootstrap
+# candidate rather than indistinguishable from a real inspection
+# failure. Mirrors docker-engine-status above; the two are expected to
+# always agree, since both gate on the same `command -v docker`.
 list_and_inspect() {
   list_subcommand="$1"; inspect_subcommand="$2"; fmt="$3"; record_name="$4"
+
+  if ! command -v docker >/dev/null 2>&1; then
+    record "docker-${record_name}s-status" absent
+    return
+  fi
+
   ok=1
   buffered=""
-
-  if command -v docker >/dev/null 2>&1; then
-    if ids1=$(docker_run $list_subcommand --filter "label=hof.managed=true"); then :; else ok=0; fi
-    if [ "$ok" = 1 ]; then
-      if ids2=$(docker_run $list_subcommand --filter "label=com.docker.compose.project=hof"); then :; else ok=0; fi
-    fi
-    if [ "$ok" = 1 ]; then
-      ids=$(printf '%s\n%s\n' "${ids1:-}" "${ids2:-}" | sed '/^$/d' | sort -u)
-      for id in $ids; do
-        if line=$(docker_run $inspect_subcommand --format "$fmt" "$id"); then
-          [ -n "$line" ] && buffered="${buffered}${line}
+  if ids1=$(docker_run $list_subcommand --filter "label=hof.managed=true"); then :; else ok=0; fi
+  if [ "$ok" = 1 ]; then
+    if ids2=$(docker_run $list_subcommand --filter "label=com.docker.compose.project=hof"); then :; else ok=0; fi
+  fi
+  if [ "$ok" = 1 ]; then
+    ids=$(printf '%s\n%s\n' "${ids1:-}" "${ids2:-}" | sed '/^$/d' | sort -u)
+    for id in $ids; do
+      if line=$(docker_run $inspect_subcommand --format "$fmt" "$id"); then
+        [ -n "$line" ] && buffered="${buffered}${line}
 "
-        else
-          ok=0
-          break
-        fi
-      done
-    fi
-  else
-    ok=0
+      else
+        ok=0
+        break
+      fi
+    done
   fi
 
   if [ "$ok" = 1 ]; then

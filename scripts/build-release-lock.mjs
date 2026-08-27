@@ -136,11 +136,18 @@ async function verifySupplyChain(selection, revision, image) {
     "--certificate-identity", selection.workflowIdentity,
     "--certificate-oidc-issuer", selection.oidcIssuer,
   ];
+  // Verifies the plain Cosign image signature - a separate artifact from
+  // the two attestations below, and the one gap a pure `gh attestation
+  // verify` pass doesn't close (that only ever checks attestations, never
+  // this bare signature). `cosign verify-attestation` was tried here too
+  // but doesn't find what `actions/attest-sbom`/`attest-build-provenance`
+  // publish (confirmed against a real release run: "no matching
+  // attestations" even though `gh attestation verify` finds and fully
+  // verifies the same ones cryptographically) - the two tools' registry
+  // discovery for GitHub-published attestations isn't compatible yet, so
+  // `gh attestation verify` below is this function's real attestation
+  // check, not a redundant second one.
   await command("cosign", ["verify", ...identityArgs, image]);
-  await Promise.all([
-    command("cosign", ["verify-attestation", ...identityArgs, "--type", "slsaprovenance", image]),
-    command("cosign", ["verify-attestation", ...identityArgs, "--type", "spdxjson", image]),
-  ]);
 
   const [provenance, sbom] = await Promise.all([
     githubAttestation(image, selection.repository, PROVENANCE_TYPE),

@@ -82,6 +82,12 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
       }
       const composePath = path.join(temporaryDirectory, `${fixtureId}.json`);
       await writeFile(composePath, JSON.stringify(compose, null, 2) + "\n");
+      // The gateway service's ./Caddyfile volume is relative to the
+      // Compose project directory (the compose file's own directory,
+      // since none is set explicitly) - without writing the real one
+      // there too, Docker silently creates an empty directory at that
+      // path and the bind mount fails at container start.
+      if (compose.services.gateway) await writeFile(path.join(temporaryDirectory, "Caddyfile"), rendered.caddyfile);
       const environment = { ...process.env };
       for (const match of JSON.stringify(compose).matchAll(/\\?\$\{([A-Z0-9_]+):\?required\}/g)) {
         environment[match[1]] = "gate6-contract-value";

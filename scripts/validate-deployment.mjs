@@ -76,10 +76,16 @@ async function verifyReleaseLockSignature(releaseLockPath, options) {
   }
 }
 
+// Same options as validateDeployment() below - returns the parsed
+// manifest/catalog/releaseLock and the three schemas alongside the
+// errors array, so a caller that needs to keep going past validation
+// (hofctl plan, in particular) never has to re-read or re-parse the
+// same deployment files a second time just to get at them.
+//
 // options: { servicesPath, catalogPath, releaseLockPath, releaseSelectionPath?,
 //   stableChannelPath?, releaseLockSignature?, releaseLockCertificate?,
 //   releaseLockIdentity?, releaseLockOidcIssuer?, skipSignature? }
-export async function validateDeployment(options) {
+export async function loadAndValidateDeployment(options) {
   // The catalog is release-owned and ships inside hof-ops itself - a
   // deployment only ever overrides it deliberately (e.g. testing an
   // unpublished catalog change), so default to the one this hofctl
@@ -105,7 +111,7 @@ export async function validateDeployment(options) {
       readFile(options.releaseLockPath).then((bytes) => [JSON.parse(bytes.toString("utf8")), bytes]),
     ]);
   } catch (error) {
-    return [`could not read services.yml/catalog/release-lock: ${error instanceof Error ? error.message : error}`];
+    return { errors: [`could not read services.yml/catalog/release-lock: ${error instanceof Error ? error.message : error}`], manifest: null, catalog: null, releaseLock: null, servicesSchema, catalogSchema, releaseLockSchema };
   }
 
   const contracts = { servicesSchema, catalogSchema, releaseLockSchema, releaseSelectionSchema, stableChannelSchema, manifest, catalog, releaseLock };
@@ -136,5 +142,12 @@ export async function validateDeployment(options) {
     errors.push(...await verifyReleaseLockSignature(options.releaseLockPath, options));
   }
 
-  return errors;
+  return { errors, manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema };
+}
+
+// The original, narrower shape (`validate`'s own CLI still only ever
+// wants the errors array) - kept as a thin wrapper so nothing about
+// hofctl validate's own contract changes.
+export async function validateDeployment(options) {
+  return (await loadAndValidateDeployment(options)).errors;
 }

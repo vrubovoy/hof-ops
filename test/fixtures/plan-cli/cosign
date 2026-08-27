@@ -1,0 +1,13 @@
+#!/usr/bin/env node
+// Fake "cosign" for plan-command tests - verifyReleaseLockSignature()
+// (scripts/validate-deployment.mjs) invokes the real `cosign verify-blob`
+// argv shape; this answers it without a real Sigstore/OIDC round trip,
+// scripted by HOF_TEST_COSIGN_OUTCOME so both the "genuinely valid,
+// signed deployment" and "signature verification failed" paths can be
+// exercised for real through runPlan()/the real CLI.
+const outcome = process.env.HOF_TEST_COSIGN_OUTCOME ?? "success";
+if (process.argv[2] === "verify-blob" && outcome === "success") {
+  process.exit(0);
+}
+process.stderr.write("Error: no matching signatures\n");
+process.exit(1);

@@ -2,8 +2,9 @@
 import path from "node:path";
 import process from "node:process";
 
-import { renderFiles } from "./render-topology.mjs";
+import { runPlan } from "./plan-command.mjs";
 import { runPreflight } from "./preflight.mjs";
+import { renderFiles } from "./render-topology.mjs";
 import { validateDeployment } from "./validate-deployment.mjs";
 
 const BOOLEAN_FLAGS = new Set(["--skip-signature"]);
@@ -13,6 +14,7 @@ function usage(message) {
   console.error("usage: hofctl render --services <services.yml> --release-lock <release-lock.json> --catalog <catalog.yaml> --out <directory>");
   console.error("       hofctl validate --services <services.yml> --release-lock <release-lock.json> [--catalog <catalog.yaml>] [--release-selection <file>] [--stable-channel <file>] [--release-lock-signature <file>] [--release-lock-certificate <file>] [--release-lock-identity <identity>] [--release-lock-oidc-issuer <issuer>] [--skip-signature]");
   console.error("       hofctl preflight --services <services.yml> [--catalog <catalog.yaml>] [--target-mode ssh|local] [--known-hosts <file> | --host-key-sha256 <sha>] [--identity-file <path>] [--connect-timeout-seconds <n>] [--min-free-disk-gb <n>] [--min-memory-gb <n>] [--min-cpu-cores <n>]");
+  console.error("       hofctl plan --services <services.yml> --release-lock <release-lock.json> --release-lock-identity <identity> (--known-hosts <file> | --host-key-sha256 <sha>) [--catalog <catalog.yaml>] [--identity-file <path>] [--target-mode ssh|local] [--connect-timeout-seconds <n>] [--repair-drift]");
   process.exitCode = 2;
 }
 
@@ -65,6 +67,40 @@ function parsePositiveInteger(rawValue, flagName) {
   const value = Number(rawValue);
   if (!Number.isInteger(value) || value <= 0) throw new Error(`${flagName} must be a positive integer, got ${JSON.stringify(rawValue)}`);
   return value;
+}
+
+// plan gets its own, stricter flag parser rather than reusing
+// parseFlags() above - plan is the one subcommand where a silently
+// accepted duplicate or unknown flag (e.g. a typo'd --skip-signature,
+// which parseFlags would just fold into options and ignore since it
+// only maps flags it's told to look at) could make an operator believe
+// a plan was computed under different, safer conditions than the ones
+// that actually ran. --skip-signature specifically is rejected with its
+// own message - plan always verifies the release lock's real signature,
+// unlike validate.
+const PLAN_FLAGS = new Set([
+  "--services", "--release-lock", "--release-lock-identity", "--known-hosts", "--host-key-sha256",
+  "--catalog", "--identity-file", "--target-mode", "--connect-timeout-seconds", "--repair-drift",
+]);
+const PLAN_BOOLEAN_FLAGS = new Set(["--repair-drift"]);
+
+function parsePlanFlags(args) {
+  const options = {};
+  const seen = new Set();
+  for (let index = 0; index < args.length; index++) {
+    const flag = args[index];
+    if (!flag?.startsWith("--")) { usage(`unexpected argument: ${flag}`); return null; }
+    if (flag === "--skip-signature") { usage("plan does not accept --skip-signature - it always verifies the release lock's real signature"); return null; }
+    if (!PLAN_FLAGS.has(flag)) { usage(`unknown flag for plan: ${flag}`); return null; }
+    if (seen.has(flag)) { usage(`duplicate flag: ${flag}`); return null; }
+    seen.add(flag);
+    const key = flag.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+    if (PLAN_BOOLEAN_FLAGS.has(flag)) { options[key] = true; continue; }
+    const value = args[++index];
+    if (!value) { usage(`${flag} requires a value`); return null; }
+    options[key] = value;
+  }
+  return options;
 }
 
 const [command, ...args] = process.argv.slice(2);
@@ -155,6 +191,53 @@ if (command === "render") {
           usage(error.message);
         } else {
           console.log(JSON.stringify({ type: "preflight.fatal", message: error instanceof Error ? error.message : String(error) }));
+          process.exitCode = 1;
+        }
+      }
+    }
+  }
+} else if (command === "plan") {
+  const options = parsePlanFlags(args);
+  if (options) {
+    resolvePaths(options, ["services", "releaseLock", "catalog", "knownHosts", "identityFile"]);
+    const targetMode = options.targetMode ?? "ssh";
+    if (!options.services || !options.releaseLock || !options.releaseLockIdentity) {
+      usage("plan requires --services, --release-lock, and --release-lock-identity");
+    } else if (!["ssh", "local"].includes(targetMode)) {
+      usage("--target-mode must be ssh or local");
+    } else if (targetMode === "ssh" && Boolean(options.knownHosts) === Boolean(options.hostKeySha256)) {
+      usage("ssh mode requires exactly one of --known-hosts or --host-key-sha256");
+    } else if (targetMode === "local" && (options.knownHosts || options.hostKeySha256 || options.identityFile)) {
+      usage("--target-mode local does not accept --known-hosts/--host-key-sha256/--identity-file");
+    } else {
+      try {
+        const connectTimeoutSeconds = parsePositiveInteger(options.connectTimeoutSeconds, "--connect-timeout-seconds");
+        const { blocked, plan, diagnostics } = await runPlan({
+          manifestPath: options.services,
+          catalogPath: options.catalog,
+          releaseLockPath: options.releaseLock,
+          releaseLockIdentity: options.releaseLockIdentity,
+          targetMode,
+          knownHostsFile: options.knownHosts,
+          hostKeySha256: options.hostKeySha256,
+          identityFile: options.identityFile,
+          connectTimeoutSeconds,
+          repairDrift: options.repairDrift === true,
+        });
+        if (blocked) {
+          // Diagnostics only - stdout must stay reserved for exactly
+          // one raw plan-v1 document, or nothing at all.
+          for (const line of diagnostics) console.error(line);
+          process.exitCode = 1;
+        } else {
+          console.log(JSON.stringify(plan));
+          if (!plan.executable) process.exitCode = 1;
+        }
+      } catch (error) {
+        if (/must be a positive integer/.test(error?.message ?? "")) {
+          usage(error.message);
+        } else {
+          console.error(error instanceof Error ? error.message : String(error));
           process.exitCode = 1;
         }
       }

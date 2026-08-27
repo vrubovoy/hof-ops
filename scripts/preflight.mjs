@@ -147,8 +147,10 @@ export function checkDocker(snapshot) {
 
 // The full observation contract resolveBaseline()/buildPlan() require -
 // built once here from the snapshot so preflight's own managed-state
-// check and a future hofctl plan always construct it identically.
-function observationFromSnapshot(snapshot) {
+// check and hofctl plan (see scripts/plan-command.mjs) always construct
+// it identically, rather than each keeping its own copy that could
+// silently drift apart.
+export function observationFromSnapshot(snapshot) {
   return {
     containersStatus: snapshot.docker.containersStatus,
     resources: snapshot.docker.resources,

@@ -38,12 +38,13 @@ RUN ansible-galaxy collection install -r /ansible/requirements.yml -p /usr/share
 # workstation into a container at apply time; whatever this specific,
 # signed image digest contains is what runs, full stop.
 COPY ansible.cfg /ansible/ansible.cfg
+COPY playbook.yml /ansible/playbook.yml
 COPY roles /ansible/roles
 
 ENV ANSIBLE_CONFIG=/ansible/ansible.cfg
 WORKDIR /ansible
 
 # No ENTRYPOINT/CMD that runs anything on its own - hofctl apply invokes
-# `ansible-playbook` (or an equivalent typed entry point, see PR #27)
-# inside a container from this image explicitly, once per operation
-# batch, never as a long-running daemon.
+# `ansible-playbook /ansible/playbook.yml` (see scripts/apply.mjs)
+# inside a container from this image explicitly, once per operation,
+# never as a long-running daemon.

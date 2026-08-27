@@ -2,6 +2,7 @@
 import path from "node:path";
 import process from "node:process";
 
+import { runApply } from "./apply.mjs";
 import { runPlan } from "./plan-command.mjs";
 import { runPreflight } from "./preflight.mjs";
 import { renderFiles } from "./render-topology.mjs";
@@ -17,6 +18,7 @@ function usage(message) {
   console.error("       hofctl preflight --services <services.yml> [--catalog <catalog.yaml>] [--target-mode ssh|local] [--known-hosts <file> | --host-key-sha256 <sha>] [--identity-file <path>] [--connect-timeout-seconds <n>] [--min-free-disk-gb <n>] [--min-memory-gb <n>] [--min-cpu-cores <n>]");
   console.error("       hofctl plan --services <services.yml> --release-lock <release-lock.json> --release-lock-identity <identity> (--known-hosts <file> | --host-key-sha256 <sha>) [--catalog <catalog.yaml>] [--identity-file <path>] [--target-mode ssh|local] [--connect-timeout-seconds <n>] [--repair-drift]");
   console.error("       hofctl secrets ensure --services <services.yml> --store <secrets.sops.yaml> --operator-age-recipient <age1...> --recovery-age-recipient <age1...> [--catalog <catalog.yaml>] [--identity-file <path>]");
+  console.error("       hofctl apply --services <services.yml> --release-lock <release-lock.json> --release-lock-identity <identity> (--known-hosts <file> | --host-key-sha256 <sha>) --identity-file <path> --recovery-age-recipient <age1...> (--approve-plan-id <exact-plan-id> | --resume) [--catalog <catalog.yaml>] [--connect-timeout-seconds <n>] [--repair-drift]");
   process.exitCode = 2;
 }
 
@@ -86,24 +88,59 @@ const PLAN_FLAGS = new Set([
 ]);
 const PLAN_BOOLEAN_FLAGS = new Set(["--repair-drift"]);
 
-function parsePlanFlags(args) {
-  const options = {};
-  const seen = new Set();
-  for (let index = 0; index < args.length; index++) {
-    const flag = args[index];
-    if (!flag?.startsWith("--")) { usage(`unexpected argument: ${flag}`); return null; }
-    if (flag === "--skip-signature") { usage("plan does not accept --skip-signature - it always verifies the release lock's real signature"); return null; }
-    if (!PLAN_FLAGS.has(flag)) { usage(`unknown flag for plan: ${flag}`); return null; }
-    if (seen.has(flag)) { usage(`duplicate flag: ${flag}`); return null; }
-    seen.add(flag);
-    const key = flag.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
-    if (PLAN_BOOLEAN_FLAGS.has(flag)) { options[key] = true; continue; }
-    const value = args[++index];
-    if (!value) { usage(`${flag} requires a value`); return null; }
-    options[key] = value;
-  }
-  return options;
+// apply gets the same strict treatment as plan - a silently accepted
+// typo'd or unknown flag here (an operator's own approval/resume
+// intent, in particular) must never be simply ignored. Never accepts
+// --target-mode at all (unlike plan/preflight) - apply only ever
+// supports ssh (see apply.mjs's own comment on why local can't work
+// here), so there is no flag exposed for a mode that would just be
+// refused.
+const APPLY_FLAGS = new Set([
+  "--services", "--release-lock", "--release-lock-identity", "--known-hosts", "--host-key-sha256",
+  "--catalog", "--identity-file", "--connect-timeout-seconds", "--repair-drift",
+  "--recovery-age-recipient", "--approve-plan-id", "--resume",
+]);
+const APPLY_BOOLEAN_FLAGS = new Set(["--repair-drift", "--resume"]);
+
+// Shared by plan and apply - both need every flag explicitly
+// whitelisted (rather than parseFlags()'s generic "map whatever looks
+// like a flag" behavior) since a mistyped or unknown flag for either of
+// them could otherwise make an operator believe something ran under
+// different, safer conditions than what they actually approved.
+function makeStrictFlagParser(commandName, allowedFlags, booleanFlags, { onDisallowed } = {}) {
+  return (args) => {
+    const options = {};
+    const seen = new Set();
+    for (let index = 0; index < args.length; index++) {
+      const flag = args[index];
+      if (!flag?.startsWith("--")) { usage(`unexpected argument: ${flag}`); return null; }
+      if (onDisallowed?.(flag)) return null;
+      if (!allowedFlags.has(flag)) { usage(`unknown flag for ${commandName}: ${flag}`); return null; }
+      if (seen.has(flag)) { usage(`duplicate flag: ${flag}`); return null; }
+      seen.add(flag);
+      const key = flag.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+      if (booleanFlags.has(flag)) { options[key] = true; continue; }
+      const value = args[++index];
+      if (!value) { usage(`${flag} requires a value`); return null; }
+      options[key] = value;
+    }
+    return options;
+  };
 }
+
+const parsePlanFlags = makeStrictFlagParser("plan", PLAN_FLAGS, PLAN_BOOLEAN_FLAGS, {
+  onDisallowed: (flag) => {
+    if (flag === "--skip-signature") { usage("plan does not accept --skip-signature - it always verifies the release lock's real signature"); return true; }
+    return false;
+  },
+});
+const parseApplyFlags = makeStrictFlagParser("apply", APPLY_FLAGS, APPLY_BOOLEAN_FLAGS, {
+  onDisallowed: (flag) => {
+    if (flag === "--skip-signature") { usage("apply does not accept --skip-signature - it always verifies the release lock's real signature"); return true; }
+    if (flag === "--target-mode") { usage("apply does not accept --target-mode - it only ever supports ssh (see ansible/README.md)"); return true; }
+    return false;
+  },
+});
 
 const [command, ...args] = process.argv.slice(2);
 
@@ -271,6 +308,53 @@ if (command === "render") {
           for (const name of addedNames) console.log(JSON.stringify({ type: "secrets.added", name }));
           console.log(JSON.stringify({ type: "secrets.result", added: addedNames.length, total: totalCount }));
         } catch (error) {
+          console.error(error instanceof Error ? error.message : String(error));
+          process.exitCode = 1;
+        }
+      }
+    }
+  }
+} else if (command === "apply") {
+  const options = parseApplyFlags(args);
+  if (options) {
+    resolvePaths(options, ["services", "releaseLock", "catalog", "knownHosts", "identityFile"]);
+    if (!options.services || !options.releaseLock || !options.releaseLockIdentity || !options.identityFile || !options.recoveryAgeRecipient) {
+      usage("apply requires --services, --release-lock, --release-lock-identity, --identity-file, and --recovery-age-recipient");
+    } else if (Boolean(options.knownHosts) === Boolean(options.hostKeySha256)) {
+      usage("apply requires exactly one of --known-hosts or --host-key-sha256");
+    } else if (Boolean(options.approvePlanId) === Boolean(options.resume)) {
+      usage("apply requires exactly one of --approve-plan-id or --resume - approving a plan approves those exact bytes, a resume never takes a new approval (see ADR 0004)");
+    } else {
+      try {
+        const connectTimeoutSeconds = parsePositiveInteger(options.connectTimeoutSeconds, "--connect-timeout-seconds");
+        const result = await runApply({
+          manifestPath: options.services,
+          catalogPath: options.catalog,
+          releaseLockPath: options.releaseLock,
+          releaseLockIdentity: options.releaseLockIdentity,
+          knownHostsFile: options.knownHosts,
+          hostKeySha256: options.hostKeySha256,
+          identityFile: options.identityFile,
+          connectTimeoutSeconds,
+          repairDrift: options.repairDrift === true,
+          recoveryAgeRecipient: options.recoveryAgeRecipient,
+          approvePlanId: options.approvePlanId,
+          resume: options.resume === true,
+          // Bounded NDJSON on stdout, one line per event - nothing else
+          // is ever printed there (see operation-event-v1.schema.json's
+          // own comment on this exact contract).
+          emit: (event) => console.log(JSON.stringify(event)),
+        });
+        if (result.blocked) {
+          for (const line of result.diagnostics) console.error(line);
+          process.exitCode = 1;
+        } else {
+          console.log(JSON.stringify({ type: "apply.result", operationId: result.operationId, committedGeneration: result.committedGeneration, planId: result.planId }));
+        }
+      } catch (error) {
+        if (/must be a positive integer/.test(error?.message ?? "")) {
+          usage(error.message);
+        } else {
           console.error(error instanceof Error ? error.message : String(error));
           process.exitCode = 1;
         }

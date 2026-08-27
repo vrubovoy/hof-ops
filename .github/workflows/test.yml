@@ -11,7 +11,7 @@ permissions:
 jobs:
   contracts:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -26,6 +26,8 @@ jobs:
       - run: pnpm test
       - name: Real SSH transport acceptance (ephemeral pinned Debian 12 sshd container)
         run: pnpm test:ssh
+      - name: Real hofctl apply acceptance (ephemeral sudo-enabled sshd container, real Execution Environment build+dispatch)
+        run: pnpm test:apply-ssh
 
   ansible:
     runs-on: ubuntu-24.04
@@ -49,7 +51,7 @@ jobs:
                   name: "{{ item }}"
                 vars:
                   hof_operation_id: "001.ci-syntax-check"
-                  hof_secret_name: "x"
+                  hof_secrets_store: "x"
                   hof_volume_name: "x"
                   hof_network_name: "x"
                   hof_image_reference: "x"

@@ -23,7 +23,7 @@ import addFormats from "ajv-formats";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PROBE_PATH = path.join(root, "scripts/target-probe.sh");
-const PROBE_VERSION = "HOF-PROBE-V2";
+const PROBE_VERSION = "HOF-PROBE-V3";
 
 // Every singleton is now mandatory - the probe always emits exactly one
 // of each, with an explicit "unknown"/status sentinel rather than
@@ -31,23 +31,47 @@ const PROBE_VERSION = "HOF-PROBE-V2";
 // target-probe.sh). A record silently missing is a protocol violation,
 // not "the host doesn't have that".
 const SINGLETON_RECORDS = new Set([
-  "os", "arch", "cpu", "memory", "disk", "clock", "sudo", "docker", "docker-resources-status",
+  "os", "arch", "cpu", "memory", "disk", "clock", "sudo", "docker",
+  "docker-containers-status", "docker-volumes-status", "docker-networks-status",
   "state-current-status", "state-current", "state-topology-status", "state-topology",
   "generated-artifacts-status", "generated-artifacts",
 ]);
-const REPEATED_RECORDS = new Set(["port", "container"]);
+const REPEATED_RECORDS = new Set(["port", "container", "volume", "network"]);
 const KNOWN_RECORDS = new Set([...SINGLETON_RECORDS, ...REPEATED_RECORDS]);
-const NUMERIC_UNKNOWN_OK = new Set(["cpu", "memory", "disk"]);
 
-// The exact order target-probe.sh's Go template joins container fields
-// in - both sides must agree on this, since \x1f-split output carries
-// no field names of its own.
+// The exact order target-probe.sh's Go templates join fields in - both
+// sides must agree on this, since \x1f-split output carries no field
+// names of its own.
 const CONTAINER_FIELDS = [
   "name", "image", "state", "health",
   "labelManaged", "labelInstallationId", "labelService", "labelUnit", "labelArtifact", "labelGeneration",
   "labelComposeProject", "labelComposeService",
   "networks", "volumes", "ports",
 ];
+// Volumes/networks have no state/health/mounts of their own - just
+// identity and ownership labels, enough to detect an orphaned Hof
+// resource with no container currently referencing it.
+const RESOURCE_FIELDS = ["name", "labelManaged", "labelInstallationId", "labelGeneration", "labelKind", "labelResource", "labelComposeProject"];
+
+const AVAILABILITY_STATUSES = new Set(["available", "unavailable"]);
+const STATE_FILE_STATUSES = new Set(["present", "absent", "unreadable"]);
+
+function parseAvailabilityStatus(value, name) {
+  if (!AVAILABILITY_STATUSES.has(value)) throw new Error(`probe record ${name} has an unrecognized status: ${JSON.stringify(value)}`);
+  return value;
+}
+
+// A typo like "presnt" must never silently fall through to "absent" -
+// only the exact three known values are accepted. status and payload
+// are also cross-checked for consistency: "present" always carries a
+// non-empty payload, "absent"/"unreadable" always carry an empty one -
+// a mismatch is itself a protocol violation, not something to paper over.
+function parseStateFileStatus(statusValue, payloadValue, statusName, payloadName) {
+  if (!STATE_FILE_STATUSES.has(statusValue)) throw new Error(`probe record ${statusName} has an unrecognized status: ${JSON.stringify(statusValue)}`);
+  if (statusValue === "present" && payloadValue.length === 0) throw new Error(`probe record ${statusName} is "present" but ${payloadName} is empty`);
+  if (statusValue !== "present" && payloadValue.length > 0) throw new Error(`probe record ${statusName} is "${statusValue}" but ${payloadName} is unexpectedly non-empty`);
+  return statusValue;
+}
 
 const BASE64_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
 const STRICT_BASE64_LENGTH = (value) => value.length % 4 === 0;
@@ -122,8 +146,7 @@ function parseProbeOutput(stdout) {
   }
 
   const singles = {};
-  const port = [];
-  const container = [];
+  const repeated = { port: [], container: [], volume: [], network: [] };
   for (const line of lines.slice(1, -1)) {
     const match = /^R (\S+) (.*)$/.exec(line);
     if (!match) throw new Error(`malformed probe protocol line: ${JSON.stringify(line)}`);
@@ -133,15 +156,16 @@ function parseProbeOutput(stdout) {
     if (SINGLETON_RECORDS.has(name)) {
       if (name in singles) throw new Error(`duplicate probe record: ${name}`);
       singles[name] = value;
-    } else if (name === "port") port.push(value);
-    else container.push(value);
+    } else {
+      repeated[name].push(value);
+    }
   }
 
   for (const name of SINGLETON_RECORDS) {
     if (!(name in singles)) throw new Error(`missing mandatory probe record: ${name}`);
   }
 
-  return { singles, port, container };
+  return { singles, ...repeated };
 }
 
 function parseNonNegativeIntegerOrUnknown(value, name) {
@@ -189,6 +213,30 @@ function parseContainerRecord(raw) {
   };
 }
 
+function parseResourceRecord(raw, kindLabel) {
+  const fields = raw.split("\x1f");
+  if (fields.length !== RESOURCE_FIELDS.length) {
+    throw new Error(`probe ${kindLabel} record has ${fields.length} fields, expected exactly ${RESOURCE_FIELDS.length}`);
+  }
+  const record = Object.fromEntries(RESOURCE_FIELDS.map((field, index) => [field, fields[index]]));
+
+  let generation = null;
+  if (record.labelGeneration) {
+    if (!/^\d+$/.test(record.labelGeneration)) throw new Error(`${kindLabel} ${record.name}: hof.generation label is not a non-negative integer: ${JSON.stringify(record.labelGeneration)}`);
+    generation = Number(record.labelGeneration);
+  }
+
+  return {
+    name: record.name,
+    managed: record.labelManaged === "true",
+    installationId: record.labelInstallationId || null,
+    generation,
+    kind: record.labelKind || null,
+    resource: record.labelResource || null,
+    composeProject: record.labelComposeProject || null,
+  };
+}
+
 const PORT_STATES = new Set(["free", "occupied", "unknown"]);
 
 let stateSchemaValidator;
@@ -210,15 +258,19 @@ async function validateManagedCurrent(value) {
 }
 
 async function buildSnapshot(mode, transport, stdout) {
-  const { singles, port, container } = parseProbeOutput(stdout);
+  const { singles, port, container, volume, network } = parseProbeOutput(stdout);
   const resources = container.map(parseContainerRecord);
+  const volumes = volume.map((raw) => parseResourceRecord(raw, "volume"));
+  const networks = network.map((raw) => parseResourceRecord(raw, "network"));
 
   const [osId, osVersionId] = singles.os.split("|");
   const [dockerEngine, dockerCompose] = singles.docker.split("|");
 
-  const managedCurrent = singles["state-current-status"] === "present" ? JSON.parse(singles["state-current"]) : null;
+  const currentStatus = parseStateFileStatus(singles["state-current-status"], singles["state-current"], "state-current-status", "state-current");
+  const managedCurrent = currentStatus === "present" ? JSON.parse(singles["state-current"]) : null;
   await validateManagedCurrent(managedCurrent);
-  const managedTopology = singles["state-topology-status"] === "present" ? JSON.parse(singles["state-topology"]) : null;
+  const topologyStatus = parseStateFileStatus(singles["state-topology-status"], singles["state-topology"], "state-topology-status", "state-topology");
+  const managedTopology = topologyStatus === "present" ? JSON.parse(singles["state-topology"]) : null;
 
   // Only a resource belonging to THIS installation (per the managed
   // state we just read) counts as "ours" for port-ownership purposes -
@@ -266,16 +318,20 @@ async function buildSnapshot(mode, transport, stdout) {
     docker: {
       engineAvailable: Boolean(dockerEngine),
       composeAvailable: Boolean(dockerCompose),
-      resourcesStatus: singles["docker-resources-status"] === "available" ? "available" : "unavailable",
+      containersStatus: parseAvailabilityStatus(singles["docker-containers-status"], "docker-containers-status"),
       resources,
+      volumesStatus: parseAvailabilityStatus(singles["docker-volumes-status"], "docker-volumes-status"),
+      volumes,
+      networksStatus: parseAvailabilityStatus(singles["docker-networks-status"], "docker-networks-status"),
+      networks,
     },
     managedState: {
-      currentStatus: singles["state-current-status"],
+      currentStatus,
       current: managedCurrent,
-      topologyStatus: singles["state-topology-status"],
+      topologyStatus,
       topology: managedTopology,
     },
-    generatedArtifactsStatus: singles["generated-artifacts-status"] === "available" ? "available" : "unavailable",
+    generatedArtifactsStatus: parseAvailabilityStatus(singles["generated-artifacts-status"], "generated-artifacts-status"),
     generatedArtifacts: JSON.parse(singles["generated-artifacts"]),
   };
 }

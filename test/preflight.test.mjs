@@ -23,9 +23,14 @@ function fakeSnapshot(overrides = {}) {
       sudoNonInteractive: true,
     },
     ports: [{ port: 80, state: "free", owner: null }, { port: 443, state: "free", owner: null }],
-    docker: { engineAvailable: true, composeAvailable: true, resourcesStatus: "available", resources: [] },
+    docker: {
+      engineAvailable: true, composeAvailable: true,
+      containersStatus: "available", resources: [],
+      volumesStatus: "available", volumes: [],
+      networksStatus: "available", networks: [],
+    },
     managedState: { currentStatus: "absent", current: null, topologyStatus: "absent", topology: null },
-    generatedArtifacts: {},
+    generatedArtifactsStatus: "available", generatedArtifacts: {},
     ...overrides,
   };
 }
@@ -106,13 +111,29 @@ test("checkPort: unknown state, or a missing record entirely, fails closed as un
   assert.equal(checkPort(fakeSnapshot({ ports: [] }), 80).status, "unknown");
 });
 
-test("checkDocker requires engine, compose, and a successful container listing", () => {
-  assert.equal(checkDocker(fakeSnapshot({ docker: { engineAvailable: true, composeAvailable: true, resourcesStatus: "available", resources: [] } })).status, "pass");
-  assert.equal(checkDocker(fakeSnapshot({ docker: { engineAvailable: false, composeAvailable: true, resourcesStatus: "available", resources: [] } })).status, "fail");
-  assert.equal(checkDocker(fakeSnapshot({ docker: { engineAvailable: true, composeAvailable: false, resourcesStatus: "available", resources: [] } })).status, "fail");
-  const result = checkDocker(fakeSnapshot({ docker: { engineAvailable: true, composeAvailable: true, resourcesStatus: "unavailable", resources: [] } }));
-  assert.equal(result.status, "fail");
-  assert.match(result.message, /container listing could not be read/);
+test("checkDocker requires engine, compose, and successful containers/volumes/networks listings, each independently", () => {
+  assert.equal(checkDocker(fakeSnapshot()).status, "pass");
+  assert.equal(checkDocker(fakeSnapshot({ docker: { ...fakeSnapshot().docker, engineAvailable: false } })).status, "fail");
+  assert.equal(checkDocker(fakeSnapshot({ docker: { ...fakeSnapshot().docker, composeAvailable: false } })).status, "fail");
+
+  const containersDown = checkDocker(fakeSnapshot({ docker: { ...fakeSnapshot().docker, containersStatus: "unavailable" } }));
+  assert.equal(containersDown.status, "fail");
+  assert.match(containersDown.message, /its containers listing could not be read/);
+
+  const volumesDown = checkDocker(fakeSnapshot({ docker: { ...fakeSnapshot().docker, volumesStatus: "unavailable" } }));
+  assert.equal(volumesDown.status, "fail");
+  assert.match(volumesDown.message, /its volumes listing could not be read/);
+
+  const networksDown = checkDocker(fakeSnapshot({ docker: { ...fakeSnapshot().docker, networksStatus: "unavailable" } }));
+  assert.equal(networksDown.status, "fail");
+  assert.match(networksDown.message, /its networks listing could not be read/);
+
+  // A single failed listing among the three must not be masked by the
+  // other two succeeding - one docker inspect failing is enough to fail
+  // the whole check, not silently drop just that resource.
+  const allDown = checkDocker(fakeSnapshot({ docker: { ...fakeSnapshot().docker, containersStatus: "unavailable", volumesStatus: "unavailable", networksStatus: "unavailable" } }));
+  assert.equal(allDown.status, "fail");
+  assert.match(allDown.message, /its containers\/volumes\/networks listing could not be read/);
 });
 
 test("checkManagedStateReadable fails when either state file exists but couldn't be read, even with sudo", () => {
@@ -151,11 +172,18 @@ test("checkManagedState passes on a genuinely clean bootstrap host", () => {
   assert.equal(checkManagedState(fakeSnapshot(), catalogFixture).status, "pass");
 });
 
-test("checkManagedState fails when state is missing but Docker already holds managed resources", () => {
-  const snapshot = fakeSnapshot({ docker: { engineAvailable: true, composeAvailable: true, resourcesStatus: "available", resources: [{ service: "tor", unit: "gateway", managed: true }] } });
+test("checkManagedState fails when state is missing but Docker already holds a managed container", () => {
+  const snapshot = fakeSnapshot({ docker: { ...fakeSnapshot().docker, resources: [{ service: "tor", unit: "gateway", managed: true }] } });
   const result = checkManagedState(snapshot, catalogFixture);
   assert.equal(result.status, "fail");
-  assert.match(result.message, /managed resources exist but the authoritative state is missing/);
+  assert.match(result.message, /managed resources .* exist but the authoritative state is missing/);
+});
+
+test("checkManagedState fails when state is missing but Docker already holds a managed orphan volume", () => {
+  const snapshot = fakeSnapshot({ docker: { ...fakeSnapshot().docker, volumes: [{ managed: true, installationId: "inst-1", resource: "kuvert-data", kind: "volume" }] } });
+  const result = checkManagedState(snapshot, catalogFixture);
+  assert.equal(result.status, "fail");
+  assert.match(result.message, /managed resources .* exist but the authoritative state is missing/);
 });
 
 test("checkManagedState is skipped (unknown), not silently passed, when state is unreadable", () => {
@@ -164,11 +192,19 @@ test("checkManagedState is skipped (unknown), not silently passed, when state is
   assert.equal(result.status, "unknown");
 });
 
-test("checkManagedState derives observation.status from the snapshot's own docker.resourcesStatus, not a hardcoded 'available'", () => {
-  const snapshot = fakeSnapshot({ docker: { engineAvailable: true, composeAvailable: true, resourcesStatus: "unavailable", resources: [] } });
+test("checkManagedState derives its observation from the snapshot's own docker.{containers,volumes,networks}Status, not a hardcoded 'available'", () => {
+  const snapshot = fakeSnapshot({ docker: { ...fakeSnapshot().docker, containersStatus: "unavailable" } });
   const result = checkManagedState(snapshot, catalogFixture);
   assert.equal(result.status, "fail");
-  assert.match(result.message, /observation is unavailable/);
+  assert.match(result.message, /refusing to assume a clean bootstrap/);
+});
+
+test("checkManagedState derives its observation from the snapshot's own generatedArtifacts, too", () => {
+  // Not directly exercised by resolveBaseline's own logic when bootstrap-
+  // clean, but observationFromSnapshot must still wire it through without
+  // throwing (validateObservation requires the full 8-field contract).
+  const snapshot = fakeSnapshot({ generatedArtifactsStatus: "unavailable", generatedArtifacts: {} });
+  assert.equal(checkManagedState(snapshot, catalogFixture).status, "pass");
 });
 
 test("runPreflight: an invalid manifest is rejected before ever attempting a connection", async () => {
@@ -184,6 +220,26 @@ test("runPreflight: an invalid manifest is rejected before ever attempting a con
     assert.equal(ok, false);
     assert.deepEqual(checks.map((c) => c.id), ["manifest"]);
     assert.equal(inspectCalled, false, "never attempts to inspect a target from an invalid manifest");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("runPreflight: an invalid catalog is rejected before ever attempting a connection, after a valid manifest", async () => {
+  const { mkdtemp, rm, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const directory = await mkdtemp(path.join(tmpdir(), "hof-preflight-invalid-catalog-"));
+  const invalidCatalogPath = path.join(directory, "catalog.yaml");
+  await writeFile(invalidCatalogPath, "apiVersion: hof.dev/catalog/v1\n"); // missing required `services`
+  try {
+    let inspectCalled = false;
+    const inspect = async () => { inspectCalled = true; return fakeSnapshot(); };
+    const { checks, ok } = await runPreflight({
+      manifestPath: path.join(root, "examples/services.yml"), catalogPath: invalidCatalogPath, inspect,
+    });
+    assert.equal(ok, false);
+    assert.deepEqual(checks.map((c) => c.id), ["catalog"]);
+    assert.equal(inspectCalled, false, "never attempts to inspect a target from an invalid catalog");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -213,7 +269,7 @@ test("runPreflight: ok is true when every check genuinely passes against a faked
 });
 
 test("runPreflight: ok is false whenever any single check fails or is unknown", async () => {
-  const inspect = async () => fakeSnapshot({ host: { ...fakeSnapshot().host, clockSynchronized: null }, docker: { engineAvailable: false, composeAvailable: true, resourcesStatus: "available", resources: [] } });
+  const inspect = async () => fakeSnapshot({ host: { ...fakeSnapshot().host, clockSynchronized: null }, docker: { ...fakeSnapshot().docker, engineAvailable: false } });
   const { checks, ok } = await runPreflight({
     manifestPath: path.join(root, "examples/services.yml"), inspect,
     minFreeDiskBytes: 1, minTotalMemoryBytes: 1, minCpuCores: 1,

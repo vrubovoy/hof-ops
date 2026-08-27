@@ -134,13 +134,31 @@ export function checkPort(snapshot, portNumber) {
 export function checkDocker(snapshot) {
   if (!snapshot.docker.engineAvailable) return check("docker", "fail", "Docker Engine is not reachable");
   if (!snapshot.docker.composeAvailable) return check("docker", "fail", "Docker Compose plugin is not available");
-  // Engine/Compose can report available while the container *listing*
-  // itself still failed (a narrower, rarer permission gap) - without
-  // this, that failure would look exactly like "Docker is fine and
-  // nothing is running" everywhere downstream (managed-state, port
-  // ownership, a future hofctl plan).
-  if (snapshot.docker.resourcesStatus !== "available") return check("docker", "fail", "Docker is reachable but its container listing could not be read");
+  // Engine/Compose can report available while a *listing* itself still
+  // failed (a narrower, rarer permission gap, and one bad `docker
+  // inspect` call taints the whole batch - see target-probe.sh) -
+  // without this, that failure would look exactly like "Docker is fine
+  // and nothing is running" everywhere downstream (managed-state, port
+  // ownership, orphan volume/network detection, a future hofctl plan).
+  const unavailable = ["containers", "volumes", "networks"].filter((kind) => snapshot.docker[`${kind}Status`] !== "available");
+  if (unavailable.length > 0) return check("docker", "fail", `Docker is reachable but its ${unavailable.join("/")} listing could not be read`);
   return check("docker", "pass", "Docker Engine and the Compose plugin are both available");
+}
+
+// The full observation contract resolveBaseline()/buildPlan() require -
+// built once here from the snapshot so preflight's own managed-state
+// check and a future hofctl plan always construct it identically.
+function observationFromSnapshot(snapshot) {
+  return {
+    containersStatus: snapshot.docker.containersStatus,
+    resources: snapshot.docker.resources,
+    volumesStatus: snapshot.docker.volumesStatus,
+    volumes: snapshot.docker.volumes,
+    networksStatus: snapshot.docker.networksStatus,
+    networks: snapshot.docker.networks,
+    generatedArtifactsStatus: snapshot.generatedArtifactsStatus,
+    generatedArtifacts: snapshot.generatedArtifacts,
+  };
 }
 
 // current.json/topology.json being unreadable (exists, but this
@@ -168,8 +186,7 @@ export function checkManagedState(snapshot, catalog) {
     return check("managed-state", "unknown", "skipped - managed state is unreadable (see managed-state-readable)");
   }
   try {
-    const observation = { status: snapshot.docker.resourcesStatus, resources: snapshot.docker.resources };
-    resolveBaseline({ managedState: snapshot.managedState, catalog, observation });
+    resolveBaseline({ managedState: snapshot.managedState, catalog, observation: observationFromSnapshot(snapshot) });
     return check("managed-state", "pass", "managed state is consistent");
   } catch (error) {
     return check("managed-state", "fail", error instanceof Error ? error.message : String(error));
@@ -215,6 +232,23 @@ async function validateManifestSchema(manifest) {
   return [];
 }
 
+// publicHostnames() (used to build the DNS check below) walks the
+// catalog's own service/hostname structure - an invalid catalog (a
+// custom --catalog override, or simple corruption) must fail loudly
+// here, not resolve to a confusing crash or a silently wrong hostname
+// list.
+let catalogValidator;
+async function validateCatalogSchema(catalog) {
+  catalogValidator ??= await (async () => {
+    const ajv = new Ajv2020({ allErrors: true, strict: true });
+    addFormats(ajv);
+    const schema = JSON.parse(await readFile(path.join(root, "schemas/service-catalog-v1.schema.json"), "utf8"));
+    return ajv.compile(schema);
+  })();
+  if (!catalogValidator(catalog)) return catalogValidator.errors.map((error) => `catalog${error.instancePath || "/"}: ${error.message}`);
+  return [];
+}
+
 // options: { manifestPath, catalogPath?, targetMode?, knownHostsFile?,
 //   hostKeySha256?, identityFile?, connectTimeoutSeconds?, minFreeDiskBytes?,
 //   minTotalMemoryBytes?, minCpuCores?, resolver?, inspect? }
@@ -231,6 +265,8 @@ export async function runPreflight(options) {
   // manifest must never even get that far.
   const manifestErrors = await validateManifestSchema(manifest);
   if (manifestErrors.length > 0) return failedResult("manifest", manifestErrors.join("; "));
+  const catalogErrors = await validateCatalogSchema(catalog);
+  if (catalogErrors.length > 0) return failedResult("catalog", catalogErrors.join("; "));
 
   const targetMode = options.targetMode ?? "ssh";
   const host = manifest.target?.host;

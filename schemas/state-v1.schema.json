@@ -18,9 +18,9 @@
       "minLength": 1
     },
     "generation": {
-      "description": "0 only for the synthetic bootstrap baseline that never touched a real host; every real apply is generation 1, 2, 3, ...",
+      "description": "This schema validates only a real, on-disk current.json - the synthetic bootstrap baseline (generation 0) is an in-memory object of hofctl's own and is never written to disk or validated against this schema, so a real current.json claiming generation 0 is itself a sign of corruption or tampering, not a legitimate first apply (that's generation 1).",
       "type": "integer",
-      "minimum": 0
+      "minimum": 1
     },
     "lastSuccessfulOperationId": { "type": ["string", "null"] },
     "appliedAt": { "type": ["string", "null"], "format": "date-time" },

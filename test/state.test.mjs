@@ -10,7 +10,19 @@ import { renderTopology } from "../scripts/render-topology.mjs";
 import { emptyBaseline, resolveBaseline, topologyToServiceState } from "../scripts/state.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
-const available = { status: "available", resources: [] };
+
+// The full {containersStatus, resources, volumesStatus, volumes,
+// networksStatus, networks, generatedArtifactsStatus, generatedArtifacts}
+// contract resolveBaseline()/buildPlan() both require - see
+// target-inspector.mjs's buildSnapshot() and preflight.mjs's
+// observationFromSnapshot(). "available" + empty everywhere, the shape a
+// genuinely clean host reports.
+const available = {
+  containersStatus: "available", resources: [],
+  volumesStatus: "available", volumes: [],
+  networksStatus: "available", networks: [],
+  generatedArtifactsStatus: "available", generatedArtifacts: {},
+};
 
 test("a real current.json record satisfies schemas/state-v1.schema.json", async () => {
   const ajv = new Ajv2020({ allErrors: true, strict: true });
@@ -35,15 +47,20 @@ test("a real current.json record satisfies schemas/state-v1.schema.json", async 
   assert.ok(validate(record), JSON.stringify(validate.errors));
 });
 
+// A real current.json is only ever validated against state-v1.schema.json
+// by target-inspector.mjs (see target-inspector.test.mjs's own
+// generation-0-is-invalid coverage) - generation 0 is exclusively the
+// synthetic in-memory baseline below, never a value resolveBaseline()
+// itself has to defend against directly.
 test("emptyBaseline is the synthetic bootstrap baseline", () => {
   assert.deepEqual(emptyBaseline(), {
-    mode: "bootstrap", generation: 0, release: null,
+    mode: "bootstrap", generation: 0, release: null, installationId: null,
     manifestDigest: null, releaseLockDigest: null, topologyDigest: null,
-    services: {}, volumes: [],
+    services: {}, volumes: [], networks: [], generatedArtifacts: {},
   });
 });
 
-test("topologyToServiceState reads Hof's own ownership labels, keyed by unit, not by artifact", async () => {
+test("topologyToServiceState reads Hof's own ownership labels, keyed by unit, not by artifact, and records volumes/networks", async () => {
   const contracts = await loadContracts();
   const rendered = renderTopology(contracts);
   const state = topologyToServiceState(rendered, contracts.catalog, { manifest: contracts.manifest, releaseLock: contracts.releaseLock });
@@ -65,6 +82,11 @@ test("topologyToServiceState reads Hof's own ownership labels, keyed by unit, no
   // Persistent services carry a schemaVersion, others don't have the key at all.
   assert.equal(typeof state.services.kuvert.schemaVersion, "number");
   assert.equal("schemaVersion" in state.services.schloss, false);
+  // networks alongside volumes - orphan-detection needs to know what's
+  // expected on both, not just volumes.
+  assert.deepEqual(state.volumes, Object.keys(rendered.compose.volumes).sort());
+  assert.deepEqual(state.networks, Object.keys(rendered.compose.networks).sort());
+  assert.ok(state.networks.includes("hof"));
 });
 
 test("topologyToServiceState's manifest/releaseLock digests are optional - null when not supplied", async () => {
@@ -140,12 +162,26 @@ test("resolveBaseline throws when current.json is present but topology.json is m
   );
 });
 
+// The reverse asymmetry - a topology.json left behind (a prior
+// installation's leftover, or a partially-wiped state dir) with no
+// current.json is exactly as untrustworthy as the other direction, and
+// must not be silently treated as "never applied".
+test("resolveBaseline throws when topology.json is present but current.json is missing (corrupt state, reverse direction)", async () => {
+  const contracts = await loadContracts();
+  const rendered = renderTopology(contracts);
+  const managedState = { current: null, topology: rendered };
+  assert.throws(
+    () => resolveBaseline({ managedState, catalog: contracts.catalog, observation: available }),
+    /topology\.json but no current\.json/,
+  );
+});
+
 test("resolveBaseline requires an explicit observation - never defaults to 'nothing is running'", async () => {
   const contracts = await loadContracts();
   assert.throws(() => resolveBaseline({ managedState: null, catalog: contracts.catalog }), /requires an explicit observation/);
 });
 
-test("resolveBaseline: clean host with no state and available, empty observation bootstraps", async () => {
+test("resolveBaseline: clean host with no state and available, empty observation on all three kinds bootstraps", async () => {
   const contracts = await loadContracts();
   const baseline = resolveBaseline({ managedState: null, catalog: contracts.catalog, observation: available });
   assert.deepEqual(baseline, emptyBaseline());
@@ -154,29 +190,83 @@ test("resolveBaseline: clean host with no state and available, empty observation
 test("resolveBaseline: fails closed when state is missing but the inspector couldn't reach the host at all", async () => {
   const contracts = await loadContracts();
   assert.throws(
-    () => resolveBaseline({ managedState: null, catalog: contracts.catalog, observation: { status: "unavailable", resources: [] } }),
-    /observation is unavailable, refusing to assume a clean bootstrap/,
+    () => resolveBaseline({ managedState: null, catalog: contracts.catalog, observation: { ...available, containersStatus: "unavailable" } }),
+    /refusing to assume a clean bootstrap/,
   );
 });
 
-test("resolveBaseline: fails closed when state is missing but Docker already has managed resources", async () => {
+// Container listing succeeding is not enough on its own - volumes and
+// networks are each independently checked, since a single failed `docker
+// inspect` on just one kind must never be masked by the other two
+// succeeding (see target-probe.sh's buffer-then-commit pattern).
+test("resolveBaseline: fails closed when only the volumes listing failed, even though containers/networks are fine", async () => {
   const contracts = await loadContracts();
-  const observation = { status: "available", resources: [{ service: "kuvert", unit: "kuvert-backend", managed: true, image: "x", state: "running" }] };
+  assert.throws(
+    () => resolveBaseline({ managedState: null, catalog: contracts.catalog, observation: { ...available, volumesStatus: "unavailable" } }),
+    /refusing to assume a clean bootstrap/,
+  );
+});
+
+test("resolveBaseline: fails closed when only the networks listing failed", async () => {
+  const contracts = await loadContracts();
+  assert.throws(
+    () => resolveBaseline({ managedState: null, catalog: contracts.catalog, observation: { ...available, networksStatus: "unavailable" } }),
+    /refusing to assume a clean bootstrap/,
+  );
+});
+
+test("resolveBaseline: fails closed when state is missing but Docker already has a managed container", async () => {
+  const contracts = await loadContracts();
+  const observation = { ...available, resources: [{ service: "kuvert", unit: "kuvert-backend", managed: true, image: "x", state: "running" }] };
   assert.throws(
     () => resolveBaseline({ managedState: null, catalog: contracts.catalog, observation }),
-    /managed resources exist but the authoritative state is missing/,
+    /managed resources .* exist but the authoritative state is missing/,
   );
 });
 
-test("resolveBaseline: loads a real saved generation and carries through its recorded digests", async () => {
+// The same fail-closed refusal must fire for an orphaned managed volume
+// or network alone, with zero managed containers - "orphan managed
+// volumes and networks" was explicitly brought into gate 7's own scope,
+// not deferred.
+test("resolveBaseline: fails closed when state is missing but a managed volume alone exists, with no containers", async () => {
+  const contracts = await loadContracts();
+  const observation = { ...available, volumes: [{ managed: true, installationId: "inst-1", resource: "kuvert-data", kind: "volume" }] };
+  assert.throws(
+    () => resolveBaseline({ managedState: null, catalog: contracts.catalog, observation }),
+    /managed resources .* exist but the authoritative state is missing/,
+  );
+});
+
+test("resolveBaseline: fails closed when state is missing but a managed network alone exists", async () => {
+  const contracts = await loadContracts();
+  const observation = { ...available, networks: [{ managed: true, installationId: "inst-1", resource: "hof", kind: "network" }] };
+  assert.throws(
+    () => resolveBaseline({ managedState: null, catalog: contracts.catalog, observation }),
+    /managed resources .* exist but the authoritative state is missing/,
+  );
+});
+
+test("resolveBaseline: an unmanaged container/volume/network alone never blocks a bootstrap", async () => {
+  const contracts = await loadContracts();
+  const observation = {
+    ...available,
+    resources: [{ service: "kuvert", unit: "kuvert-backend", managed: false, image: "x", state: "running" }],
+    volumes: [{ managed: false, installationId: null, resource: "some-other-volume", kind: "volume" }],
+  };
+  const baseline = resolveBaseline({ managedState: null, catalog: contracts.catalog, observation });
+  assert.deepEqual(baseline, emptyBaseline());
+});
+
+test("resolveBaseline: loads a real saved generation and carries through its recorded digests, installationId, networks and generatedArtifacts", async () => {
   const contracts = await loadContracts();
   const rendered = renderTopology(contracts);
   const expected = topologyToServiceState(rendered, contracts.catalog);
+  const generatedArtifacts = { "compose.yml": "sha256:" + "c".repeat(64) };
   const managedState = {
     current: {
-      generation: 3, release: rendered.topology.release,
+      generation: 3, installationId: "inst-1", release: rendered.topology.release,
       manifestDigest: "sha256:" + "a".repeat(64), releaseLockDigest: "sha256:" + "b".repeat(64),
-      topologyDigest: expected.topologyDigest,
+      topologyDigest: expected.topologyDigest, generatedArtifacts,
     },
     topology: rendered,
   };
@@ -184,10 +274,26 @@ test("resolveBaseline: loads a real saved generation and carries through its rec
   const baseline = resolveBaseline({ managedState, catalog: contracts.catalog, observation: available });
   assert.equal(baseline.mode, "applied");
   assert.equal(baseline.generation, 3);
+  assert.equal(baseline.installationId, "inst-1");
   assert.equal(baseline.manifestDigest, "sha256:" + "a".repeat(64));
   assert.equal(baseline.releaseLockDigest, "sha256:" + "b".repeat(64));
   assert.equal(baseline.topologyDigest, expected.topologyDigest);
   assert.deepEqual(baseline.services, expected.services);
+  assert.deepEqual(baseline.volumes, expected.volumes);
+  assert.deepEqual(baseline.networks, expected.networks);
+  assert.deepEqual(baseline.generatedArtifacts, generatedArtifacts);
+});
+
+test("resolveBaseline: a saved generation with no recorded generatedArtifacts defaults to an empty object, not undefined", async () => {
+  const contracts = await loadContracts();
+  const rendered = renderTopology(contracts);
+  const expected = topologyToServiceState(rendered, contracts.catalog);
+  const managedState = {
+    current: { generation: 1, installationId: "inst-1", topologyDigest: expected.topologyDigest },
+    topology: rendered,
+  };
+  const baseline = resolveBaseline({ managedState, catalog: contracts.catalog, observation: available });
+  assert.deepEqual(baseline.generatedArtifacts, {});
 });
 
 test("resolveBaseline: refuses managed state whose recorded topologyDigest doesn't match its own saved topology.json", async () => {

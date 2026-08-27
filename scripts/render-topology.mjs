@@ -45,6 +45,21 @@ function ownershipLabels({ installationId, generation, service, unit, artifact }
     "hof.generation": String(generation ?? 0),
   };
 }
+// Named volumes/networks have no "service" of their own the way a
+// container does - kind ("volume"|"network") and resource (its own
+// name, e.g. "kuvert-data") are what target-probe.sh's volume/network
+// records key on, so an orphaned Hof-managed volume/network (no
+// container currently referencing it) can still be told apart from a
+// stray one on a shared host.
+function resourceOwnershipLabels({ installationId, generation, kind, resource }) {
+  return {
+    "hof.managed": "true",
+    "hof.installation-id": installationId ?? "",
+    "hof.generation": String(generation ?? 0),
+    "hof.kind": kind,
+    "hof.resource": resource,
+  };
+}
 function wachterHardening() {
   return {
     read_only: true,
@@ -139,7 +154,10 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
   const browserOrigins = enabledIds.filter((id) => id !== "tor" && catalogById.get(id).hostname !== null).map((id) => origins[id]);
   const trustedOrigins = [origins.schloss, ...browserOrigins.filter((origin) => origin !== origins.schloss)];
   const appFlags = Object.fromEntries(catalog.services.filter((service) => !service.mandatory).map((service) => [service.id, enabled.has(service.id)]));
-  const compose = { name: "hof", services: {}, volumes: {}, networks: { hof: {} } };
+  const compose = {
+    name: "hof", services: {}, volumes: {},
+    networks: { hof: { labels: resourceOwnershipLabels({ installationId, generation, kind: "network", resource: "hof" }) } },
+  };
 
   compose.services.gateway = composeService(releaseLock.components.gateway.image, { DOMAIN: manifest.domains.base });
   compose.services.gateway.labels = { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "tor", unit: "gateway", artifact: "gateway" }) };
@@ -306,9 +324,16 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
       labels: { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "wachter", unit: "wachter-agent", artifact: "wachter-backend" }) },
       ...wachterHardening(),
     };
-    compose.networks["wachter-internal"] = { internal: true };
+    compose.networks["wachter-internal"] = {
+      internal: true,
+      labels: resourceOwnershipLabels({ installationId, generation, kind: "network", resource: "wachter-internal" }),
+    };
   }
-  for (const id of enabledIds) for (const volume of catalogById.get(id).volumes) compose.volumes[volume] = { name: volume };
+  for (const id of enabledIds) {
+    for (const volume of catalogById.get(id).volumes) {
+      compose.volumes[volume] = { name: volume, labels: resourceOwnershipLabels({ installationId, generation, kind: "volume", resource: volume }) };
+    }
+  }
 
   const healthTargets = enabledIds.map((id) => {
     const service = catalogById.get(id);

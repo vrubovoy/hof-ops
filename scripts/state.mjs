@@ -13,9 +13,9 @@ import { sha256 } from "./digest.mjs";
 
 export function emptyBaseline() {
   return {
-    mode: "bootstrap", generation: 0, release: null,
+    mode: "bootstrap", generation: 0, release: null, installationId: null,
     manifestDigest: null, releaseLockDigest: null, topologyDigest: null,
-    services: {}, volumes: [],
+    services: {}, volumes: [], networks: [], generatedArtifacts: {},
   };
 }
 
@@ -118,36 +118,63 @@ export function topologyToServiceState(rendered, catalog, { manifest, releaseLoc
     topologyDigest: sha256(Buffer.from(stableStringify({ topology: rendered.topology, backup: rendered.backup, caddyfile: rendered.caddyfile }))),
     services,
     volumes: Object.keys(rendered.compose.volumes).sort(),
+    // Unlike volumes, a missing network is safe to just recreate
+    // (stateless infrastructure) - plan.mjs still needs to know what's
+    // expected to tell "recreate this" apart from "this was never ours".
+    networks: Object.keys(rendered.compose.networks).sort(),
   };
 }
 
+function validateObservation(observation) {
+  const required = [
+    "containersStatus", "resources", "volumesStatus", "volumes", "networksStatus", "networks",
+    "generatedArtifactsStatus", "generatedArtifacts",
+  ];
+  const ok = observation
+    && required.every((key) => key in observation)
+    && ["containersStatus", "volumesStatus", "networksStatus", "generatedArtifactsStatus"].every((key) => typeof observation[key] === "string")
+    && ["resources", "volumes", "networks"].every((key) => Array.isArray(observation[key]))
+    && typeof observation.generatedArtifacts === "object" && observation.generatedArtifacts !== null;
+  if (!ok) {
+    throw new Error(
+      "resolveBaseline requires an explicit observation ({containersStatus, resources, volumesStatus, volumes, " +
+      "networksStatus, networks, generatedArtifactsStatus, generatedArtifacts}) - it must never default to 'nothing is running'",
+    );
+  }
+}
+
 // The single decision point PLATFORM-OPS-PLAN.md describes: state
-// present -> use it; state absent and observation confirms Docker
-// already holds resources labeled for this installation -> refuse
-// (hofctl adopt is the only sanctioned recovery, not implemented here);
-// state absent and observation confirms Docker is clean -> the
-// synthetic bootstrap baseline.
+// present -> use it; state absent and observation confirms every
+// resource kind (containers/volumes/networks) is both inspectable and
+// clean -> the synthetic bootstrap baseline; state absent but any kind
+// couldn't be inspected, or any of them already holds a resource
+// labeled for Hof, -> refuse (hofctl adopt is the only sanctioned
+// recovery, not implemented here) rather than guess.
 //
 // managedState is TargetInspector's own snapshot.managedState
 // ({current, topology}, either already-parsed JSON or null) - current
-// present with topology null is corrupt state, not "never applied".
-// observation must be explicit ({status, resources}) - there is no
-// default, because "the inspector didn't run" and "the inspector
-// confirmed nothing is there" are two different facts and must never be
+// present with topology absent, or topology present with current
+// absent, are BOTH corrupt state, not "never applied" (a topology.json
+// left behind by a wiped current.json is exactly as untrustworthy as
+// the reverse). observation must be explicit - there is no default,
+// because "the inspector didn't run" and "the inspector confirmed
+// nothing is there" are two different facts and must never be
 // conflated into the same silent assumption. catalog is needed only to
 // shape topology.json back into the {services, volumes} baseline via
 // topologyToServiceState.
 export function resolveBaseline({ managedState, catalog, observation }) {
-  if (!observation || typeof observation.status !== "string" || !Array.isArray(observation.resources)) {
-    throw new Error("resolveBaseline requires an explicit observation ({status, resources}) - it must never default to 'nothing is running'");
-  }
+  validateObservation(observation);
 
   const current = managedState?.current ?? null;
   const topology = managedState?.topology ?? null;
+  if (current && !topology) {
+    throw new Error("managed state has current.json but no topology.json - state directory is corrupt, cannot compute a baseline");
+  }
+  if (topology && !current) {
+    throw new Error("managed state has topology.json but no current.json - state directory is corrupt (a prior installation's leftover?), cannot compute a baseline");
+  }
+
   if (current) {
-    if (!topology) {
-      throw new Error("managed state has current.json but no topology.json - state directory is corrupt, cannot compute a baseline");
-    }
     const serviceState = topologyToServiceState(topology, catalog);
     // current.json's own recorded topologyDigest should always match a
     // fresh recompute from the topology.json saved alongside it - if it
@@ -162,6 +189,7 @@ export function resolveBaseline({ managedState, catalog, observation }) {
     return {
       mode: "applied",
       generation: current.generation,
+      installationId: current.installationId,
       // manifestDigest/releaseLockDigest can't be recomputed from a saved
       // topology.json alone (the original files aren't kept) - trusted
       // from current.json's own record, exactly as apply wrote them.
@@ -171,15 +199,22 @@ export function resolveBaseline({ managedState, catalog, observation }) {
       release: serviceState.release,
       services: serviceState.services,
       volumes: serviceState.volumes,
+      networks: serviceState.networks,
+      generatedArtifacts: current.generatedArtifacts ?? {},
     };
   }
 
-  if (observation.status !== "available") {
-    throw new Error("cannot confirm this host has no existing managed resources - observation is unavailable, refusing to assume a clean bootstrap");
-  }
-  if (observation.resources.some((resource) => resource.managed)) {
+  const availability = [observation.containersStatus, observation.volumesStatus, observation.networksStatus];
+  if (availability.some((status) => status !== "available")) {
     throw new Error(
-      "managed resources exist but the authoritative state is missing - " +
+      "cannot confirm this host has no existing managed resources - containers/volumes/networks observation " +
+      "is not all available, refusing to assume a clean bootstrap",
+    );
+  }
+  const anyManaged = [...observation.resources, ...observation.volumes, ...observation.networks].some((entry) => entry.managed);
+  if (anyManaged) {
+    throw new Error(
+      "managed resources (containers, volumes, or networks) exist but the authoritative state is missing - " +
       "refusing to guess at a baseline. This needs a typed recovery operation " +
       "(hofctl adopt, not implemented yet), not an automatic adoption.",
     );

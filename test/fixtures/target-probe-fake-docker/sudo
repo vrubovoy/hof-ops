@@ -1,0 +1,76 @@
+#!/usr/bin/env node
+// Fake "sudo" for target-probe.test.mjs - answers exactly the fixed set
+// of commands target-probe.sh ever runs under sudo -n (true, cat,
+// test -e, sha256sum, and docker), scripted by the HOF_TEST_SCENARIO
+// env var so a real `sh scripts/target-probe.sh` run can exercise
+// "Docker reachable only via sudo" and "one of several docker inspect
+// calls failing taints the whole batch" against the genuine shell
+// script, without a real Docker daemon or a real sudoers grant.
+const fs = require("node:fs");
+const crypto = require("node:crypto");
+
+const args = process.argv.slice(2);
+let i = 0;
+if (args[i] === "-n") i++;
+const cmd = args[i];
+const rest = args.slice(i + 1);
+const scenario = process.env.HOF_TEST_SCENARIO;
+const SEP = String.fromCharCode(31);
+
+function containerLine(id) {
+  // The exact 15-field order target-probe.sh's container_fmt joins -
+  // see CONTAINER_FIELDS in target-inspector.mjs. Only what this
+  // fixture's own assertions care about is realistic; the rest are
+  // fixed, valid placeholder values.
+  return [
+    `/${id}`, "ghcr.io/example/kuvert-backend@sha256:" + "a".repeat(64), "running", "none",
+    "true", "inst-1", "kuvert", "kuvert-backend", "kuvert-backend", "1", "hof", "kuvert-backend",
+    "hof,", "", "",
+  ].join(SEP);
+}
+
+function fail() { process.exit(1); }
+
+switch (cmd) {
+  case "true":
+    process.exit(0);
+    break;
+  case "cat":
+    try { process.stdout.write(fs.readFileSync(rest[0])); process.exit(0); } catch { fail(); }
+    break;
+  case "test":
+    // rest: ["-e", path]
+    process.exit(fs.existsSync(rest[1]) ? 0 : 1);
+    break;
+  case "sha256sum":
+    try {
+      const digest = crypto.createHash("sha256").update(fs.readFileSync(rest[0])).digest("hex");
+      process.stdout.write(`${digest}  ${rest[0]}\n`);
+      process.exit(0);
+    } catch { fail(); }
+    break;
+  case "docker": {
+    const [sub, ...rest2] = rest;
+    if (sub === "version") { process.stdout.write("27.0.0"); process.exit(0); }
+    if (sub === "compose" && rest2[0] === "version") { process.stdout.write("2.28.0"); process.exit(0); }
+    if (sub === "ps") {
+      if (scenario === "sudo-only-success") process.stdout.write("c1\n");
+      else if (scenario === "partial-failure") process.stdout.write("c1\nc2\n");
+      process.exit(0);
+    }
+    if (sub === "inspect") {
+      const id = rest2.at(-1);
+      if (scenario === "partial-failure" && id === "c2") fail();
+      process.stdout.write(containerLine(id));
+      process.exit(0);
+    }
+    if (sub === "volume" && rest2[0] === "ls") { process.exit(0); }
+    if (sub === "network" && rest2[0] === "ls") { process.exit(0); }
+    if (sub === "volume" && rest2[0] === "inspect") fail();
+    if (sub === "network" && rest2[0] === "inspect") fail();
+    fail();
+    break;
+  }
+  default:
+    fail();
+}

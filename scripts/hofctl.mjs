@@ -3,6 +3,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { renderFiles } from "./render-topology.mjs";
+import { runPreflight } from "./preflight.mjs";
 import { validateDeployment } from "./validate-deployment.mjs";
 
 const BOOLEAN_FLAGS = new Set(["--skip-signature"]);
@@ -11,6 +12,7 @@ function usage(message) {
   if (message) console.error(message);
   console.error("usage: hofctl render --services <services.yml> --release-lock <release-lock.json> --catalog <catalog.yaml> --out <directory>");
   console.error("       hofctl validate --services <services.yml> --release-lock <release-lock.json> [--catalog <catalog.yaml>] [--release-selection <file>] [--stable-channel <file>] [--release-lock-signature <file>] [--release-lock-certificate <file>] [--release-lock-identity <identity>] [--release-lock-oidc-issuer <issuer>] [--skip-signature]");
+  console.error("       hofctl preflight --services <services.yml> [--catalog <catalog.yaml>] [--disk-path <path>] [--min-free-disk-gb <n>] [--min-memory-gb <n>] [--min-cpu-cores <n>]");
   process.exitCode = 2;
 }
 
@@ -84,6 +86,32 @@ if (command === "render") {
         if (errors.length > 0) process.exitCode = 1;
       } catch (error) {
         console.log(JSON.stringify({ type: "validate.fatal", message: error instanceof Error ? error.message : String(error) }));
+        process.exitCode = 1;
+      }
+    }
+  }
+} else if (command === "preflight") {
+  const options = parseFlags(args);
+  if (options) {
+    resolvePaths(options, ["services", "catalog", "diskPath"]);
+    if (!options.services) {
+      usage("preflight requires --services");
+    } else {
+      const preflightOptions = {
+        manifestPath: options.services,
+        catalogPath: options.catalog,
+        diskPath: options.diskPath,
+      };
+      if (options.minFreeDiskGb) preflightOptions.minFreeDiskBytes = Number(options.minFreeDiskGb) * 1024 ** 3;
+      if (options.minMemoryGb) preflightOptions.minTotalMemoryBytes = Number(options.minMemoryGb) * 1024 ** 3;
+      if (options.minCpuCores) preflightOptions.minCpuCores = Number(options.minCpuCores);
+      try {
+        const { checks, ok } = await runPreflight(preflightOptions);
+        for (const entry of checks) console.log(JSON.stringify({ type: "preflight.check", ...entry }));
+        console.log(JSON.stringify({ type: "preflight.result", ok }));
+        if (!ok) process.exitCode = 1;
+      } catch (error) {
+        console.log(JSON.stringify({ type: "preflight.fatal", message: error instanceof Error ? error.message : String(error) }));
         process.exitCode = 1;
       }
     }

@@ -2,6 +2,7 @@
 
 import { execFile } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
+import { statSync } from "node:fs";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -111,6 +112,19 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
       // path and the bind mount fails at container start.
       if (compose.services.gateway) await writeFile(path.join(temporaryDirectory, "Caddyfile"), rendered.caddyfile);
       const environment = { ...process.env };
+      // The rendered fallback (${DOCKER_GID:-998}) is only ever a guess -
+      // wachter-agent got a real EACCES connecting to the Docker socket
+      // once actually started, because this runner's real group ID isn't
+      // 998. Read it the same way an operator's own setup would
+      // (`stat -c '%g' /var/run/docker.sock`, per Tor's README).
+      if (compose.services["wachter-agent"]) {
+        try {
+          environment.DOCKER_GID = String(statSync("/var/run/docker.sock").gid);
+        } catch {
+          // No local Docker socket to introspect - leave the rendered
+          // fallback in place rather than failing the whole matrix over it.
+        }
+      }
       // Unique per variable name, not one shared constant, and at least
       // 32 bytes - both found by actually running this against schlussel
       // with Glocke enabled: its own directional-secret distinctness

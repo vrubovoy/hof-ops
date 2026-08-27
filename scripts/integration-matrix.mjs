@@ -89,8 +89,12 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
       // path and the bind mount fails at container start.
       if (compose.services.gateway) await writeFile(path.join(temporaryDirectory, "Caddyfile"), rendered.caddyfile);
       const environment = { ...process.env };
+      // At least 32 bytes: several of these are HMAC secrets whose own
+      // resolveSecret() enforces a 32-byte minimum (found by actually
+      // running this against schlussel with Glocke enabled - the shorter
+      // placeholder crashed it at startup instead of letting it come up).
       for (const match of JSON.stringify(compose).matchAll(/\\?\$\{([A-Z0-9_]+):\?required\}/g)) {
-        environment[match[1]] = "gate6-contract-value";
+        environment[match[1]] = "gate6-contract-placeholder-value-0123456789";
       }
       // WACHTER_AGENT_TOKEN is an either/or with _FILE, so the render
       // template can't mark it `:?required` (Compose has no "one of"

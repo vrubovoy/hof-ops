@@ -226,3 +226,43 @@ test("a state file that exists but this user genuinely cannot read (no sudo, mod
     await exec("docker", ["exec", containerName, "rm", "-f", "/var/lib/hof/state/current.json"]);
   }
 });
+
+test("a readable generated file reports present with a real sha256 digest, over the real transport", async () => {
+  await exec("docker", [
+    "exec", containerName, "sh", "-c",
+    "mkdir -p /etc/hof/generated && printf 'services: {}\\n' > /etc/hof/generated/compose.yml && chmod 644 /etc/hof/generated/compose.yml",
+  ]);
+  const { stdout: sumLine } = await exec("docker", ["exec", containerName, "sha256sum", "/etc/hof/generated/compose.yml"]);
+  const expectedDigest = `sha256:${sumLine.trim().split(/\s+/)[0]}`;
+  try {
+    const snapshot = await inspectTarget({
+      targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
+      identityFile: userKeyPath, knownHostsFile: knownHostsPath, connectTimeoutSeconds: 10,
+    });
+    assert.equal(snapshot.generatedArtifactsStatus, "available");
+    assert.deepEqual(snapshot.generatedArtifacts["compose.yml"], { status: "present", digest: expectedDigest });
+  } finally {
+    await exec("docker", ["exec", containerName, "rm", "-f", "/etc/hof/generated/compose.yml"]);
+  }
+});
+
+test("a generated file that exists but this user genuinely cannot read (no sudo, mode 600, root-owned) reports unreadable - never silently indistinguishable from a genuinely missing one", async () => {
+  await exec("docker", [
+    "exec", containerName, "sh", "-c",
+    "mkdir -p /etc/hof/generated && echo 'services: {}' > /etc/hof/generated/Caddyfile && chown root:root /etc/hof/generated/Caddyfile && chmod 600 /etc/hof/generated/Caddyfile",
+  ]);
+  try {
+    const snapshot = await inspectTarget({
+      targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
+      identityFile: userKeyPath, knownHostsFile: knownHostsPath, connectTimeoutSeconds: 10,
+    });
+    assert.equal(snapshot.host.sudoNonInteractive, false, "hofprobe has no sudoers entry in this fixture, by design");
+    assert.deepEqual(snapshot.generatedArtifacts.Caddyfile, { status: "unreadable", digest: null });
+    // A genuinely different, still-absent file in the same batch stays
+    // "absent" - "unreadable" must be scoped to the one file that's
+    // actually permission-walled, not smeared across the whole batch.
+    assert.deepEqual(snapshot.generatedArtifacts["service.env"], { status: "unreadable", digest: null }, "also unreadable here - this fixture has no sudo at all, so nothing can be positively confirmed absent either");
+  } finally {
+    await exec("docker", ["exec", containerName, "rm", "-f", "/etc/hof/generated/Caddyfile"]);
+  }
+});

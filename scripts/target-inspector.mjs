@@ -23,7 +23,7 @@ import addFormats from "ajv-formats";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PROBE_PATH = path.join(root, "scripts/target-probe.sh");
-const PROBE_VERSION = "HOF-PROBE-V3";
+const PROBE_VERSION = "HOF-PROBE-V4";
 
 // Every singleton is now mandatory - the probe always emits exactly one
 // of each, with an explicit "unknown"/status sentinel rather than
@@ -71,6 +71,52 @@ function parseStateFileStatus(statusValue, payloadValue, statusName, payloadName
   if (statusValue === "present" && payloadValue.length === 0) throw new Error(`probe record ${statusName} is "present" but ${payloadName} is empty`);
   if (statusValue !== "present" && payloadValue.length > 0) throw new Error(`probe record ${statusName} is "${statusValue}" but ${payloadName} is unexpectedly non-empty`);
   return statusValue;
+}
+
+// The exact fixed filename list target-probe.sh checksums, in no
+// particular order - every one of them must appear in a valid
+// generated-artifacts payload, and nothing else may.
+const GENERATED_ARTIFACT_FILENAMES = new Set(["compose.yml", "Caddyfile", "service.env", "runtime-config.json", "backup-inventory.json", "topology.json"]);
+const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
+// Each generated file gets its own present|absent|unreadable status
+// (see target-probe.sh's own per-file positive-confirmation-only read) -
+// a file that exists but couldn't be hashed even with sudo must never
+// collapse into the same "no digest recorded" shape a genuinely absent
+// file has, or a planner comparing against a baseline digest would
+// treat "can't tell" exactly like "safe to regenerate".
+function parseGeneratedArtifacts(raw) {
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("probe record generated-artifacts is not valid JSON");
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("probe record generated-artifacts is not a JSON object");
+  }
+  const keys = new Set(Object.keys(value));
+  for (const filename of GENERATED_ARTIFACT_FILENAMES) {
+    if (!keys.has(filename)) throw new Error(`probe record generated-artifacts is missing the fixed entry ${JSON.stringify(filename)}`);
+  }
+  for (const filename of keys) {
+    if (!GENERATED_ARTIFACT_FILENAMES.has(filename)) throw new Error(`probe record generated-artifacts has an unknown entry ${JSON.stringify(filename)}`);
+    const entry = value[filename];
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error(`probe record generated-artifacts.${filename} is not an object`);
+    }
+    if (!STATE_FILE_STATUSES.has(entry.status)) {
+      throw new Error(`probe record generated-artifacts.${filename} has an unrecognized status: ${JSON.stringify(entry.status)}`);
+    }
+    if (entry.status === "present") {
+      if (typeof entry.digest !== "string" || !DIGEST_PATTERN.test(entry.digest)) {
+        throw new Error(`probe record generated-artifacts.${filename} is "present" but its digest is not a valid sha256 digest`);
+      }
+    } else if (entry.digest !== null) {
+      throw new Error(`probe record generated-artifacts.${filename} is "${entry.status}" but its digest is not null`);
+    }
+  }
+  return value;
 }
 
 const BASE64_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
@@ -262,6 +308,7 @@ async function buildSnapshot(mode, transport, stdout) {
   const resources = container.map(parseContainerRecord);
   const volumes = volume.map((raw) => parseResourceRecord(raw, "volume"));
   const networks = network.map((raw) => parseResourceRecord(raw, "network"));
+  const generatedArtifactsStatus = parseAvailabilityStatus(singles["generated-artifacts-status"], "generated-artifacts-status");
 
   const [osId, osVersionId] = singles.os.split("|");
   const [dockerEngine, dockerCompose] = singles.docker.split("|");
@@ -331,8 +378,12 @@ async function buildSnapshot(mode, transport, stdout) {
       topologyStatus,
       topology: managedTopology,
     },
-    generatedArtifactsStatus: parseAvailabilityStatus(singles["generated-artifacts-status"], "generated-artifacts-status"),
-    generatedArtifacts: JSON.parse(singles["generated-artifacts"]),
+    generatedArtifactsStatus,
+    // The fixed per-file map is only ever emitted when the batch itself
+    // is available (sha256sum genuinely missing from the target writes
+    // a bare "{}" instead - see target-probe.sh) - parseGeneratedArtifacts
+    // would otherwise reject that as missing every fixed entry.
+    generatedArtifacts: generatedArtifactsStatus === "available" ? parseGeneratedArtifacts(singles["generated-artifacts"]) : {},
   };
 }
 

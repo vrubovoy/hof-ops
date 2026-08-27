@@ -27,7 +27,21 @@ function validCurrentJson(overrides = {}) {
   };
 }
 
-// Builds a valid HOF-PROBE-V3 transcript from a plain object of
+// The full fixed six-filename map, all genuinely absent - the shape a
+// clean host with verified sudo, but nothing ever generated yet,
+// reports. Every test that isn't specifically exercising
+// generated-artifacts parsing gets this for free via probeOutput()'s
+// own default.
+const CLEAN_GENERATED_ARTIFACTS = JSON.stringify({
+  "compose.yml": { status: "absent", digest: null },
+  Caddyfile: { status: "absent", digest: null },
+  "service.env": { status: "absent", digest: null },
+  "runtime-config.json": { status: "absent", digest: null },
+  "backup-inventory.json": { status: "absent", digest: null },
+  "topology.json": { status: "absent", digest: null },
+});
+
+// Builds a valid HOF-PROBE-V4 transcript from a plain object of
 // singleton values plus port/container/volume/network arrays - the
 // same shape target-probe.sh's own output decodes to, without needing a
 // real shell. Every mandatory singleton has a default so a test only
@@ -37,8 +51,8 @@ function probeOutput({
   clock = "yes", sudo = "yes", docker = "27.0.0|2.28.0",
   dockerContainersStatus = "available", dockerVolumesStatus = "available", dockerNetworksStatus = "available",
   stateCurrentStatus = "absent", stateCurrent = "", stateTopologyStatus = "absent", stateTopology = "",
-  generatedArtifactsStatus = "available", generatedArtifacts = "{}",
-  ports = [], containers = [], volumes = [], networks = [], version = "HOF-PROBE-V3",
+  generatedArtifactsStatus = "available", generatedArtifacts = CLEAN_GENERATED_ARTIFACTS,
+  ports = [], containers = [], volumes = [], networks = [], version = "HOF-PROBE-V4",
 } = {}) {
   const lines = [version];
   const record = (name, value) => lines.push(`R ${name} ${b64(value)}`);
@@ -132,7 +146,7 @@ test("ssh mode builds exactly the hardened argument list, in known-hosts mode", 
   ]);
   // The fixed probe script, verbatim, over stdin - never a caller-built command.
   assert.match(call.options.input, /^#!\/bin\/sh/);
-  assert.match(call.options.input, /HOF-PROBE-V3/);
+  assert.match(call.options.input, /HOF-PROBE-V4/);
 });
 
 test("ssh mode never uses ssh-keyscan when a known-hosts file is supplied", async () => {
@@ -260,7 +274,7 @@ test("rejects a non-finite or non-positive connectTimeoutSeconds instead of sile
 });
 
 test("an oversized transcript is rejected by the protocol-level line bound, independent of execFile's own maxBuffer", async () => {
-  const huge = "HOF-PROBE-V3\n" + Array.from({ length: 3000 }, (_, i) => `R port ${b64(`${8000 + i}|free`)}`).join("\n") + "\nEND\n";
+  const huge = "HOF-PROBE-V4\n" + Array.from({ length: 3000 }, (_, i) => `R port ${b64(`${8000 + i}|free`)}`).join("\n") + "\nEND\n";
   const run = fakeRun({ sh: { stdout: huge, stderr: "" } });
   await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /more than the 2000-line bound/);
 });
@@ -272,8 +286,8 @@ test("a truncated transcript (no END) is rejected, not silently accepted as part
 });
 
 test("a wrong version marker is rejected", async () => {
-  const run = fakeRun({ sh: { stdout: probeOutput({ version: "HOF-PROBE-V2" }), stderr: "" } });
-  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /does not start with the expected HOF-PROBE-V3 marker/);
+  const run = fakeRun({ sh: { stdout: probeOutput({ version: "HOF-PROBE-V3" }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /does not start with the expected HOF-PROBE-V4 marker/);
 });
 
 test("an unrecognized record name is rejected, not ignored", async () => {
@@ -477,19 +491,77 @@ test("state file present/absent/unreadable statuses all parse distinctly", async
   assert.equal(unreadable.managedState.current, null);
 });
 
-test("generatedArtifacts parses through as the real JSON object", async () => {
-  const artifacts = { "compose.yml": "sha256:" + "6".repeat(64), "topology.json": "sha256:" + "7".repeat(64) };
-  const run = fakeRun({ sh: { stdout: probeOutput({ generatedArtifacts: JSON.stringify(artifacts) }), stderr: "" } });
+function generatedArtifacts(overrides = {}) {
+  return JSON.stringify({
+    "compose.yml": { status: "absent", digest: null },
+    Caddyfile: { status: "absent", digest: null },
+    "service.env": { status: "absent", digest: null },
+    "runtime-config.json": { status: "absent", digest: null },
+    "backup-inventory.json": { status: "absent", digest: null },
+    "topology.json": { status: "absent", digest: null },
+    ...overrides,
+  });
+}
+
+test("generatedArtifacts parses through as the real per-file {status, digest} object", async () => {
+  const digest = "sha256:" + "6".repeat(64);
+  const payload = generatedArtifacts({ "compose.yml": { status: "present", digest } });
+  const run = fakeRun({ sh: { stdout: probeOutput({ generatedArtifacts: payload }), stderr: "" } });
   const snapshot = await inspectTarget({ targetMode: "local", run });
-  assert.deepEqual(snapshot.generatedArtifacts, artifacts);
+  assert.deepEqual(snapshot.generatedArtifacts["compose.yml"], { status: "present", digest });
+  assert.deepEqual(snapshot.generatedArtifacts.Caddyfile, { status: "absent", digest: null });
 });
 
-test("generatedArtifactsStatus distinguishes 'sha256sum isn't on this target at all' from 'it ran, files are just missing'", async () => {
+test("generatedArtifactsStatus distinguishes 'sha256sum isn't on this target at all' from 'it ran, files are just missing' - and the unavailable batch is simply {}, not the fixed six-file map", async () => {
   const runAvailable = fakeRun({ sh: { stdout: probeOutput({ generatedArtifactsStatus: "available" }), stderr: "" } });
   const available = await inspectTarget({ targetMode: "local", run: runAvailable });
   assert.equal(available.generatedArtifactsStatus, "available");
+  assert.equal(Object.keys(available.generatedArtifacts).length, 6);
 
-  const runUnavailable = fakeRun({ sh: { stdout: probeOutput({ generatedArtifactsStatus: "unavailable" }), stderr: "" } });
+  const runUnavailable = fakeRun({ sh: { stdout: probeOutput({ generatedArtifactsStatus: "unavailable", generatedArtifacts: "{}" }), stderr: "" } });
   const unavailable = await inspectTarget({ targetMode: "local", run: runUnavailable });
   assert.equal(unavailable.generatedArtifactsStatus, "unavailable");
+  assert.deepEqual(unavailable.generatedArtifacts, {});
+});
+
+test("a generated file reported unreadable never carries a digest, and is never indistinguishable from a genuinely absent one", async () => {
+  const payload = generatedArtifacts({ Caddyfile: { status: "unreadable", digest: null } });
+  const run = fakeRun({ sh: { stdout: probeOutput({ generatedArtifacts: payload }), stderr: "" } });
+  const snapshot = await inspectTarget({ targetMode: "local", run });
+  assert.deepEqual(snapshot.generatedArtifacts.Caddyfile, { status: "unreadable", digest: null });
+  assert.notDeepEqual(snapshot.generatedArtifacts.Caddyfile, snapshot.generatedArtifacts["compose.yml"], "unreadable must stay a distinct status from absent, not collapse into the same shape");
+});
+
+test("generated-artifacts strictly rejects a missing fixed filename entry", async () => {
+  const incomplete = JSON.stringify({ "compose.yml": { status: "absent", digest: null } }); // missing the other five
+  const run = fakeRun({ sh: { stdout: probeOutput({ generatedArtifacts: incomplete }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /missing the fixed entry/);
+});
+
+test("generated-artifacts strictly rejects an unknown extra filename entry", async () => {
+  const extra = generatedArtifacts({ "unexpected-file.txt": { status: "absent", digest: null } });
+  const run = fakeRun({ sh: { stdout: probeOutput({ generatedArtifacts: extra }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /unknown entry/);
+});
+
+test("generated-artifacts strictly rejects an unrecognized per-file status", async () => {
+  const payload = generatedArtifacts({ "compose.yml": { status: "presnt", digest: null } });
+  const run = fakeRun({ sh: { stdout: probeOutput({ generatedArtifacts: payload }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /unrecognized status/);
+});
+
+test("generated-artifacts strictly rejects a \"present\" entry with a missing or malformed digest", async () => {
+  const missingDigest = generatedArtifacts({ "compose.yml": { status: "present", digest: null } });
+  const run1 = fakeRun({ sh: { stdout: probeOutput({ generatedArtifacts: missingDigest }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run: run1 }), /is "present" but its digest is not a valid sha256 digest/);
+
+  const malformedDigest = generatedArtifacts({ "compose.yml": { status: "present", digest: "not-a-digest" } });
+  const run2 = fakeRun({ sh: { stdout: probeOutput({ generatedArtifacts: malformedDigest }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run: run2 }), /is "present" but its digest is not a valid sha256 digest/);
+});
+
+test("generated-artifacts strictly rejects a non-\"present\" entry that still carries a digest", async () => {
+  const payload = generatedArtifacts({ "compose.yml": { status: "absent", digest: "sha256:" + "6".repeat(64) } });
+  const run = fakeRun({ sh: { stdout: probeOutput({ generatedArtifacts: payload }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /is "absent" but its digest is not null/);
 });

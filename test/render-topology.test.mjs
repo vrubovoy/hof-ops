@@ -28,12 +28,95 @@ test("full topology renders every selected service and integration", async () =>
   assert.equal(rendered.compose.services.schloss.environment.WACHTER_ENABLED, "true");
   assert.equal(rendered.compose.services["glocke-backend"].environment.GLOCKE_EVENT_SOURCES, "schlussel,kuvert,tafel,zettel");
   assert.equal(rendered.compose.services["glocke-backend"].environment.ALLOWED_ORIGINS, rendered.topology.trustedOrigins.join(","));
-  assert.match(rendered.compose.services["herold-backend"].environment.HEROLD_CREDENTIAL_ENCRYPTION_KEY, /required/);
+  assert.equal(rendered.compose.services["herold-backend"].environment.HEROLD_CREDENTIAL_ENCRYPTION_KEY_FILE, "/run/secrets/herold-credential-encryption-key");
+  assert.ok(rendered.compose.services["herold-backend"].secrets.includes("herold-credential-encryption-key"));
+  assert.deepEqual(rendered.compose.secrets["herold-credential-encryption-key"], { file: "${HOF_SECRETS_DIR:-/etc/hof/secrets}/herold-credential-encryption-key" });
   assert.deepEqual(rendered.compose.services["wachter-agent"].networks, ["wachter-internal"]);
   assert.ok(rendered.compose.services["wachter-agent"].volumes.includes("/var/run/docker.sock:/var/run/docker.sock"));
   assert.match(rendered.caddyfile, /glocke\.example\.com/);
   assert.ok(rendered.compose.services.wachter);
   assert.ok(rendered.compose.services["wachter-agent"]);
+});
+
+test("secret-safe rendering: every secret-bearing service gets the _FILE convention, never a raw env var, and compose.secrets covers exactly what's wired", async () => {
+  const contracts = await contractsWith(["kuvert", "tafel", "zettel", "glocke", "schrank", "herold", "wachter"]);
+  const rendered = renderTopology(contracts);
+  const { compose } = rendered;
+
+  // Every secret this configuration needs is declared once, at a fixed,
+  // overridable-for-testing path - never a literal /etc path baked in
+  // with no way to point it elsewhere.
+  const expectedSecretNames = [
+    "schlussel-to-glocke-hmac-secret", "kuvert-to-glocke-hmac-secret", "tafel-to-glocke-hmac-secret", "zettel-to-glocke-hmac-secret",
+    "glocke-to-schlussel-hmac-secret", "glocke-vapid-private-key", "herold-credential-encryption-key", "wachter-agent-token",
+  ];
+  assert.deepEqual(Object.keys(compose.secrets).sort(), expectedSecretNames.sort());
+  for (const name of expectedSecretNames) {
+    assert.deepEqual(compose.secrets[name], { file: `\${HOF_SECRETS_DIR:-/etc/hof/secrets}/${name}` });
+  }
+
+  // schlussel: both of its own two HMAC secrets, _FILE only.
+  assert.deepEqual(compose.services.schlussel.secrets.slice().sort(), ["glocke-to-schlussel-hmac-secret", "schlussel-to-glocke-hmac-secret"].sort());
+  assert.equal(compose.services.schlussel.environment.SCHLUSSEL_TO_GLOCKE_HMAC_SECRET_FILE, "/run/secrets/schlussel-to-glocke-hmac-secret");
+  assert.equal(compose.services.schlussel.environment.GLOCKE_TO_SCHLUSSEL_HMAC_SECRET_FILE, "/run/secrets/glocke-to-schlussel-hmac-secret");
+  assert.ok(!("SCHLUSSEL_TO_GLOCKE_HMAC_SECRET" in compose.services.schlussel.environment));
+  assert.ok(!("GLOCKE_TO_SCHLUSSEL_HMAC_SECRET" in compose.services.schlussel.environment));
+
+  // Each glocke producer gets its own outgoing secret, _FILE only.
+  for (const producer of ["kuvert", "tafel", "zettel"]) {
+    const unit = `${producer}-backend`;
+    const envVar = `${producer.toUpperCase()}_TO_GLOCKE_HMAC_SECRET`;
+    assert.equal(compose.services[unit].environment[`${envVar}_FILE`], `/run/secrets/${producer}-to-glocke-hmac-secret`);
+    assert.ok(!(envVar in compose.services[unit].environment));
+    assert.ok(compose.services[unit].secrets.includes(`${producer}-to-glocke-hmac-secret`));
+  }
+
+  // glocke-backend: every producer's own secret (under its own
+  // GLOCKE_SOURCE_SECRET_* key), the reverse HMAC secret, and the VAPID
+  // private key - six secrets total, all _FILE.
+  const glockeEnv = compose.services["glocke-backend"].environment;
+  assert.deepEqual(
+    compose.services["glocke-backend"].secrets.slice().sort(),
+    ["schlussel-to-glocke-hmac-secret", "kuvert-to-glocke-hmac-secret", "tafel-to-glocke-hmac-secret", "zettel-to-glocke-hmac-secret", "glocke-to-schlussel-hmac-secret", "glocke-vapid-private-key"].sort(),
+  );
+  for (const producer of ["schlussel", "kuvert", "tafel", "zettel"]) {
+    assert.equal(glockeEnv[`GLOCKE_SOURCE_SECRET_${producer.toUpperCase()}_FILE`], `/run/secrets/${producer}-to-glocke-hmac-secret`);
+  }
+  assert.equal(glockeEnv.GLOCKE_VAPID_PRIVATE_KEY_FILE, "/run/secrets/glocke-vapid-private-key");
+  assert.ok(!("GLOCKE_VAPID_PRIVATE_KEY" in glockeEnv));
+  // GLOCKE_PUSH_ALLOWED_ENDPOINT_HOSTS is a real config value, not a
+  // secret at all - a plain manifest-driven value, never routed through
+  // compose.secrets.
+  assert.equal(glockeEnv.GLOCKE_PUSH_ALLOWED_ENDPOINT_HOSTS, "fcm.googleapis.com,updates.push.services.mozilla.com");
+  // The one deliberate exception: glocke's own app reads the VAPID
+  // *public* key as a plain value, not _FILE-aware - a bare render with
+  // no vapidPublicKey supplied keeps the old require-a-value placeholder
+  // rather than silently emitting nothing.
+  assert.match(glockeEnv.GLOCKE_VAPID_PUBLIC_KEY, /GLOCKE_VAPID_PUBLIC_KEY:\?required/);
+
+  // A real, supplied vapidPublicKey is rendered as the literal value,
+  // never the placeholder.
+  const withRealVapid = renderTopology({ ...contracts, vapidPublicKey: "real-derived-public-key-value" });
+  assert.equal(withRealVapid.compose.services["glocke-backend"].environment.GLOCKE_VAPID_PUBLIC_KEY, "real-derived-public-key-value");
+
+  // herold: its own encryption key, _FILE only.
+  assert.equal(compose.services["herold-backend"].environment.HEROLD_CREDENTIAL_ENCRYPTION_KEY_FILE, "/run/secrets/herold-credential-encryption-key");
+  assert.ok(!("HEROLD_CREDENTIAL_ENCRYPTION_KEY" in compose.services["herold-backend"].environment));
+
+  // wachter + wachter-agent: the SAME shared token, _FILE only, no
+  // leftover bind-mount workaround.
+  for (const unit of ["wachter", "wachter-agent"]) {
+    assert.equal(compose.services[unit].environment.WACHTER_AGENT_TOKEN_FILE, "/run/secrets/wachter-agent-token");
+    assert.ok(!("WACHTER_AGENT_TOKEN" in compose.services[unit].environment));
+    assert.ok(compose.services[unit].secrets.includes("wachter-agent-token"));
+  }
+  assert.ok(!compose.services.wachter.volumes?.some((v) => v.includes("WACHTER_AGENT_TOKEN_FILE")), "no leftover identity bind-mount workaround");
+});
+
+test("secret-safe rendering: with everything optional disabled, no secrets are required at all", async () => {
+  const rendered = renderTopology(await contractsWith([]));
+  assert.deepEqual(rendered.compose.secrets, {});
+  for (const service of Object.values(rendered.compose.services)) assert.ok(!("secrets" in service));
 });
 
 test("Wächter's two containers get their real port, command, and hardening", async () => {

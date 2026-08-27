@@ -12,7 +12,7 @@ services:
   herold: { enabled: true }
   wachter: { enabled: true }
 features:
-  browserPush: { enabled: true, subject: mailto:admin@example.com }
+  browserPush: { enabled: true, subject: mailto:admin@example.com, allowedEndpointHosts: [fcm.googleapis.com, updates.push.services.mozilla.com] }
 backup:
   schedule: "03:00"
   destinations:

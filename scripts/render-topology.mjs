@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 
 import { validateContracts } from "./contracts.mjs";
+import { requiredSecrets } from "./secrets.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP_PORTS = { kuvert: 3001, tafel: 3002, zettel: 3003, glocke: 3004, schrank: 3005, herold: 3006, wachter: 3007 };
@@ -110,6 +111,31 @@ function composeService(image, environment = {}) {
   };
 }
 
+// Wires one secret onto `component` via the `_FILE` convention every
+// consuming app already implements (see e.g. glocke/herold/kuvert/
+// tafel/zettel's own resolveSecret()/config.ts) - Compose's own native
+// file-based secrets mechanism always mounts a declared secret at
+// exactly /run/secrets/<name> inside the container, regardless of the
+// host source path, which is exactly why the app-side *_FILE var can
+// point at a fixed, known-in-advance path. The three pieces this
+// touches (the unit's own <ENVVAR>_FILE value, the unit's own
+// `secrets:` list, and compose's top-level `secrets:` declaration
+// pointing at the real target-side source file under
+// /etc/hof/secrets/) are only ever written together, here, so they can
+// never drift out of sync with each other. Never touches an actual
+// secret VALUE - render-topology.mjs stays secret-blind by design (see
+// scripts/secrets.mjs's own module comment).
+function wireSecret(compose, component, secretName, envVar) {
+  component.environment[`${envVar}_FILE`] = `/run/secrets/${secretName}`;
+  component.secrets = [...(component.secrets ?? []), secretName];
+  // ${HOF_SECRETS_DIR:-...}, not a hardcoded path - the same Compose
+  // interpolation convention already used for ${DOCKER_GID:-998} - so a
+  // real target's Ansible-managed default and a test's own throwaway
+  // directory (never needing real root/`/etc` write access to verify
+  // this) both work against the exact same rendered file.
+  compose.secrets[secretName] = { file: `\${HOF_SECRETS_DIR:-/etc/hof/secrets}/${secretName}` };
+}
+
 function healthcheck(port, healthPath) {
   return {
     test: ["CMD", "wget", "-qO-", `http://localhost:${port}${healthPath}`],
@@ -127,7 +153,17 @@ function healthyDependencies(service, catalogById) {
   );
 }
 
-export function renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId = null, generation = 0 }) {
+// vapidPublicKey: the (non-secret) VAPID public key, derived from
+// whatever "glocke-vapid-private-key" currently holds in the operator's
+// own secrets store (see scripts/secrets.mjs's vapidPublicKeyFor()) -
+// the ONE value render-topology.mjs ever needs from outside its own
+// secret-blind inputs, since glocke's own app reads it as a plain env
+// var, not `_FILE`-aware (unlike every other secret here). Omitted
+// (undefined) for a bare `hofctl render` preview with no real secrets
+// store behind it yet - GLOCKE_VAPID_PUBLIC_KEY then keeps the same
+// require-a-value-at-`docker compose up`-time placeholder it always
+// had, so render stays usable and deterministic without live secrets.
+export function renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId = null, generation = 0, vapidPublicKey } = {}) {
   const errors = validateContracts({
     servicesSchema,
     catalogSchema,
@@ -144,6 +180,11 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
   const catalogById = new Map(catalog.services.map((service) => [service.id, service]));
   const enabledIds = enabledServiceIds(manifest, catalog);
   const enabled = new Set(enabledIds);
+  // Every secret this specific configuration needs, keyed by the exact
+  // env var name each call site below already uses - see wireSecret()
+  // and scripts/secrets.mjs's own requiredSecrets() (the single source
+  // of truth both this renderer and hofctl secrets/apply share).
+  const secretNameFor = new Map(requiredSecrets(manifest, enabledIds).map((secret) => [secret.envVar, secret.name]));
   for (const id of enabled) {
     for (const dependency of catalogById.get(id).dependsOn) {
       if (!enabled.has(dependency)) throw new Error(`enabled service ${id} requires disabled service ${dependency}`);
@@ -155,7 +196,7 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
   const trustedOrigins = [origins.schloss, ...browserOrigins.filter((origin) => origin !== origins.schloss)];
   const appFlags = Object.fromEntries(catalog.services.filter((service) => !service.mandatory).map((service) => [service.id, enabled.has(service.id)]));
   const compose = {
-    name: "hof", services: {}, volumes: {},
+    name: "hof", services: {}, volumes: {}, secrets: {},
     networks: { hof: { labels: resourceOwnershipLabels({ installationId, generation, kind: "network", resource: "hof" }) } },
   };
 
@@ -208,13 +249,15 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
           ...Object.fromEntries(Object.entries(deletionTargets).map(([name, url]) => [`${envName(name)}_DELETION_URL`, url])),
           GLOCKE_ENABLED: String(enabled.has("glocke")),
         };
-        if (enabled.has("glocke")) Object.assign(component.environment, {
-          GLOCKE_BASE_URL: `http://glocke-backend:${APP_PORTS.glocke}`,
-          SCHLUSSEL_TO_GLOCKE_HMAC_KEY_ID: "schlussel-v1",
-          SCHLUSSEL_TO_GLOCKE_HMAC_SECRET: "${SCHLUSSEL_TO_GLOCKE_HMAC_SECRET:?required}",
-          GLOCKE_TO_SCHLUSSEL_HMAC_KEY_ID: "glocke-v1",
-          GLOCKE_TO_SCHLUSSEL_HMAC_SECRET: "${GLOCKE_TO_SCHLUSSEL_HMAC_SECRET:?required}",
-        });
+        if (enabled.has("glocke")) {
+          Object.assign(component.environment, {
+            GLOCKE_BASE_URL: `http://glocke-backend:${APP_PORTS.glocke}`,
+            SCHLUSSEL_TO_GLOCKE_HMAC_KEY_ID: "schlussel-v1",
+            GLOCKE_TO_SCHLUSSEL_HMAC_KEY_ID: "glocke-v1",
+          });
+          wireSecret(compose, component, secretNameFor.get("SCHLUSSEL_TO_GLOCKE_HMAC_SECRET"), "SCHLUSSEL_TO_GLOCKE_HMAC_SECRET");
+          wireSecret(compose, component, secretNameFor.get("GLOCKE_TO_SCHLUSSEL_HMAC_SECRET"), "GLOCKE_TO_SCHLUSSEL_HMAC_SECRET");
+        }
       } else if (artifact === "schlussel-frontend") {
         component.environment = {
           ALLOWED_RETURN_ORIGINS: trustedOrigins.join(","), DEFAULT_APP_URL: origins.schloss,
@@ -234,33 +277,46 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
           MIGRATE_ON_STARTUP: "false",
           ALLOWED_ORIGINS: [origins.schloss, origins.schlussel, origins[id]].filter(Boolean).join(","),
         };
-        if (enabled.has("glocke") && producers.includes(id)) Object.assign(component.environment, {
-          GLOCKE_BASE_URL: `http://glocke-backend:${APP_PORTS.glocke}`,
-          [`${envName(id)}_TO_GLOCKE_HMAC_KEY_ID`]: `${id}-v1`,
-          [`${envName(id)}_TO_GLOCKE_HMAC_SECRET`]: `\${${envName(id)}_TO_GLOCKE_HMAC_SECRET:?required}`,
-        });
+        if (enabled.has("glocke") && producers.includes(id)) {
+          const producerSecretEnvVar = `${envName(id)}_TO_GLOCKE_HMAC_SECRET`;
+          Object.assign(component.environment, {
+            GLOCKE_BASE_URL: `http://glocke-backend:${APP_PORTS.glocke}`,
+            [`${envName(id)}_TO_GLOCKE_HMAC_KEY_ID`]: `${id}-v1`,
+          });
+          wireSecret(compose, component, secretNameFor.get(producerSecretEnvVar), producerSecretEnvVar);
+        }
         if (id === "glocke") {
           component.environment = {
             ...component.environment, ALLOWED_ORIGINS: trustedOrigins.join(","), SCHLUSSEL_INTERNAL_URL: "http://schlussel:4000",
             GLOCKE_PUBLIC_URL: origins.glocke, GLOCKE_EVENT_SOURCES: producers.join(","),
             GLOCKE_TO_SCHLUSSEL_HMAC_KEY_ID: "glocke-v1",
-            GLOCKE_TO_SCHLUSSEL_HMAC_SECRET: "${GLOCKE_TO_SCHLUSSEL_HMAC_SECRET:?required}",
             GLOCKE_BROWSER_PUSH_ENABLED: String(manifest.features?.browserPush?.enabled === true),
           };
-          for (const producer of producers) Object.assign(component.environment, {
-            [`GLOCKE_SOURCE_KEY_ID_${envName(producer)}`]: `${producer}-v1`,
-            [`GLOCKE_SOURCE_SECRET_${envName(producer)}`]: `\${${envName(producer)}_TO_GLOCKE_HMAC_SECRET:?required}`,
-          });
+          wireSecret(compose, component, secretNameFor.get("GLOCKE_TO_SCHLUSSEL_HMAC_SECRET"), "GLOCKE_TO_SCHLUSSEL_HMAC_SECRET");
+          for (const producer of producers) {
+            const sourceSecretEnvVar = `GLOCKE_SOURCE_SECRET_${envName(producer)}`;
+            component.environment[`GLOCKE_SOURCE_KEY_ID_${envName(producer)}`] = `${producer}-v1`;
+            wireSecret(compose, component, secretNameFor.get(`${envName(producer)}_TO_GLOCKE_HMAC_SECRET`), sourceSecretEnvVar);
+          }
           if (enabled.has("kuvert")) component.environment.KUVERT_ORIGIN = origins.kuvert;
           if (enabled.has("tafel")) component.environment.TAFEL_ORIGIN = origins.tafel;
-          if (manifest.features?.browserPush?.enabled) Object.assign(component.environment, {
-            GLOCKE_VAPID_SUBJECT: manifest.features.browserPush.subject,
-            GLOCKE_VAPID_PUBLIC_KEY: "${GLOCKE_VAPID_PUBLIC_KEY:?required}",
-            GLOCKE_VAPID_PRIVATE_KEY: "${GLOCKE_VAPID_PRIVATE_KEY:?required}",
-            GLOCKE_PUSH_ALLOWED_ENDPOINT_HOSTS: "${GLOCKE_PUSH_ALLOWED_ENDPOINT_HOSTS:?required}",
-          });
+          if (manifest.features?.browserPush?.enabled) {
+            Object.assign(component.environment, {
+              GLOCKE_VAPID_SUBJECT: manifest.features.browserPush.subject,
+              // Not itself a secret - a real config value with no safe
+              // default, cross-validated as required in contracts.mjs.
+              GLOCKE_PUSH_ALLOWED_ENDPOINT_HOSTS: manifest.features.browserPush.allowedEndpointHosts.join(","),
+              // The one place a real (non-secret, derived) value ever
+              // flows in from outside this otherwise secret-blind
+              // renderer - see renderTopology()'s own vapidPublicKey
+              // param comment. A bare `hofctl render` preview with no
+              // real secrets store yet keeps the old placeholder.
+              GLOCKE_VAPID_PUBLIC_KEY: vapidPublicKey ?? "${GLOCKE_VAPID_PUBLIC_KEY:?required}",
+            });
+            wireSecret(compose, component, secretNameFor.get("GLOCKE_VAPID_PRIVATE_KEY"), "GLOCKE_VAPID_PRIVATE_KEY");
+          }
         }
-        if (id === "herold") component.environment.HEROLD_CREDENTIAL_ENCRYPTION_KEY = "${HEROLD_CREDENTIAL_ENCRYPTION_KEY:?required}";
+        if (id === "herold") wireSecret(compose, component, secretNameFor.get("HEROLD_CREDENTIAL_ENCRYPTION_KEY"), "HEROLD_CREDENTIAL_ENCRYPTION_KEY");
       } else if (isFrontend) {
         component.environment = {
           SCHLUSSEL_WEB_URL: origins.schlussel, SCHLOSS_URL: origins.schloss,
@@ -296,18 +352,17 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
       environment: {
         PORT: String(APP_PORTS.wachter), SCHLUSSEL_JWKS_URL: "http://schlussel:4000/.well-known/jwks.json",
         JWT_ISSUER: "schlussel", WACHTER_AGENT_URL: "http://wachter-agent:3008",
-        WACHTER_AGENT_TOKEN: "${WACHTER_AGENT_TOKEN:-}", WACHTER_AGENT_TOKEN_FILE: "${WACHTER_AGENT_TOKEN_FILE:-}",
       },
       networks: ["hof", "wachter-internal"],
       depends_on: { "wachter-agent": { condition: "service_healthy" } },
-      volumes: ["${WACHTER_AGENT_TOKEN_FILE:-/dev/null}:${WACHTER_AGENT_TOKEN_FILE:-/dev/null}:ro"],
       labels: { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "wachter", unit: "wachter", artifact: "wachter-backend" }) },
       ...wachterHardening(),
     });
+    wireSecret(compose, compose.services.wachter, secretNameFor.get("WACHTER_AGENT_TOKEN"), "WACHTER_AGENT_TOKEN");
 
     compose.services["wachter-agent"] = {
       ...composeService(image, {
-        PORT: "3008", WACHTER_AGENT_TOKEN: "${WACHTER_AGENT_TOKEN:-}", WACHTER_AGENT_TOKEN_FILE: "${WACHTER_AGENT_TOKEN_FILE:-}",
+        PORT: "3008",
         WACHTER_PROC_DIR: "/host/proc", WACHTER_ROOT_DIR: "/host/rootfs-probe", WACHTER_DOCKER_SOCKET: "/var/run/docker.sock",
       }),
       // The API and its agent share one image (see the catalog's own
@@ -315,15 +370,17 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
       // container runs the API's default CMD instead of the agent.
       command: ["node", "backend/dist/agent.js"],
       networks: ["wachter-internal"],
-      volumes: [
-        "${WACHTER_AGENT_TOKEN_FILE:-/dev/null}:${WACHTER_AGENT_TOKEN_FILE:-/dev/null}:ro",
-        "/proc:/host/proc:ro", "/etc/hostname:/host/rootfs-probe:ro", "/var/run/docker.sock:/var/run/docker.sock",
-      ],
+      volumes: ["/proc:/host/proc:ro", "/etc/hostname:/host/rootfs-probe:ro", "/var/run/docker.sock:/var/run/docker.sock"],
       group_add: ["${DOCKER_GID:-998}"],
       healthcheck: healthcheck(3008, "/health"),
       labels: { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "wachter", unit: "wachter-agent", artifact: "wachter-backend" }) },
       ...wachterHardening(),
     };
+    // The API and its agent both authenticate with the same token - the
+    // exact same secret, wired onto both units (matches WACHTER_AGENT_URL
+    // pointing the API at the agent, and the agent trusting that one
+    // token back).
+    wireSecret(compose, compose.services["wachter-agent"], secretNameFor.get("WACHTER_AGENT_TOKEN"), "WACHTER_AGENT_TOKEN");
     compose.networks["wachter-internal"] = {
       internal: true,
       labels: resourceOwnershipLabels({ installationId, generation, kind: "network", resource: "wachter-internal" }),

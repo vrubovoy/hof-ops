@@ -5,6 +5,7 @@ import process from "node:process";
 import { runPlan } from "./plan-command.mjs";
 import { runPreflight } from "./preflight.mjs";
 import { renderFiles } from "./render-topology.mjs";
+import { runSecretsEnsure } from "./secrets.mjs";
 import { validateDeployment } from "./validate-deployment.mjs";
 
 const BOOLEAN_FLAGS = new Set(["--skip-signature"]);
@@ -15,6 +16,7 @@ function usage(message) {
   console.error("       hofctl validate --services <services.yml> --release-lock <release-lock.json> [--catalog <catalog.yaml>] [--release-selection <file>] [--stable-channel <file>] [--release-lock-signature <file>] [--release-lock-certificate <file>] [--release-lock-identity <identity>] [--release-lock-oidc-issuer <issuer>] [--skip-signature]");
   console.error("       hofctl preflight --services <services.yml> [--catalog <catalog.yaml>] [--target-mode ssh|local] [--known-hosts <file> | --host-key-sha256 <sha>] [--identity-file <path>] [--connect-timeout-seconds <n>] [--min-free-disk-gb <n>] [--min-memory-gb <n>] [--min-cpu-cores <n>]");
   console.error("       hofctl plan --services <services.yml> --release-lock <release-lock.json> --release-lock-identity <identity> (--known-hosts <file> | --host-key-sha256 <sha>) [--catalog <catalog.yaml>] [--identity-file <path>] [--target-mode ssh|local] [--connect-timeout-seconds <n>] [--repair-drift]");
+  console.error("       hofctl secrets ensure --services <services.yml> --store <secrets.sops.yaml> --operator-age-recipient <age1...> --recovery-age-recipient <age1...> [--catalog <catalog.yaml>] [--identity-file <path>]");
   process.exitCode = 2;
 }
 
@@ -241,6 +243,34 @@ if (command === "render") {
         if (/must be a positive integer/.test(error?.message ?? "")) {
           usage(error.message);
         } else {
+          console.error(error instanceof Error ? error.message : String(error));
+          process.exitCode = 1;
+        }
+      }
+    }
+  }
+} else if (command === "secrets") {
+  const [subcommand, ...secretsArgs] = args;
+  if (subcommand !== "ensure") {
+    usage(subcommand ? `unknown secrets subcommand: ${subcommand}` : "a secrets subcommand is required (ensure)");
+  } else {
+    const options = parseFlags(secretsArgs);
+    if (options) {
+      resolvePaths(options, ["services", "catalog", "store", "identityFile"]);
+      if (!options.services || !options.store || !options.operatorAgeRecipient || !options.recoveryAgeRecipient) {
+        usage("secrets ensure requires --services, --store, --operator-age-recipient, and --recovery-age-recipient");
+      } else {
+        try {
+          const { addedNames, totalCount } = await runSecretsEnsure({
+            servicesPath: options.services, catalogPath: options.catalog, storePath: options.store,
+            operatorAgeRecipient: options.operatorAgeRecipient, recoveryAgeRecipient: options.recoveryAgeRecipient,
+            identityFile: options.identityFile,
+          });
+          // Names only, ever - the CLI layer must never be able to
+          // accidentally print a real secret value.
+          for (const name of addedNames) console.log(JSON.stringify({ type: "secrets.added", name }));
+          console.log(JSON.stringify({ type: "secrets.result", added: addedNames.length, total: totalCount }));
+        } catch (error) {
           console.error(error instanceof Error ? error.message : String(error));
           process.exitCode = 1;
         }

@@ -101,6 +101,28 @@ test("the gateway unit's configFingerprint changes when only the Caddyfile conte
   assert.notEqual(before.services.tor.units.gateway.configFingerprint, after.services.tor.units.gateway.configFingerprint);
 });
 
+test("configFingerprint ignores hof.generation/hof.installation-id - bumping a generation alone must never look like a config change", async () => {
+  const contracts = await loadContracts();
+  const generationOne = topologyToServiceState(renderTopology({ ...contracts, installationId: "inst-1", generation: 1 }), contracts.catalog);
+  const generationTwo = topologyToServiceState(renderTopology({ ...contracts, installationId: "inst-1", generation: 2 }), contracts.catalog);
+  const differentInstallation = topologyToServiceState(renderTopology({ ...contracts, installationId: "inst-2", generation: 1 }), contracts.catalog);
+
+  for (const [serviceId, service] of Object.entries(generationOne.services)) {
+    for (const unit of Object.keys(service.units)) {
+      assert.equal(
+        generationOne.services[serviceId].units[unit].configFingerprint,
+        generationTwo.services[serviceId].units[unit].configFingerprint,
+        `${serviceId}/${unit}: generation bump alone must not change configFingerprint`,
+      );
+      assert.equal(
+        generationOne.services[serviceId].units[unit].configFingerprint,
+        differentInstallation.services[serviceId].units[unit].configFingerprint,
+        `${serviceId}/${unit}: installation-id alone must not change configFingerprint`,
+      );
+    }
+  }
+});
+
 test("topologyToServiceState marks a disabled service as present but empty", async () => {
   const contracts = await loadContracts();
   contracts.manifest.services.schrank.enabled = false;

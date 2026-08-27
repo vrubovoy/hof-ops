@@ -7,8 +7,12 @@
 #
 # Pinned to Debian 12 - one of hofctl preflight's own two supported
 # platforms, so `os`/`arch` checks exercise a real match, not a
-# synthetic stand-in.
-FROM debian:12-slim
+# synthetic stand-in. Digest-pinned like every other image this
+# project ever pulls (see hof-ops's own release-lock supply chain) -
+# `docker inspect --format '{{index .RepoDigests 0}}' debian:12-slim`
+# after a fresh pull is how this digest was obtained; bump it by
+# re-running that against a newer pull when Debian 12 is next updated.
+FROM debian:12-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends openssh-server sudo ca-certificates \

@@ -29,11 +29,18 @@ function restartLabels(isFrontend) {
 // supplied by the caller (state.mjs, once that owns generation numbers);
 // a bare `hofctl render` with neither has no real installation yet, so
 // they default to an empty/zero placeholder rather than failing.
-function ownershipLabels({ installationId, generation, service, artifact }) {
+// unit is the actual Compose service key - always unique within one
+// Compose file by construction, unlike artifact: Wachter's API and its
+// agent are two units (wachter, wachter-agent) sharing one catalog
+// artifact (wachter-backend), so hof.artifact alone can't tell them
+// apart (a Docker inspector keying on it would collapse the agent into
+// the API, or the reverse, since it's the same value for both).
+function ownershipLabels({ installationId, generation, service, unit, artifact }) {
   return {
     "hof.managed": "true",
     "hof.installation-id": installationId ?? "",
     "hof.service": service,
+    "hof.unit": unit,
     "hof.artifact": artifact,
     "hof.generation": String(generation ?? 0),
   };
@@ -135,7 +142,7 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
   const compose = { name: "hof", services: {}, volumes: {}, networks: { hof: {} } };
 
   compose.services.gateway = composeService(releaseLock.components.gateway.image, { DOMAIN: manifest.domains.base });
-  compose.services.gateway.labels = { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "tor", artifact: "gateway" }) };
+  compose.services.gateway.labels = { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "tor", unit: "gateway", artifact: "gateway" }) };
   compose.services.gateway.ports = ["80:80", "443:443"];
   compose.services.gateway.volumes = ["./Caddyfile:/etc/caddy/Caddyfile:ro", "caddy-data:/data"];
   if (manifest.tls.mode === "supplied") {
@@ -247,7 +254,7 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
       // Schloss shares the port-80/no-healthcheck-path shape of a
       // frontend artifact below, but per the platform's own restart
       // convention it is NOT restartable - it's the entry point itself.
-      component.labels = { ...restartLabels(isFrontend), ...ownershipLabels({ installationId, generation, service: id, artifact }) };
+      component.labels = { ...restartLabels(isFrontend), ...ownershipLabels({ installationId, generation, service: id, unit: artifact, artifact }) };
       if (artifact === service.health.component) component.healthcheck = healthcheck(port, service.health.path);
       else if (isFrontend || artifact === "schloss") component.healthcheck = healthcheck(80, "/");
       const dependencies = healthyDependencies(service, catalogById);
@@ -276,7 +283,7 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
       networks: ["hof", "wachter-internal"],
       depends_on: { "wachter-agent": { condition: "service_healthy" } },
       volumes: ["${WACHTER_AGENT_TOKEN_FILE:-/dev/null}:${WACHTER_AGENT_TOKEN_FILE:-/dev/null}:ro"],
-      labels: { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "wachter", artifact: "wachter-backend" }) },
+      labels: { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "wachter", unit: "wachter", artifact: "wachter-backend" }) },
       ...wachterHardening(),
     });
 
@@ -296,7 +303,7 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
       ],
       group_add: ["${DOCKER_GID:-998}"],
       healthcheck: healthcheck(3008, "/health"),
-      labels: { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "wachter", artifact: "wachter-backend" }) },
+      labels: { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "wachter", unit: "wachter-agent", artifact: "wachter-backend" }) },
       ...wachterHardening(),
     };
     compose.networks["wachter-internal"] = { internal: true };

@@ -12,6 +12,7 @@ import { renderTopology } from "../scripts/render-topology.mjs";
 import { emptyBaseline, loadState, resolveBaseline, topologyToServiceState } from "../scripts/state.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
+const available = { status: "available", resources: [] };
 
 test("a real current.json record satisfies schemas/state-v1.schema.json", async () => {
   const ajv = new Ajv2020({ allErrors: true, strict: true });
@@ -37,24 +38,69 @@ test("a real current.json record satisfies schemas/state-v1.schema.json", async 
 });
 
 test("emptyBaseline is the synthetic bootstrap baseline", () => {
-  assert.deepEqual(emptyBaseline(), { mode: "bootstrap", generation: 0, release: null, services: {}, volumes: [] });
+  assert.deepEqual(emptyBaseline(), {
+    mode: "bootstrap", generation: 0, release: null,
+    manifestDigest: null, releaseLockDigest: null, topologyDigest: null,
+    services: {}, volumes: [],
+  });
 });
 
-test("topologyToServiceState reads Hof's own ownership labels, not artifact-name guessing", async () => {
+test("topologyToServiceState reads Hof's own ownership labels, keyed by unit, not by artifact", async () => {
   const contracts = await loadContracts();
   const rendered = renderTopology(contracts);
-  const state = topologyToServiceState(rendered, contracts.catalog);
+  const state = topologyToServiceState(rendered, contracts.catalog, { manifest: contracts.manifest, releaseLock: contracts.releaseLock });
 
   assert.equal(state.release, rendered.topology.release);
+  assert.match(state.manifestDigest, /^sha256:[0-9a-f]{64}$/);
+  assert.match(state.releaseLockDigest, /^sha256:[0-9a-f]{64}$/);
+  assert.match(state.topologyDigest, /^sha256:[0-9a-f]{64}$/);
   assert.equal(state.services.kuvert.enabled, true);
-  assert.equal(state.services.kuvert.artifacts["kuvert-backend"].image, rendered.compose.services["kuvert-backend"].image);
+  assert.equal(state.services.kuvert.units["kuvert-backend"].image, rendered.compose.services["kuvert-backend"].image);
+  assert.equal(state.services.kuvert.units["kuvert-backend"].artifact, "kuvert-backend");
   // Wächter's two containers (wachter, wachter-agent) share one catalog
-  // artifact (wachter-backend) - both must resolve to the same service.
+  // artifact (wachter-backend) but must be two distinct units, or the
+  // agent silently disappears from state entirely.
   assert.equal(state.services.wachter.enabled, true);
-  assert.deepEqual(Object.keys(state.services.wachter.artifacts), ["wachter-backend"]);
+  assert.deepEqual(Object.keys(state.services.wachter.units).sort(), ["wachter", "wachter-agent"]);
+  assert.equal(state.services.wachter.units.wachter.artifact, "wachter-backend");
+  assert.equal(state.services.wachter.units["wachter-agent"].artifact, "wachter-backend");
   // Persistent services carry a schemaVersion, others don't have the key at all.
   assert.equal(typeof state.services.kuvert.schemaVersion, "number");
   assert.equal("schemaVersion" in state.services.schloss, false);
+});
+
+test("topologyToServiceState's manifest/releaseLock digests are optional - null when not supplied", async () => {
+  const contracts = await loadContracts();
+  const rendered = renderTopology(contracts);
+  const state = topologyToServiceState(rendered, contracts.catalog);
+  assert.equal(state.manifestDigest, null);
+  assert.equal(state.releaseLockDigest, null);
+  assert.match(state.topologyDigest, /^sha256:[0-9a-f]{64}$/);
+});
+
+test("a unit's configFingerprint changes when its rendered environment changes, even with the same image", async () => {
+  const contracts = await loadContracts();
+  const before = topologyToServiceState(renderTopology(contracts), contracts.catalog);
+
+  const changed = structuredClone(contracts);
+  changed.manifest.domains.base = "changed.example.com";
+  const after = topologyToServiceState(renderTopology(changed), changed.catalog);
+
+  assert.equal(before.services.kuvert.units["kuvert-backend"].image, after.services.kuvert.units["kuvert-backend"].image);
+  assert.notEqual(before.services.kuvert.units["kuvert-backend"].configFingerprint, after.services.kuvert.units["kuvert-backend"].configFingerprint);
+  assert.notEqual(before.topologyDigest, after.topologyDigest);
+});
+
+test("the gateway unit's configFingerprint changes when only the Caddyfile content changes", async () => {
+  const contracts = await loadContracts();
+  const before = topologyToServiceState(renderTopology(contracts), contracts.catalog);
+
+  const changed = structuredClone(contracts);
+  changed.manifest.tls.email = "changed@example.com";
+  const after = topologyToServiceState(renderTopology(changed), changed.catalog);
+
+  assert.equal(before.services.tor.units.gateway.image, after.services.tor.units.gateway.image);
+  assert.notEqual(before.services.tor.units.gateway.configFingerprint, after.services.tor.units.gateway.configFingerprint);
 });
 
 test("topologyToServiceState marks a disabled service as present but empty", async () => {
@@ -62,7 +108,7 @@ test("topologyToServiceState marks a disabled service as present but empty", asy
   contracts.manifest.services.schrank.enabled = false;
   const rendered = renderTopology(contracts);
   const state = topologyToServiceState(rendered, contracts.catalog);
-  assert.deepEqual(state.services.schrank, { enabled: false, artifacts: {}, schemaVersion: null });
+  assert.deepEqual(state.services.schrank, { enabled: false, units: {}, schemaVersion: null });
 });
 
 test("loadState returns null when there is no state directory at all", async () => {
@@ -76,32 +122,70 @@ test("loadState throws when current.json exists but topology.json is missing (co
   await assert.rejects(() => loadState(directory), /topology\.json is missing/);
 });
 
-test("resolveBaseline: clean host with no state and no Docker resources bootstraps", async () => {
+test("resolveBaseline requires an explicit observation - never defaults to 'nothing is running'", async () => {
   const contracts = await loadContracts();
   const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
-  const baseline = await resolveBaseline({ statePath: directory, catalog: contracts.catalog, hasManagedResources: false });
+  await assert.rejects(() => resolveBaseline({ statePath: directory, catalog: contracts.catalog }), /requires an explicit observation/);
+});
+
+test("resolveBaseline: clean host with no state and available, empty observation bootstraps", async () => {
+  const contracts = await loadContracts();
+  const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
+  const baseline = await resolveBaseline({ statePath: directory, catalog: contracts.catalog, observation: available });
   assert.deepEqual(baseline, emptyBaseline());
+});
+
+test("resolveBaseline: fails closed when state is missing but the inspector couldn't reach the host at all", async () => {
+  const contracts = await loadContracts();
+  const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
+  await assert.rejects(
+    () => resolveBaseline({ statePath: directory, catalog: contracts.catalog, observation: { status: "unavailable", resources: [] } }),
+    /observation is unavailable, refusing to assume a clean bootstrap/,
+  );
 });
 
 test("resolveBaseline: fails closed when state is missing but Docker already has managed resources", async () => {
   const contracts = await loadContracts();
   const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
+  const observation = { status: "available", resources: [{ service: "kuvert", unit: "kuvert-backend", managed: true, image: "x", state: "running" }] };
   await assert.rejects(
-    () => resolveBaseline({ statePath: directory, catalog: contracts.catalog, hasManagedResources: true }),
+    () => resolveBaseline({ statePath: directory, catalog: contracts.catalog, observation }),
     /managed resources exist but the authoritative state is missing/,
   );
 });
 
-test("resolveBaseline: loads a real saved generation and shapes it through topologyToServiceState", async () => {
+test("resolveBaseline: loads a real saved generation and carries through its recorded digests", async () => {
   const contracts = await loadContracts();
   const rendered = renderTopology(contracts);
   const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
   await mkdir(directory, { recursive: true });
-  await writeFile(path.join(directory, "current.json"), JSON.stringify({ generation: 3, release: rendered.topology.release }));
+  const expected = topologyToServiceState(rendered, contracts.catalog);
+  await writeFile(path.join(directory, "current.json"), JSON.stringify({
+    generation: 3, release: rendered.topology.release,
+    manifestDigest: "sha256:" + "a".repeat(64), releaseLockDigest: "sha256:" + "b".repeat(64),
+    topologyDigest: expected.topologyDigest,
+  }));
   await writeFile(path.join(directory, "topology.json"), JSON.stringify(rendered));
 
-  const baseline = await resolveBaseline({ statePath: directory, catalog: contracts.catalog, hasManagedResources: false });
+  const baseline = await resolveBaseline({ statePath: directory, catalog: contracts.catalog, observation: available });
   assert.equal(baseline.mode, "applied");
   assert.equal(baseline.generation, 3);
-  assert.deepEqual(baseline.services, topologyToServiceState(rendered, contracts.catalog).services);
+  assert.equal(baseline.manifestDigest, "sha256:" + "a".repeat(64));
+  assert.equal(baseline.releaseLockDigest, "sha256:" + "b".repeat(64));
+  assert.equal(baseline.topologyDigest, expected.topologyDigest);
+  assert.deepEqual(baseline.services, expected.services);
+});
+
+test("resolveBaseline: refuses a state directory whose recorded topologyDigest doesn't match its own saved topology.json", async () => {
+  const contracts = await loadContracts();
+  const rendered = renderTopology(contracts);
+  const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
+  await mkdir(directory, { recursive: true });
+  await writeFile(path.join(directory, "current.json"), JSON.stringify({ generation: 1, topologyDigest: "sha256:" + "0".repeat(64) }));
+  await writeFile(path.join(directory, "topology.json"), JSON.stringify(rendered));
+
+  await assert.rejects(
+    () => resolveBaseline({ statePath: directory, catalog: contracts.catalog, observation: available }),
+    /does not match a fresh digest of the saved topology\.json/,
+  );
 });

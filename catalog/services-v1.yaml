@@ -52,11 +52,6 @@ services:
     health:
       component: kuvert-backend
       path: /health
-    # Kuvert's own runtime doesn't yet gate its startup migration behind
-    # MIGRATE_ON_STARTUP (unlike Tafel's five newer siblings below) - it
-    # always self-migrates on start regardless of this operation running.
-    # Harmless (migrations are idempotent), but a real, still-open gap -
-    # see PLATFORM-OPS-PLAN.md's hofctl plan design note.
     database:
       component: kuvert-backend
       command: [node, backend/dist/migrate.js]
@@ -70,8 +65,6 @@ services:
     health:
       component: tafel-backend
       path: /health
-    # Same open gap as Kuvert above - always self-migrates on start,
-    # this operation isn't yet the only trigger.
     database:
       component: tafel-backend
       command: [node, backend/dist/migrate.js]

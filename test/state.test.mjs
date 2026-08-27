@@ -1,6 +1,4 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -9,7 +7,7 @@ import addFormats from "ajv-formats";
 
 import { loadContracts } from "../scripts/contracts.mjs";
 import { renderTopology } from "../scripts/render-topology.mjs";
-import { emptyBaseline, loadState, resolveBaseline, topologyToServiceState } from "../scripts/state.mjs";
+import { emptyBaseline, resolveBaseline, topologyToServiceState } from "../scripts/state.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 const available = { status: "available", resources: [] };
@@ -111,45 +109,39 @@ test("topologyToServiceState marks a disabled service as present but empty", asy
   assert.deepEqual(state.services.schrank, { enabled: false, units: {}, schemaVersion: null });
 });
 
-test("loadState returns null when there is no state directory at all", async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
-  assert.equal(await loadState(directory), null);
-});
-
-test("loadState throws when current.json exists but topology.json is missing (corrupt state)", async () => {
-  const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
-  await writeFile(path.join(directory, "current.json"), JSON.stringify({ generation: 1 }));
-  await assert.rejects(() => loadState(directory), /topology\.json is missing/);
+test("resolveBaseline throws when current.json is present but topology.json is missing (corrupt state)", async () => {
+  const contracts = await loadContracts();
+  const managedState = { current: { generation: 1 }, topology: null };
+  assert.throws(
+    () => resolveBaseline({ managedState, catalog: contracts.catalog, observation: available }),
+    /current\.json but no topology\.json/,
+  );
 });
 
 test("resolveBaseline requires an explicit observation - never defaults to 'nothing is running'", async () => {
   const contracts = await loadContracts();
-  const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
-  await assert.rejects(() => resolveBaseline({ statePath: directory, catalog: contracts.catalog }), /requires an explicit observation/);
+  assert.throws(() => resolveBaseline({ managedState: null, catalog: contracts.catalog }), /requires an explicit observation/);
 });
 
 test("resolveBaseline: clean host with no state and available, empty observation bootstraps", async () => {
   const contracts = await loadContracts();
-  const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
-  const baseline = await resolveBaseline({ statePath: directory, catalog: contracts.catalog, observation: available });
+  const baseline = resolveBaseline({ managedState: null, catalog: contracts.catalog, observation: available });
   assert.deepEqual(baseline, emptyBaseline());
 });
 
 test("resolveBaseline: fails closed when state is missing but the inspector couldn't reach the host at all", async () => {
   const contracts = await loadContracts();
-  const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
-  await assert.rejects(
-    () => resolveBaseline({ statePath: directory, catalog: contracts.catalog, observation: { status: "unavailable", resources: [] } }),
+  assert.throws(
+    () => resolveBaseline({ managedState: null, catalog: contracts.catalog, observation: { status: "unavailable", resources: [] } }),
     /observation is unavailable, refusing to assume a clean bootstrap/,
   );
 });
 
 test("resolveBaseline: fails closed when state is missing but Docker already has managed resources", async () => {
   const contracts = await loadContracts();
-  const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
   const observation = { status: "available", resources: [{ service: "kuvert", unit: "kuvert-backend", managed: true, image: "x", state: "running" }] };
-  await assert.rejects(
-    () => resolveBaseline({ statePath: directory, catalog: contracts.catalog, observation }),
+  assert.throws(
+    () => resolveBaseline({ managedState: null, catalog: contracts.catalog, observation }),
     /managed resources exist but the authoritative state is missing/,
   );
 });
@@ -157,17 +149,17 @@ test("resolveBaseline: fails closed when state is missing but Docker already has
 test("resolveBaseline: loads a real saved generation and carries through its recorded digests", async () => {
   const contracts = await loadContracts();
   const rendered = renderTopology(contracts);
-  const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
-  await mkdir(directory, { recursive: true });
   const expected = topologyToServiceState(rendered, contracts.catalog);
-  await writeFile(path.join(directory, "current.json"), JSON.stringify({
-    generation: 3, release: rendered.topology.release,
-    manifestDigest: "sha256:" + "a".repeat(64), releaseLockDigest: "sha256:" + "b".repeat(64),
-    topologyDigest: expected.topologyDigest,
-  }));
-  await writeFile(path.join(directory, "topology.json"), JSON.stringify(rendered));
+  const managedState = {
+    current: {
+      generation: 3, release: rendered.topology.release,
+      manifestDigest: "sha256:" + "a".repeat(64), releaseLockDigest: "sha256:" + "b".repeat(64),
+      topologyDigest: expected.topologyDigest,
+    },
+    topology: rendered,
+  };
 
-  const baseline = await resolveBaseline({ statePath: directory, catalog: contracts.catalog, observation: available });
+  const baseline = resolveBaseline({ managedState, catalog: contracts.catalog, observation: available });
   assert.equal(baseline.mode, "applied");
   assert.equal(baseline.generation, 3);
   assert.equal(baseline.manifestDigest, "sha256:" + "a".repeat(64));
@@ -176,16 +168,13 @@ test("resolveBaseline: loads a real saved generation and carries through its rec
   assert.deepEqual(baseline.services, expected.services);
 });
 
-test("resolveBaseline: refuses a state directory whose recorded topologyDigest doesn't match its own saved topology.json", async () => {
+test("resolveBaseline: refuses managed state whose recorded topologyDigest doesn't match its own saved topology.json", async () => {
   const contracts = await loadContracts();
   const rendered = renderTopology(contracts);
-  const directory = await mkdtemp(path.join(tmpdir(), "hof-state-"));
-  await mkdir(directory, { recursive: true });
-  await writeFile(path.join(directory, "current.json"), JSON.stringify({ generation: 1, topologyDigest: "sha256:" + "0".repeat(64) }));
-  await writeFile(path.join(directory, "topology.json"), JSON.stringify(rendered));
+  const managedState = { current: { generation: 1, topologyDigest: "sha256:" + "0".repeat(64) }, topology: rendered };
 
-  await assert.rejects(
-    () => resolveBaseline({ statePath: directory, catalog: contracts.catalog, observation: available }),
-    /does not match a fresh digest of the saved topology\.json/,
+  assert.throws(
+    () => resolveBaseline({ managedState, catalog: contracts.catalog, observation: available }),
+    /does not match a fresh digest of its own saved topology\.json/,
   );
 });

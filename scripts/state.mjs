@@ -1,11 +1,13 @@
-// hofctl plan's baseline: the last-applied deployment state, read from
-// /var/lib/hof/state - and the bootstrap/fail-closed rules for when it's
-// missing (see PLATFORM-OPS-PLAN.md's hofctl plan design). hofctl apply
-// (out of scope for delivery item 7) is the only thing that ever writes
-// these files; this module only reads them.
-
-import { readFile } from "node:fs/promises";
-import path from "node:path";
+// hofctl plan's baseline: the last-applied deployment state, and the
+// bootstrap/fail-closed rules for when it's missing (see
+// PLATFORM-OPS-PLAN.md's hofctl plan design). Pure - takes managedState
+// as already-parsed JSON (read target-side by target-probe.sh, as part
+// of the same atomic snapshot TargetInspector collects everything else
+// from) rather than touching a filesystem itself. There is no local
+// file-reading helper here at all, even for --target-mode local -
+// target-probe.sh reads /var/lib/hof/state/{current,topology}.json the
+// same way over both transports, so this module never needs to know
+// where the JSON came from.
 
 import { sha256 } from "./digest.mjs";
 
@@ -77,67 +79,52 @@ export function topologyToServiceState(rendered, catalog, { manifest, releaseLoc
   };
 }
 
-async function readJsonIfExists(filePath) {
-  try {
-    return JSON.parse(await readFile(filePath, "utf8"));
-  } catch (error) {
-    if (error.code === "ENOENT") return null;
-    throw new Error(`could not read ${filePath}: ${error.message}`);
-  }
-}
-
-// Loads the real on-disk baseline, or null if this host has never had a
-// successful apply. Distinct from resolveBaseline() below: this function
-// alone can't decide whether a missing state directory is fine
-// (genuinely never applied) or a fail-closed adoption refusal (Docker
-// already has managed resources) - it only knows what's on disk.
-export async function loadState(statePath) {
-  const current = await readJsonIfExists(path.join(statePath, "current.json"));
-  if (!current) return null;
-  const topology = await readJsonIfExists(path.join(statePath, "topology.json"));
-  if (!topology) {
-    throw new Error(`${statePath}/current.json exists but topology.json is missing - state directory is corrupt, cannot compute a baseline`);
-  }
-  return { current, topology };
-}
-
 // The single decision point PLATFORM-OPS-PLAN.md describes: state
 // present -> use it; state absent and observation confirms Docker
 // already holds resources labeled for this installation -> refuse
 // (hofctl adopt is the only sanctioned recovery, not implemented here);
 // state absent and observation confirms Docker is clean -> the
-// synthetic bootstrap baseline. observation must be explicit
-// ({status, resources}) - there is no default, because "the inspector
-// didn't run" and "the inspector confirmed nothing is there" are two
-// different facts and must never be conflated into the same silent
-// assumption. catalog is needed only to shape topology.json back into
-// the {services, volumes} baseline via topologyToServiceState.
-export async function resolveBaseline({ statePath, catalog, observation }) {
+// synthetic bootstrap baseline.
+//
+// managedState is TargetInspector's own snapshot.managedState
+// ({current, topology}, either already-parsed JSON or null) - current
+// present with topology null is corrupt state, not "never applied".
+// observation must be explicit ({status, resources}) - there is no
+// default, because "the inspector didn't run" and "the inspector
+// confirmed nothing is there" are two different facts and must never be
+// conflated into the same silent assumption. catalog is needed only to
+// shape topology.json back into the {services, volumes} baseline via
+// topologyToServiceState.
+export function resolveBaseline({ managedState, catalog, observation }) {
   if (!observation || typeof observation.status !== "string" || !Array.isArray(observation.resources)) {
     throw new Error("resolveBaseline requires an explicit observation ({status, resources}) - it must never default to 'nothing is running'");
   }
 
-  const state = await loadState(statePath);
-  if (state) {
-    const serviceState = topologyToServiceState(state.topology, catalog);
+  const current = managedState?.current ?? null;
+  const topology = managedState?.topology ?? null;
+  if (current) {
+    if (!topology) {
+      throw new Error("managed state has current.json but no topology.json - state directory is corrupt, cannot compute a baseline");
+    }
+    const serviceState = topologyToServiceState(topology, catalog);
     // current.json's own recorded topologyDigest should always match a
     // fresh recompute from the topology.json saved alongside it - if it
     // doesn't, the state directory was corrupted or hand-edited after
     // the fact, and this baseline can't be trusted.
-    if (state.current.topologyDigest && state.current.topologyDigest !== serviceState.topologyDigest) {
+    if (current.topologyDigest && current.topologyDigest !== serviceState.topologyDigest) {
       throw new Error(
-        `${statePath}/current.json's topologyDigest does not match a fresh digest of the saved topology.json - ` +
+        "managed state's recorded topologyDigest does not match a fresh digest of its own saved topology.json - " +
         "state directory is corrupt or was hand-edited, cannot compute a baseline",
       );
     }
     return {
       mode: "applied",
-      generation: state.current.generation,
+      generation: current.generation,
       // manifestDigest/releaseLockDigest can't be recomputed from a saved
       // topology.json alone (the original files aren't kept) - trusted
       // from current.json's own record, exactly as apply wrote them.
-      manifestDigest: state.current.manifestDigest ?? null,
-      releaseLockDigest: state.current.releaseLockDigest ?? null,
+      manifestDigest: current.manifestDigest ?? null,
+      releaseLockDigest: current.releaseLockDigest ?? null,
       topologyDigest: serviceState.topologyDigest,
       release: serviceState.release,
       services: serviceState.services,

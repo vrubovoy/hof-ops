@@ -12,7 +12,7 @@ function usage(message) {
   if (message) console.error(message);
   console.error("usage: hofctl render --services <services.yml> --release-lock <release-lock.json> --catalog <catalog.yaml> --out <directory>");
   console.error("       hofctl validate --services <services.yml> --release-lock <release-lock.json> [--catalog <catalog.yaml>] [--release-selection <file>] [--stable-channel <file>] [--release-lock-signature <file>] [--release-lock-certificate <file>] [--release-lock-identity <identity>] [--release-lock-oidc-issuer <issuer>] [--skip-signature]");
-  console.error("       hofctl preflight --services <services.yml> [--catalog <catalog.yaml>] [--disk-path <path>] [--min-free-disk-gb <n>] [--min-memory-gb <n>] [--min-cpu-cores <n>]");
+  console.error("       hofctl preflight --services <services.yml> [--catalog <catalog.yaml>] [--target-mode ssh|local] [--known-hosts <file> | --host-key-sha256 <sha>] [--identity-file <path>] [--connect-timeout-seconds <n>] [--min-free-disk-gb <n>] [--min-memory-gb <n>] [--min-cpu-cores <n>]");
   process.exitCode = 2;
 }
 
@@ -93,14 +93,25 @@ if (command === "render") {
 } else if (command === "preflight") {
   const options = parseFlags(args);
   if (options) {
-    resolvePaths(options, ["services", "catalog", "diskPath"]);
+    resolvePaths(options, ["services", "catalog", "knownHosts", "identityFile"]);
+    const targetMode = options.targetMode ?? "ssh";
     if (!options.services) {
       usage("preflight requires --services");
+    } else if (!["ssh", "local"].includes(targetMode)) {
+      usage("--target-mode must be ssh or local");
+    } else if (targetMode === "ssh" && Boolean(options.knownHosts) === Boolean(options.hostKeySha256)) {
+      usage("ssh mode requires exactly one of --known-hosts or --host-key-sha256");
+    } else if (targetMode === "local" && (options.knownHosts || options.hostKeySha256 || options.identityFile)) {
+      usage("--target-mode local does not accept --known-hosts/--host-key-sha256/--identity-file");
     } else {
       const preflightOptions = {
         manifestPath: options.services,
         catalogPath: options.catalog,
-        diskPath: options.diskPath,
+        targetMode,
+        knownHostsFile: options.knownHosts,
+        hostKeySha256: options.hostKeySha256,
+        identityFile: options.identityFile,
+        connectTimeoutSeconds: options.connectTimeoutSeconds ? Number(options.connectTimeoutSeconds) : undefined,
       };
       if (options.minFreeDiskGb) preflightOptions.minFreeDiskBytes = Number(options.minFreeDiskGb) * 1024 ** 3;
       if (options.minMemoryGb) preflightOptions.minTotalMemoryBytes = Number(options.minMemoryGb) * 1024 ** 3;

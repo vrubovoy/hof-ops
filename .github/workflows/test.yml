@@ -24,3 +24,5 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm validate
       - run: pnpm test
+      - name: Real SSH transport acceptance (ephemeral pinned Debian 12 sshd container)
+        run: pnpm test:ssh

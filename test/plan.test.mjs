@@ -514,6 +514,21 @@ test("observation unavailable: only the containers listing failing is still enou
   assert.ok(plan.blockers.some((blocker) => blocker.includes("observation unavailable")));
 });
 
+// Docker vanishing from an already-applied installation is real
+// corruption or tampering, never a legitimate "fresh host" - "absent"
+// only ever means "safe to bootstrap" for a baseline that had nothing
+// running in the first place (see ADR 0004 and state.test.mjs's own
+// bootstrap-eligibility coverage).
+test("observation absent (Docker genuinely uninstalled): blocks an applied host exactly like unavailable does, never treated as a clean slate", async () => {
+  const { contracts, rendered } = await fixture();
+  const baseline = baselineFrom(rendered, contracts.catalog, 1);
+  const observation = { ...observedMatching(baseline), containersStatus: "absent", resources: [] };
+  const plan = buildDesired({ baseline, rendered, contracts, observation });
+
+  assert.equal(plan.executable, false);
+  assert.ok(plan.blockers.some((blocker) => blocker.includes("observation unavailable")));
+});
+
 test("buildPlan requires an explicit observation - never defaults to 'nothing is running'", async () => {
   const { contracts, rendered } = await fixture();
   assert.throws(

@@ -1,0 +1,282 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/plan-v2.schema.json",
+  "title": "Hof deployment plan (v2, target-bound)",
+  "description": "hofctl plan's v2 output contract - everything plan-v1 already has (baseline/desired/drift/summary/operations/warnings/blockers, unchanged in shape) plus exact target binding, planning policy, image verification policy per image.verify operation, and the bootstrap-only recovery/suppliedTls fields delivery item 8's apply needs. plan-v1 stays the historical, unchanged contract - this is an addition, not a breaking replacement. See ADR 0004.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "planId", "mode", "executable", "target", "policy", "baseline", "desired", "drift", "summary", "operations", "warnings", "blockers"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/plan/v2" },
+    "planId": {
+      "description": "sha256 of the plan's own inputs+baseline+target binding, deterministic - never includes a timestamp. Unlike plan-v1, this also covers `target` (host, port, user, the exact accepted host-key fingerprint) and `policy`/`recovery`/`suppliedTls` - a host-key change, a different baseline generation, or a different recovery recipient all produce a different planId, exactly as ADR 0004 requires (\"a host-key change invalidates the plan\").",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "mode": { "enum": ["bootstrap", "applied"] },
+    "executable": {
+      "description": "false when blockers is non-empty - apply must refuse a plan that isn't executable.",
+      "type": "boolean"
+    },
+    "target": {
+      "description": "Exactly which target this plan was computed against - apply's own stale-plan recheck re-derives this under the lock and refuses to proceed if it no longer matches.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "host", "port", "user", "hostKeySha256", "installationId", "baselineGeneration"],
+      "properties": {
+        "mode": { "enum": ["ssh", "local"] },
+        "host": { "type": ["string", "null"] },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "user": { "type": ["string", "null"] },
+        "hostKeySha256": {
+          "description": "The exact accepted SSH host-key fingerprint from the same connection this plan's own inspection used - never the caller-supplied trust anchor alone, and never a value inspectTarget() merely hoped was accepted. Required (non-null) in ssh mode; always null in local mode (there is no SSH transport to fingerprint).",
+          "type": ["string", "null"],
+          "pattern": "^SHA256:[A-Za-z0-9+/]+=*$"
+        },
+        "installationId": {
+          "description": "bootstrap: a fixed, deterministic placeholder (never a real installation id - see plan-command.mjs's BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER). applied: the real installation id this baseline was resolved from.",
+          "type": ["string", "null"]
+        },
+        "baselineGeneration": {
+          "description": "The baseline's own generation this plan was diffed from (0 for a synthetic bootstrap baseline) - apply's stale-plan recheck compares this against a fresh baseline read under the lock.",
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "ssh" } } },
+          "then": { "properties": { "hostKeySha256": { "type": "string" } } },
+          "else": { "properties": { "hostKeySha256": { "const": null } } }
+        }
+      ]
+    },
+    "policy": {
+      "description": "The planning-time choices this specific plan was computed with - apply must never silently apply a different policy than the one the operator actually approved.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repairDrift"],
+      "properties": {
+        "repairDrift": { "type": "boolean" }
+      }
+    },
+    "recovery": {
+      "description": "Required for a bootstrap plan (never for applied) - the external age recipient secrets.sops.yaml is encrypted to in addition to the target's own operator key, so a lost target host doesn't also mean permanently lost secrets. Never itself a secret - a public age recipient is safe to record in a plan.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ageRecipient"],
+      "properties": {
+        "ageRecipient": { "type": "string", "pattern": "^age1[a-z0-9]{20,}$" }
+      }
+    },
+    "suppliedTls": {
+      "description": "Present only when the manifest's tls.mode is \"supplied\" - the sha256 of the certificate file as read from the operator's own workstation at planning time (never the certificate or key content itself, and never the private key's digest either - only enough to let apply detect the file changing between planning and execution).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "certificateFingerprint"],
+      "properties": {
+        "mode": { "const": "supplied" },
+        "certificateFingerprint": { "$ref": "#/$defs/digestOrNull" }
+      }
+    },
+    "baseline": { "$ref": "#/$defs/baselineState" },
+    "desired": { "$ref": "#/$defs/desiredState" },
+    "drift": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/driftEntry" }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "update", "remove", "migrate"],
+      "properties": {
+        "create": { "type": "integer", "minimum": 0 },
+        "update": { "type": "integer", "minimum": 0 },
+        "remove": { "type": "integer", "minimum": 0 },
+        "migrate": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "operations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/operation" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "mode": { "const": "bootstrap" } } },
+      "then": { "required": ["recovery"] },
+      "else": { "not": { "required": ["recovery"] } }
+    }
+  ],
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
+    "operationId": {
+      "description": "A three-digit sequence prefix (this plan's own execution order) plus a descriptive suffix - unlike volume/service identifiers, operation ids legitimately start with a digit.",
+      "type": "string",
+      "pattern": "^[0-9]{3}\\.[a-z][a-z0-9.-]{0,80}$"
+    },
+    "digestOrNull": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
+    "services": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["enabled", "units"],
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "units": {
+            "description": "Keyed by hof.unit (the actual Compose service key), not by catalog artifact - Wachter's API and its agent share one artifact but are two units, and collapsing them loses one entirely.",
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["artifact", "image", "configFingerprint"],
+              "properties": {
+                "artifact": { "$ref": "#/$defs/identifier" },
+                "image": { "type": ["string", "null"] },
+                "configFingerprint": {
+                  "description": "sha256 of this unit's own full rendered Compose service definition (image, environment, labels, volumes, ...) - catches a domain/CORS/browserPush/TLS-driven env change even when the image itself didn't change.",
+                  "$ref": "#/$defs/digestOrNull"
+                }
+              }
+            }
+          },
+          "schemaVersion": {
+            "description": "Present only for a service with a catalog database entry - the release lock's declared schema version for its database component (from/to, see the catalog schema).",
+            "type": ["integer", "null"]
+          }
+        }
+      }
+    },
+    "volumes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/identifier" }
+    },
+    "generatedArtifacts": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/digestOrNull" }
+    },
+    "baselineState": {
+      "description": "The last-applied state this plan is diffing from - either loaded from /var/lib/hof/state, or the synthetic empty baseline (mode: bootstrap, generation: 0, installationId: null) on a truly clean host.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "generation", "installationId", "release", "manifestDigest", "releaseLockDigest", "topologyDigest", "services", "volumes", "networks", "generatedArtifacts"],
+      "properties": {
+        "mode": { "enum": ["bootstrap", "applied"] },
+        "generation": { "type": "integer", "minimum": 0 },
+        "installationId": { "type": ["string", "null"] },
+        "release": { "type": ["string", "null"], "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "manifestDigest": { "$ref": "#/$defs/digestOrNull" },
+        "releaseLockDigest": { "$ref": "#/$defs/digestOrNull" },
+        "topologyDigest": {
+          "description": "sha256 over the rendered topology, backup config, and Caddyfile together - the one field that catches a change (like a backup schedule edit) with no per-unit Compose footprint at all.",
+          "$ref": "#/$defs/digestOrNull"
+        },
+        "services": { "$ref": "#/$defs/services" },
+        "volumes": { "$ref": "#/$defs/volumes" },
+        "networks": { "$ref": "#/$defs/volumes" },
+        "generatedArtifacts": { "$ref": "#/$defs/generatedArtifacts" }
+      }
+    },
+    "desiredState": {
+      "description": "What services.yml + the catalog + the release lock render to right now - a plain snapshot, not itself a generation.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release", "manifestDigest", "releaseLockDigest", "topologyDigest", "services", "volumes", "networks"],
+      "properties": {
+        "release": { "type": ["string", "null"], "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "manifestDigest": { "$ref": "#/$defs/digestOrNull" },
+        "releaseLockDigest": { "$ref": "#/$defs/digestOrNull" },
+        "topologyDigest": { "$ref": "#/$defs/digestOrNull" },
+        "services": { "$ref": "#/$defs/services" },
+        "volumes": { "$ref": "#/$defs/volumes" },
+        "networks": { "$ref": "#/$defs/volumes" }
+      }
+    },
+    "driftEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resource", "kind", "detail"],
+      "properties": {
+        "resource": { "type": "string" },
+        "kind": {
+          "enum": ["manual-change", "missing", "unmanaged", "generated-missing", "generated-modified", "generated-unreadable"]
+        },
+        "detail": { "type": "string" }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "phase", "action", "resource", "reason"],
+      "properties": {
+        "id": { "$ref": "#/$defs/operationId" },
+        "phase": {
+          "enum": ["host", "secret", "volume", "image", "config", "backup", "service", "database", "readiness", "state"]
+        },
+        "action": {
+          "enum": [
+            "host.prepare", "secret.ensure", "volume.ensure", "network.ensure", "image.verify", "image.pull",
+            "config.write", "backup.create", "service.stop", "service.remove", "database.migrate", "service.start",
+            "readiness.wait", "state.commit"
+          ]
+        },
+        "resource": { "type": "string" },
+        "image": { "type": "string" },
+        "imageTrust": {
+          "description": "Only for image.verify - exactly how apply must verify this specific image, carried in the plan itself so apply never has to re-consult the release lock at execution time to know whether an image needs a real Cosign identity check or is trusted by digest pin alone (a third-party image with no Hof-controlled signing identity - see release-lock-v1.schema.json's own thirdParty/trust split).",
+          "oneOf": [
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["policy", "signatureIdentity", "signatureOidcIssuer"],
+              "properties": {
+                "policy": { "const": "signed" },
+                "signatureIdentity": { "type": "string", "pattern": "^https://github\\.com/" },
+                "signatureOidcIssuer": { "type": "string", "format": "uri", "pattern": "^https://" }
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["policy"],
+              "properties": { "policy": { "const": "digest-only" } }
+            }
+          ]
+        },
+        "condition": {
+          "description": "Only for readiness.wait - what actually counts as ready for this specific unit. Most units have a real Compose healthcheck and must reach \"healthy\"; the gateway deliberately has none (see render-topology.mjs's own comment on why), so it only ever waits for \"running\".",
+          "enum": ["running", "healthy"]
+        },
+        "argv": {
+          "description": "Only for database.migrate - the catalog's own database.command for this component, so an approved plan is self-sufficient and apply never has to re-interpret the catalog to know what to run.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "volume": {
+          "description": "Only for database.migrate/backup.create - the catalog's own database.volume (or the volume backup.create is protecting).",
+          "$ref": "#/$defs/identifier"
+        },
+        "schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["from", "to", "rollbackCompatible"],
+          "properties": {
+            "from": { "type": "integer", "minimum": 0 },
+            "to": { "type": "integer", "minimum": 0 },
+            "rollbackCompatible": { "type": "boolean" }
+          }
+        },
+        "reason": { "type": "string" }
+      }
+    }
+  }
+}

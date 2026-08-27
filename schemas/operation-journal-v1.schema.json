@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/operation-journal-v1.schema.json",
+  "title": "Hof apply operation journal",
+  "description": "/var/lib/hof/state/journal/<operationId>.json - the durable, per-apply-run header record on the target. Written once at apply start (immutable except `status`/`committedGeneration`, updated only by the same operationId that created it); individual operation attempts are recorded separately as an append-only operation-event-v1 log this journal's own operationId ties them to. Never holds a secret value, decrypted content, an environment dump, or an SSH private-key path - safe to read, copy, or attach to a bug report without a second sanitization pass.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "operationId", "approvedPlanId", "target", "inputDigests", "startedAt", "status", "committedGeneration"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/operation-journal/v1" },
+    "operationId": { "$ref": "#/$defs/operationId" },
+    "approvedPlanId": {
+      "description": "The exact plan-v2 planId this run was approved against (--approve-plan-id) - apply's own stale-plan recheck re-derives a fresh plan under the lock and refuses to proceed if it no longer matches this value.",
+      "$ref": "#/$defs/planId"
+    },
+    "target": { "$ref": "#/$defs/targetBinding" },
+    "inputDigests": {
+      "description": "Every input this specific run is bound to, fixed at journal creation and never recomputed from a live file again mid-run - a manifest/release-lock/catalog/renderer/Execution-Environment edited out from under an in-progress apply must never silently change what a resumed operation does.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifestDigest", "releaseLockDigest", "catalogDigest", "composeTemplateDigest", "executionEnvironmentDigest"],
+      "properties": {
+        "manifestDigest": { "$ref": "#/$defs/sha256" },
+        "releaseLockDigest": { "$ref": "#/$defs/sha256" },
+        "catalogDigest": { "$ref": "#/$defs/sha256" },
+        "composeTemplateDigest": { "$ref": "#/$defs/sha256" },
+        "executionEnvironmentDigest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "status": {
+      "description": "in-progress: apply is running or was interrupted and not yet resolved either way. succeeded: every operation completed and state.commit landed - committedGeneration is then always set. failed: a fatal, unresumable outcome (see operation-event-v1's own resumability note) - the operator must diagnose and start a fresh bootstrap, never retry this same journal.",
+      "enum": ["in-progress", "succeeded", "failed"]
+    },
+    "committedGeneration": {
+      "description": "Set only once state.commit has actually succeeded - null for the entire lifetime of a run that never reaches it, including every failed one. A bootstrap always commits generation 1.",
+      "type": ["integer", "null"],
+      "minimum": 1
+    }
+  },
+  "$defs": {
+    "operationId": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "planId": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "targetBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "host", "port", "user", "hostKeySha256", "installationId", "baselineGeneration"],
+      "properties": {
+        "mode": { "enum": ["ssh", "local"] },
+        "host": { "type": ["string", "null"] },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "user": { "type": ["string", "null"] },
+        "hostKeySha256": { "type": ["string", "null"], "pattern": "^SHA256:[A-Za-z0-9+/]+=*$" },
+        "installationId": { "type": ["string", "null"] },
+        "baselineGeneration": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

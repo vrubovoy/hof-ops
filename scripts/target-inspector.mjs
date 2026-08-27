@@ -23,7 +23,7 @@ import addFormats from "ajv-formats";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PROBE_PATH = path.join(root, "scripts/target-probe.sh");
-const PROBE_VERSION = "HOF-PROBE-V4";
+const PROBE_VERSION = "HOF-PROBE-V5";
 
 // Every singleton is now mandatory - the probe always emits exactly one
 // of each, with an explicit "unknown"/status sentinel rather than
@@ -31,7 +31,7 @@ const PROBE_VERSION = "HOF-PROBE-V4";
 // target-probe.sh). A record silently missing is a protocol violation,
 // not "the host doesn't have that".
 const SINGLETON_RECORDS = new Set([
-  "os", "arch", "cpu", "memory", "disk", "clock", "sudo", "docker",
+  "os", "arch", "cpu", "memory", "disk", "clock", "sudo", "docker", "docker-engine-status",
   "docker-containers-status", "docker-volumes-status", "docker-networks-status",
   "state-current-status", "state-current", "state-topology-status", "state-topology",
   "generated-artifacts-status", "generated-artifacts",
@@ -54,10 +54,23 @@ const CONTAINER_FIELDS = [
 const RESOURCE_FIELDS = ["name", "labelManaged", "labelInstallationId", "labelGeneration", "labelKind", "labelResource", "labelComposeProject"];
 
 const AVAILABILITY_STATUSES = new Set(["available", "unavailable"]);
+// Docker itself gets a real tri-state, not the plain available/
+// unavailable every other availability record uses: "absent" (Docker
+// genuinely isn't installed on the target at all - a fresh host that's
+// a legitimate bootstrap candidate) must never be indistinguishable
+// from "unavailable" (Docker is installed but couldn't safely be
+// inspected - fail closed exactly like before). See ADR 0004's "Docker
+// Absent" rules.
+const DOCKER_STATUSES = new Set(["available", "absent", "unavailable"]);
 const STATE_FILE_STATUSES = new Set(["present", "absent", "unreadable"]);
 
 function parseAvailabilityStatus(value, name) {
   if (!AVAILABILITY_STATUSES.has(value)) throw new Error(`probe record ${name} has an unrecognized status: ${JSON.stringify(value)}`);
+  return value;
+}
+
+function parseDockerStatus(value, name) {
+  if (!DOCKER_STATUSES.has(value)) throw new Error(`probe record ${name} has an unrecognized status: ${JSON.stringify(value)}`);
   return value;
 }
 
@@ -311,7 +324,10 @@ async function buildSnapshot(mode, transport, stdout) {
   const generatedArtifactsStatus = parseAvailabilityStatus(singles["generated-artifacts-status"], "generated-artifacts-status");
 
   const [osId, osVersionId] = singles.os.split("|");
-  const [dockerEngine, dockerCompose] = singles.docker.split("|");
+  // The engine version string itself is diagnostic-only (never surfaced
+  // as a typed field) - engineStatus (a real tri-state, see below) is
+  // what everything else actually branches on.
+  const [, dockerCompose] = singles.docker.split("|");
 
   const currentStatus = parseStateFileStatus(singles["state-current-status"], singles["state-current"], "state-current-status", "state-current");
   const managedCurrent = currentStatus === "present" ? JSON.parse(singles["state-current"]) : null;
@@ -363,13 +379,19 @@ async function buildSnapshot(mode, transport, stdout) {
     },
     ports,
     docker: {
-      engineAvailable: Boolean(dockerEngine),
+      // engineStatus: "available" | "absent" | "unavailable" - "absent"
+      // (Docker genuinely not installed) is a legitimate bootstrap
+      // candidate, never the same as "unavailable" (installed but
+      // couldn't be reached, fail closed). composeAvailable stays a
+      // plain boolean - it's only ever meaningful once the engine
+      // itself is genuinely available.
+      engineStatus: parseDockerStatus(singles["docker-engine-status"], "docker-engine-status"),
       composeAvailable: Boolean(dockerCompose),
-      containersStatus: parseAvailabilityStatus(singles["docker-containers-status"], "docker-containers-status"),
+      containersStatus: parseDockerStatus(singles["docker-containers-status"], "docker-containers-status"),
       resources,
-      volumesStatus: parseAvailabilityStatus(singles["docker-volumes-status"], "docker-volumes-status"),
+      volumesStatus: parseDockerStatus(singles["docker-volumes-status"], "docker-volumes-status"),
       volumes,
-      networksStatus: parseAvailabilityStatus(singles["docker-networks-status"], "docker-networks-status"),
+      networksStatus: parseDockerStatus(singles["docker-networks-status"], "docker-networks-status"),
       networks,
     },
     managedState: {
@@ -395,11 +417,36 @@ const SSH_HARDENING = [
   "-o", "PermitLocalCommand=no",
   "-o", "RequestTTY=no",
   "-o", "ConnectionAttempts=1",
+  // -v (LogLevel DEBUG1) is how ADR 0004's exact target binding is
+  // actually obtained: OpenSSH itself prints the one host key it
+  // negotiated and accepted for THIS connection ("Server host key: ...")
+  // to stderr, in both trust modes - see parseAcceptedHostKey below.
+  // Reimplementing "which key would SSH pick" independently would risk
+  // silently disagreeing with what the real client actually did; asking
+  // the client that already connected cannot.
+  "-v",
 ];
 
 function sha256Fingerprint(base64Key) {
   const digest = createHash("sha256").update(Buffer.from(base64Key, "base64")).digest("base64");
   return "SHA256:" + digest.replace(/=+$/, "");
+}
+
+// The exact accepted host-key fingerprint for THIS connection, parsed
+// from ssh -v's own "debug1: Server host key: <type> SHA256:<...>"
+// stderr line - the actual key OpenSSH negotiated and verified against
+// UserKnownHostsFile, not merely the caller-supplied trust anchor. Used
+// in both trust modes: in known-hosts mode it's the only way to learn
+// which of possibly several known_hosts entries for this host was
+// actually the one accepted; in host-key-sha256 mode it's a genuine,
+// independent cross-check against the value this module itself already
+// pinned into a temp known_hosts file (see resolveKnownHosts).
+function parseAcceptedHostKey(stderr) {
+  const match = /^debug1: Server host key: \S+ (SHA256:\S+)/m.exec(stderr);
+  if (!match) {
+    throw new Error("could not determine the actual accepted SSH host-key fingerprint from the transport (no \"Server host key\" line in ssh -v output) - refusing to trust an unconfirmed fingerprint");
+  }
+  return match[1];
 }
 
 // Resolves exactly one trusted known_hosts line for this host/port -
@@ -460,8 +507,16 @@ async function inspectSsh(options) {
       `${user}@${host}`,
       "sh", "-s",
     ];
-    const { stdout } = await run("ssh", args, { input: probeScript, timeout: (timeout + 20) * 1000 });
-    const trustDigest = knownHostsFile ? null : hostKeySha256;
+    const { stdout, stderr } = await run("ssh", args, { input: probeScript, timeout: (timeout + 20) * 1000 });
+    const trustDigest = parseAcceptedHostKey(stderr);
+    // In host-key-sha256 mode this must always already agree - the temp
+    // known_hosts file resolveKnownHosts() built contains exactly one
+    // key, the one already matched against hostKeySha256. A mismatch
+    // here would mean OpenSSH itself negotiated a different key than
+    // the one this module pinned - never silently trusted.
+    if (hostKeySha256 && trustDigest !== hostKeySha256) {
+      throw new Error(`ssh accepted host key ${trustDigest}, which does not match the pinned fingerprint ${hostKeySha256} - refusing to trust the result`);
+    }
     return await buildSnapshot("ssh", { verified: true, trustDigest }, stdout);
   } finally {
     await cleanup();

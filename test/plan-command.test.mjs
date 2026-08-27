@@ -86,7 +86,7 @@ function cleanSnapshot(overrides = {}) {
     },
     ports: [],
     docker: {
-      engineAvailable: true, composeAvailable: true,
+      engineStatus: "available", composeAvailable: true,
       containersStatus: "available", resources: [],
       volumesStatus: "available", volumes: [],
       networksStatus: "available", networks: [],
@@ -209,7 +209,7 @@ test("a genuine applied no-op plan against a matching, already-applied installat
   const snapshot = cleanSnapshot({
     managedState: { currentStatus: "present", current, topologyStatus: "present", topology: rendered },
     docker: {
-      engineAvailable: true, composeAvailable: true,
+      engineStatus: "available", composeAvailable: true,
       containersStatus: "available", resources,
       volumesStatus: "available", volumes: state.volumes.map((name) => asResourceRecord(name, "volume")),
       networksStatus: "available", networks: state.networks.map((name) => asResourceRecord(name, "network")),
@@ -256,7 +256,7 @@ test("repairDrift actually reaches buildPlan: a manual-change drift blocks by de
   const snapshot = cleanSnapshot({
     managedState: { currentStatus: "present", current, topologyStatus: "present", topology: rendered },
     docker: {
-      engineAvailable: true, composeAvailable: true,
+      engineStatus: "available", composeAvailable: true,
       containersStatus: "available", resources,
       volumesStatus: "available", volumes: state.volumes.map((name) => asResourceRecord(name, "volume")),
       networksStatus: "available", networks: state.networks.map((name) => asResourceRecord(name, "network")),

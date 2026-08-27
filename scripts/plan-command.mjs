@@ -111,7 +111,14 @@ export async function runPlan(options) {
   if (readable.status !== "pass") return blocked("state", readable.message);
 
   const observation = observationFromSnapshot(snapshot);
-  const incompleteDocker = ["containersStatus", "volumesStatus", "networksStatus"].filter((key) => observation[key] !== "available");
+  // "absent" (Docker genuinely not installed) is not incomplete - it's
+  // a real, positively-confirmed answer a genuinely clean bootstrap
+  // host is expected to give. Only "unavailable" (installed but
+  // couldn't be safely inspected) blocks here; resolveBaseline() below
+  // still separately refuses "absent" on an already-applied baseline
+  // (Docker vanishing from an existing installation is real corruption,
+  // never silently treated as a fresh host).
+  const incompleteDocker = ["containersStatus", "volumesStatus", "networksStatus"].filter((key) => observation[key] === "unavailable");
   if (incompleteDocker.length > 0) {
     return blocked("docker", `Docker's ${incompleteDocker.join("/")} listing could not be read - refusing to plan against an incomplete observation`);
   }

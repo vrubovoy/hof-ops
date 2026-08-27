@@ -131,15 +131,25 @@ export function checkPort(snapshot, portNumber) {
   return check(`port-${portNumber}`, "fail", `port ${portNumber} is already in use by something else - hofctl apply needs it free for the gateway`);
 }
 
+// engineStatus is a real tri-state (see ADR 0004's "Docker Absent"
+// rules, target-inspector.mjs's DOCKER_STATUSES): "absent" is a
+// perfectly legitimate state for a fresh host item 8's bootstrap apply
+// will install Docker onto - preflight must never report that as a
+// failure the way "Docker Engine is not reachable" would suggest.
+// "unavailable" (installed but couldn't be verified) still fails
+// closed, exactly as before.
 export function checkDocker(snapshot) {
-  if (!snapshot.docker.engineAvailable) return check("docker", "fail", "Docker Engine is not reachable");
+  if (snapshot.docker.engineStatus === "absent") {
+    return check("docker", "pass", "Docker is not installed yet - it will be installed during bootstrap apply");
+  }
+  if (snapshot.docker.engineStatus === "unavailable") return check("docker", "fail", "Docker Engine is not reachable");
   if (!snapshot.docker.composeAvailable) return check("docker", "fail", "Docker Compose plugin is not available");
   // Engine/Compose can report available while a *listing* itself still
   // failed (a narrower, rarer permission gap, and one bad `docker
   // inspect` call taints the whole batch - see target-probe.sh) -
   // without this, that failure would look exactly like "Docker is fine
   // and nothing is running" everywhere downstream (managed-state, port
-  // ownership, orphan volume/network detection, a future hofctl plan).
+  // ownership, orphan volume/network detection, hofctl plan).
   const unavailable = ["containers", "volumes", "networks"].filter((kind) => snapshot.docker[`${kind}Status`] !== "available");
   if (unavailable.length > 0) return check("docker", "fail", `Docker is reachable but its ${unavailable.join("/")} listing could not be read`);
   return check("docker", "pass", "Docker Engine and the Compose plugin are both available");

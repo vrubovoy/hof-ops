@@ -41,18 +41,18 @@ const CLEAN_GENERATED_ARTIFACTS = JSON.stringify({
   "topology.json": { status: "absent", digest: null },
 });
 
-// Builds a valid HOF-PROBE-V4 transcript from a plain object of
+// Builds a valid HOF-PROBE-V5 transcript from a plain object of
 // singleton values plus port/container/volume/network arrays - the
 // same shape target-probe.sh's own output decodes to, without needing a
 // real shell. Every mandatory singleton has a default so a test only
 // has to override the one thing it's exercising.
 function probeOutput({
   os = "debian|12", arch = "x86_64", cpu = "4", memory = "8589934592", disk = "53687091200",
-  clock = "yes", sudo = "yes", docker = "27.0.0|2.28.0",
+  clock = "yes", sudo = "yes", docker = "27.0.0|2.28.0", dockerEngineStatus = "available",
   dockerContainersStatus = "available", dockerVolumesStatus = "available", dockerNetworksStatus = "available",
   stateCurrentStatus = "absent", stateCurrent = "", stateTopologyStatus = "absent", stateTopology = "",
   generatedArtifactsStatus = "available", generatedArtifacts = CLEAN_GENERATED_ARTIFACTS,
-  ports = [], containers = [], volumes = [], networks = [], version = "HOF-PROBE-V4",
+  ports = [], containers = [], volumes = [], networks = [], version = "HOF-PROBE-V5",
 } = {}) {
   const lines = [version];
   const record = (name, value) => lines.push(`R ${name} ${b64(value)}`);
@@ -64,6 +64,7 @@ function probeOutput({
   record("clock", clock);
   record("sudo", sudo);
   record("docker", docker);
+  record("docker-engine-status", dockerEngineStatus);
   record("docker-containers-status", dockerContainersStatus);
   record("docker-volumes-status", dockerVolumesStatus);
   record("docker-networks-status", dockerNetworksStatus);
@@ -101,6 +102,15 @@ function resourceRecord({
   return [name, managed, installationId, generation, kind, resource, composeProject].join("\x1f");
 }
 
+// A real, plausible ssh -v debug stream (the exact line format
+// inspectSsh's parseAcceptedHostKey looks for, plus realistic noise
+// around it) - every ssh() mock response needs one now that the
+// accepted host-key fingerprint is always parsed from stderr, in both
+// trust modes.
+function sshDebugStderr(fingerprint = "SHA256:gcuHMcC8doDMjedrPcW196YKgc/MpHxl+BU6kA8Shno", algo = "ssh-ed25519") {
+  return `OpenSSH_9.6p1, OpenSSL 3.1.4\ndebug1: Connecting to target.example.com [203.0.113.10] port 22.\ndebug1: Server host key: ${algo} ${fingerprint}\ndebug1: Authentication succeeded (publickey).\n`;
+}
+
 function fakeRun(responses) {
   const calls = [];
   const run = async (command, args, options) => {
@@ -116,7 +126,7 @@ function fakeRun(responses) {
 }
 
 test("ssh mode builds exactly the hardened argument list, in known-hosts mode", async () => {
-  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: "" } });
+  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: sshDebugStderr() } });
   await inspectTarget({
     targetMode: "ssh", host: "target.example.com", port: 2222, user: "deploy",
     knownHostsFile: "/etc/hof/known_hosts", identityFile: "/etc/hof/id_ed25519",
@@ -134,6 +144,7 @@ test("ssh mode builds exactly the hardened argument list, in known-hosts mode", 
     "-o", "PermitLocalCommand=no",
     "-o", "RequestTTY=no",
     "-o", "ConnectionAttempts=1",
+    "-v",
     "-o", "StrictHostKeyChecking=yes",
     "-o", "UserKnownHostsFile=/etc/hof/known_hosts",
     "-o", "GlobalKnownHostsFile=/dev/null",
@@ -146,11 +157,48 @@ test("ssh mode builds exactly the hardened argument list, in known-hosts mode", 
   ]);
   // The fixed probe script, verbatim, over stdin - never a caller-built command.
   assert.match(call.options.input, /^#!\/bin\/sh/);
-  assert.match(call.options.input, /HOF-PROBE-V4/);
+  assert.match(call.options.input, /HOF-PROBE-V5/);
+});
+
+// ADR 0004's "exact target binding": known-hosts mode used to return
+// trustDigest: null (the only trust anchor was the caller's own opaque
+// known_hosts file). It must now return the actual accepted key's own
+// fingerprint, parsed from the real ssh -v transcript - the one thing
+// that can later detect a host-key change and invalidate a bound plan.
+test("known-hosts mode returns the real accepted host-key fingerprint, parsed from ssh -v - never null", async () => {
+  const fingerprint = "SHA256:gcuHMcC8doDMjedrPcW196YKgc/MpHxl+BU6kA8Shno";
+  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: sshDebugStderr(fingerprint) } });
+  const snapshot = await inspectTarget({ targetMode: "ssh", host: "target.example.com", user: "deploy", knownHostsFile: "/kh", run });
+  assert.equal(snapshot.transport.trustDigest, fingerprint);
+});
+
+test("a missing \"Server host key\" line in ssh -v output is rejected, never silently trusted as an unconfirmed connection", async () => {
+  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: "debug1: some unrelated debug noise\n" } });
+  await assert.rejects(
+    () => inspectTarget({ targetMode: "ssh", host: "target.example.com", user: "deploy", knownHostsFile: "/kh", run }),
+    /could not determine the actual accepted SSH host-key fingerprint/,
+  );
+});
+
+// host-key-sha256 mode pins exactly one key into a temp known_hosts
+// file - if ssh's own real negotiation somehow accepted a DIFFERENT
+// key than that one (should never happen, but must never be silently
+// trusted if it did), inspectTarget refuses the whole result.
+test("host-key-sha256 mode refuses the result if ssh's own accepted key doesn't match the pinned fingerprint", async () => {
+  const keyBase64 = "AAAAC3NzaC1lZDI1NTE5AAAAIF3+kiD6IUxc4xrFjKJI/9v42GCfTbG6v9/16Am1GiL6";
+  const pinnedFingerprint = "SHA256:gcuHMcC8doDMjedrPcW196YKgc/MpHxl+BU6kA8Shno";
+  const run = fakeRun({
+    "ssh-keyscan": { stdout: `target.example.com ssh-ed25519 ${keyBase64}\n`, stderr: "" },
+    ssh: { stdout: probeOutput(), stderr: sshDebugStderr("SHA256:completelyDifferentKeyAcceptedSomehow") },
+  });
+  await assert.rejects(
+    () => inspectTarget({ targetMode: "ssh", host: "target.example.com", user: "deploy", hostKeySha256: pinnedFingerprint, run }),
+    /ssh accepted host key SHA256:completelyDifferentKeyAcceptedSomehow, which does not match the pinned fingerprint/,
+  );
 });
 
 test("ssh mode never uses ssh-keyscan when a known-hosts file is supplied", async () => {
-  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: "" } });
+  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: sshDebugStderr() } });
   await inspectTarget({ targetMode: "ssh", host: "h.example.com", user: "u", knownHostsFile: "/kh", run });
   assert.deepEqual(run.calls.map((call) => call.command), ["ssh"]);
 });
@@ -164,7 +212,10 @@ test("host-key-sha256 mode keyscans, matches the fingerprint, and always writes 
 
   const run = fakeRun({
     "ssh-keyscan": { stdout: `target.example.com ssh-ed25519 ${keyBase64}\n`, stderr: "" },
-    ssh: { stdout: probeOutput(), stderr: "" },
+    // sshDebugStderr()'s own default fingerprint IS expectedFingerprint -
+    // the real cross-check in host-key-sha256 mode (inspectSsh throws if
+    // they disagree) is exercised here precisely because they match.
+    ssh: { stdout: probeOutput(), stderr: sshDebugStderr() },
   });
   const snapshot = await inspectTarget({
     targetMode: "ssh", host: "target.example.com", user: "deploy",
@@ -235,7 +286,7 @@ test("a run() failure (auth rejected, connection refused, timeout) propagates - 
 });
 
 test("refuses a host value that would be interpreted as an SSH option, even with a valid known_hosts file", async () => {
-  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: "" } });
+  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: sshDebugStderr() } });
   await assert.rejects(
     () => inspectTarget({ targetMode: "ssh", host: "-oProxyCommand=touch /tmp/pwned", user: "deploy", knownHostsFile: "/kh", run }),
     /not a valid hostname/,
@@ -244,7 +295,7 @@ test("refuses a host value that would be interpreted as an SSH option, even with
 });
 
 test("refuses a user value that would be interpreted as an SSH option", async () => {
-  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: "" } });
+  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: sshDebugStderr() } });
   await assert.rejects(
     () => inspectTarget({ targetMode: "ssh", host: "target.example.com", user: "-oProxyCommand=touch /tmp/pwned", knownHostsFile: "/kh", run }),
     /not a valid SSH username/,
@@ -253,14 +304,14 @@ test("refuses a user value that would be interpreted as an SSH option", async ()
 });
 
 test("refuses an out-of-range or non-integer port before connecting", async () => {
-  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: "" } });
+  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: sshDebugStderr() } });
   await assert.rejects(() => inspectTarget({ targetMode: "ssh", host: "target.example.com", user: "deploy", port: 0, knownHostsFile: "/kh", run }), /not a valid port number/);
   await assert.rejects(() => inspectTarget({ targetMode: "ssh", host: "target.example.com", user: "deploy", port: 70000, knownHostsFile: "/kh", run }), /not a valid port number/);
   await assert.rejects(() => inspectTarget({ targetMode: "ssh", host: "target.example.com", user: "deploy", port: Number.NaN, knownHostsFile: "/kh", run }), /not a valid port number/);
 });
 
 test("the SSH argv always contains a -- terminator right before the destination, as defense in depth", async () => {
-  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: "" } });
+  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: sshDebugStderr() } });
   await inspectTarget({ targetMode: "ssh", host: "target.example.com", user: "deploy", knownHostsFile: "/kh", run });
   const args = run.calls[0].args;
   const destinationIndex = args.indexOf("deploy@target.example.com");
@@ -268,13 +319,13 @@ test("the SSH argv always contains a -- terminator right before the destination,
 });
 
 test("rejects a non-finite or non-positive connectTimeoutSeconds instead of silently using it", async () => {
-  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: "" } });
+  const run = fakeRun({ ssh: { stdout: probeOutput(), stderr: sshDebugStderr() } });
   await assert.rejects(() => inspectTarget({ targetMode: "ssh", host: "h.example.com", user: "u", knownHostsFile: "/kh", connectTimeoutSeconds: Number.NaN, run }), /connectTimeoutSeconds must be a positive integer/);
   await assert.rejects(() => inspectTarget({ targetMode: "ssh", host: "h.example.com", user: "u", knownHostsFile: "/kh", connectTimeoutSeconds: -5, run }), /connectTimeoutSeconds must be a positive integer/);
 });
 
 test("an oversized transcript is rejected by the protocol-level line bound, independent of execFile's own maxBuffer", async () => {
-  const huge = "HOF-PROBE-V4\n" + Array.from({ length: 3000 }, (_, i) => `R port ${b64(`${8000 + i}|free`)}`).join("\n") + "\nEND\n";
+  const huge = "HOF-PROBE-V5\n" + Array.from({ length: 3000 }, (_, i) => `R port ${b64(`${8000 + i}|free`)}`).join("\n") + "\nEND\n";
   const run = fakeRun({ sh: { stdout: huge, stderr: "" } });
   await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /more than the 2000-line bound/);
 });
@@ -286,8 +337,8 @@ test("a truncated transcript (no END) is rejected, not silently accepted as part
 });
 
 test("a wrong version marker is rejected", async () => {
-  const run = fakeRun({ sh: { stdout: probeOutput({ version: "HOF-PROBE-V3" }), stderr: "" } });
-  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /does not start with the expected HOF-PROBE-V4 marker/);
+  const run = fakeRun({ sh: { stdout: probeOutput({ version: "HOF-PROBE-V4" }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /does not start with the expected HOF-PROBE-V5 marker/);
 });
 
 test("an unrecognized record name is rejected, not ignored", async () => {
@@ -477,6 +528,46 @@ test("docker-{containers,volumes,networks}-status each independently distinguish
   assert.equal(unavailable.docker.containersStatus, "unavailable");
   assert.equal(unavailable.docker.volumesStatus, "unavailable");
   assert.equal(unavailable.docker.networksStatus, "unavailable");
+});
+
+// "absent" (Docker genuinely not installed) is a real, distinct third
+// value - never collapsed into "unavailable" (installed but couldn't be
+// verified) - see ADR 0004's "Docker Absent" rules.
+test("docker-engine-status and docker-{containers,volumes,networks}-status are a real tri-state: available, absent, and unavailable all parse distinctly", async () => {
+  const runAbsent = fakeRun({
+    sh: {
+      stdout: probeOutput({
+        docker: "|", dockerEngineStatus: "absent",
+        dockerContainersStatus: "absent", dockerVolumesStatus: "absent", dockerNetworksStatus: "absent",
+      }),
+      stderr: "",
+    },
+  });
+  const absent = await inspectTarget({ targetMode: "local", run: runAbsent });
+  assert.equal(absent.docker.engineStatus, "absent");
+  assert.equal(absent.docker.composeAvailable, false);
+  assert.equal(absent.docker.containersStatus, "absent");
+  assert.equal(absent.docker.volumesStatus, "absent");
+  assert.equal(absent.docker.networksStatus, "absent");
+  assert.deepEqual(absent.docker.resources, []);
+
+  const runUnavailable = fakeRun({ sh: { stdout: probeOutput({ dockerEngineStatus: "unavailable" }), stderr: "" } });
+  const unavailable = await inspectTarget({ targetMode: "local", run: runUnavailable });
+  assert.equal(unavailable.docker.engineStatus, "unavailable");
+
+  const runAvailable = fakeRun({ sh: { stdout: probeOutput({ dockerEngineStatus: "available" }), stderr: "" } });
+  const available = await inspectTarget({ targetMode: "local", run: runAvailable });
+  assert.equal(available.docker.engineStatus, "available");
+});
+
+test("an unrecognized docker-engine-status is rejected, never silently read as available/absent/unavailable", async () => {
+  const run = fakeRun({ sh: { stdout: probeOutput({ dockerEngineStatus: "definitely-installed" }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /probe record docker-engine-status has an unrecognized status/);
+});
+
+test("an unrecognized docker-containers-status is rejected, including a plain-availability-style typo", async () => {
+  const run = fakeRun({ sh: { stdout: probeOutput({ dockerContainersStatus: "presnt" }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /probe record docker-containers-status has an unrecognized status/);
 });
 
 test("state file present/absent/unreadable statuses all parse distinctly", async () => {

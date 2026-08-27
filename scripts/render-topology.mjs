@@ -7,7 +7,28 @@ import YAML from "yaml";
 import { validateContracts } from "./contracts.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const APP_PORTS = { kuvert: 3001, tafel: 3002, zettel: 3003, glocke: 3004, schrank: 3005, herold: 3006 };
+const APP_PORTS = { kuvert: 3001, tafel: 3002, zettel: 3003, glocke: 3004, schrank: 3005, herold: 3006, wachter: 3007 };
+// Matches Wächter's own restart-control contract (see its README/SECURITY):
+// only stateless frontend containers may ever be restarted through it, and
+// every other declared service is critical - the agent gives critical=true
+// precedence if a container is ever labeled both.
+function restartLabels(isFrontend) {
+  return isFrontend
+    ? { "hof.wachter.restartable": "true", "hof.wachter.critical": "false" }
+    : { "hof.wachter.critical": "true" };
+}
+// Matches wachter/docker-compose.yml's own hardening for both of its
+// containers - a read-only root filesystem, no Linux capabilities, and no
+// privilege escalation, since one of them (the agent) holds the Docker
+// socket.
+function wachterHardening() {
+  return {
+    read_only: true,
+    tmpfs: ["/tmp"],
+    cap_drop: ["ALL"],
+    security_opt: ["no-new-privileges:true"],
+  };
+}
 const EXPORT_SERVICES = ["kuvert", "tafel", "zettel", "glocke", "schrank", "herold"];
 const GLOCKE_PRODUCERS = ["schlussel", "kuvert", "tafel", "zettel"];
 
@@ -78,6 +99,7 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
   const compose = { name: "hof", services: {}, volumes: {}, networks: { hof: {} } };
 
   compose.services.gateway = composeService(releaseLock.components.gateway.image, { DOMAIN: manifest.domains.base });
+  compose.services.gateway.labels = restartLabels(false);
   compose.services.gateway.ports = ["80:80", "443:443"];
   compose.services.gateway.volumes = ["./Caddyfile:/etc/caddy/Caddyfile:ro", "caddy-data:/data"];
   if (manifest.tls.mode === "supplied") {
@@ -109,6 +131,11 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
         component.environment = {
           PORT: "4000", DATABASE_PATH: "/data/schlussel.db", KEYS_DIR: "/data/keys", EXPORT_DIR: "/data/exports",
           JWT_ISSUER: "schlussel", ALLOWED_ORIGINS: trustedOrigins.join(","),
+          // Interim default: there's no reconciler-driven explicit migration
+          // step yet (delivery item 8), so a freshly provisioned volume
+          // needs to migrate itself on first boot or /ready never passes.
+          // Revisit once Ansible reconciliation owns this instead.
+          MIGRATE_ON_STARTUP: "true",
           ...Object.fromEntries(Object.entries(exportTargets).map(([name, url]) => [`${envName(name)}_EXPORT_URL`, url])),
           ...Object.fromEntries(Object.entries(deletionTargets).map(([name, url]) => [`${envName(name)}_DELETION_URL`, url])),
           GLOCKE_ENABLED: String(enabled.has("glocke")),
@@ -132,6 +159,8 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
         component.environment = {
           PORT: String(APP_PORTS[id]), DATABASE_PATH: `/data/${id}.db`, JWT_ISSUER: "schlussel",
           SCHLUSSEL_JWKS_URL: "http://schlussel:4000/.well-known/jwks.json",
+          // Interim default - see the identical comment on schlussel above.
+          MIGRATE_ON_STARTUP: "true",
           ALLOWED_ORIGINS: [origins.schloss, origins.schlussel, origins[id]].filter(Boolean).join(","),
         };
         if (enabled.has("glocke") && producers.includes(id)) Object.assign(component.environment, {
@@ -169,6 +198,10 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
       }
 
       if (service.volumes.length && !isFrontend && artifact !== "schloss") component.volumes = service.volumes.map((volume) => `${volume}:/data`);
+      // Schloss shares the port-80/no-healthcheck-path shape of a
+      // frontend artifact below, but per the platform's own restart
+      // convention it is NOT restartable - it's the entry point itself.
+      component.labels = restartLabels(isFrontend);
       if (artifact === service.health.component) component.healthcheck = healthcheck(port, service.health.path);
       else if (isFrontend || artifact === "schloss") component.healthcheck = healthcheck(80, "/");
       const dependencies = healthyDependencies(service, catalogById);
@@ -182,20 +215,45 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
     const image = releaseLock.components["wachter-backend"].image;
     compose.services.wachter = compose.services["wachter-backend"];
     delete compose.services["wachter-backend"];
-    compose.services["wachter-agent"] = composeService(image, { PORT: "3008" });
+
+    // Full replacement, not a patch on top of the generic isBackend
+    // branch above - Wächter has no database and isn't a browser-facing
+    // CORS target, so it doesn't take DATABASE_PATH/ALLOWED_ORIGINS, and
+    // it needs its own agent-specific vars the generic branch has no
+    // notion of.
+    Object.assign(compose.services.wachter, {
+      environment: {
+        PORT: String(APP_PORTS.wachter), SCHLUSSEL_JWKS_URL: "http://schlussel:4000/.well-known/jwks.json",
+        JWT_ISSUER: "schlussel", WACHTER_AGENT_URL: "http://wachter-agent:3008",
+        WACHTER_AGENT_TOKEN: "${WACHTER_AGENT_TOKEN:-}", WACHTER_AGENT_TOKEN_FILE: "${WACHTER_AGENT_TOKEN_FILE:-}",
+      },
+      networks: ["hof", "wachter-internal"],
+      depends_on: { "wachter-agent": { condition: "service_healthy" } },
+      volumes: ["${WACHTER_AGENT_TOKEN_FILE:-/dev/null}:${WACHTER_AGENT_TOKEN_FILE:-/dev/null}:ro"],
+      labels: restartLabels(false),
+      ...wachterHardening(),
+    });
+
+    compose.services["wachter-agent"] = {
+      ...composeService(image, {
+        PORT: "3008", WACHTER_AGENT_TOKEN: "${WACHTER_AGENT_TOKEN:-}", WACHTER_AGENT_TOKEN_FILE: "${WACHTER_AGENT_TOKEN_FILE:-}",
+        WACHTER_PROC_DIR: "/host/proc", WACHTER_ROOT_DIR: "/host/rootfs-probe", WACHTER_DOCKER_SOCKET: "/var/run/docker.sock",
+      }),
+      // The API and its agent share one image (see the catalog's own
+      // comment) - only the command differs. Without this the agent
+      // container runs the API's default CMD instead of the agent.
+      command: ["node", "backend/dist/agent.js"],
+      networks: ["wachter-internal"],
+      volumes: [
+        "${WACHTER_AGENT_TOKEN_FILE:-/dev/null}:${WACHTER_AGENT_TOKEN_FILE:-/dev/null}:ro",
+        "/proc:/host/proc:ro", "/etc/hostname:/host/rootfs-probe:ro", "/var/run/docker.sock:/var/run/docker.sock",
+      ],
+      group_add: ["${DOCKER_GID:-998}"],
+      healthcheck: healthcheck(3008, "/health"),
+      labels: restartLabels(false),
+      ...wachterHardening(),
+    };
     compose.networks["wachter-internal"] = { internal: true };
-    compose.services["wachter-agent"].environment.WACHTER_AGENT_TOKEN = "${WACHTER_AGENT_TOKEN:?required}";
-    compose.services["wachter-agent"].environment.WACHTER_PROC_DIR = "/host/proc";
-    compose.services["wachter-agent"].environment.WACHTER_ROOT_DIR = "/host/rootfs-probe";
-    compose.services["wachter-agent"].environment.WACHTER_DOCKER_SOCKET = "/var/run/docker.sock";
-    compose.services["wachter-agent"].networks = ["wachter-internal"];
-    compose.services["wachter-agent"].volumes = ["/proc:/host/proc:ro", "/etc/hostname:/host/rootfs-probe:ro", "/var/run/docker.sock:/var/run/docker.sock"];
-    compose.services["wachter-agent"].group_add = ["${DOCKER_GID:-998}"];
-    compose.services["wachter-agent"].healthcheck = healthcheck(3008, "/health");
-    compose.services.wachter.environment.WACHTER_AGENT_URL = "http://wachter-agent:3008";
-    compose.services.wachter.environment.WACHTER_AGENT_TOKEN = "${WACHTER_AGENT_TOKEN:?required}";
-    compose.services.wachter.networks = ["hof", "wachter-internal"];
-    compose.services.wachter.depends_on = { "wachter-agent": { condition: "service_healthy" } };
   }
   for (const id of enabledIds) for (const volume of catalogById.get(id).volumes) compose.volumes[volume] = { name: volume };
 

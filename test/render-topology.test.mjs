@@ -36,6 +36,53 @@ test("full topology renders every selected service and integration", async () =>
   assert.ok(rendered.compose.services["wachter-agent"]);
 });
 
+test("Wächter's two containers get their real port, command, and hardening", async () => {
+  const rendered = renderTopology(await contractsWith(["wachter"]));
+  const { wachter, "wachter-agent": agent } = rendered.compose.services;
+
+  // The regression this guards against: APP_PORTS had no "wachter" entry,
+  // so this rendered as the literal string "undefined" and the
+  // healthcheck URL was http://localhost:undefined/ready.
+  assert.equal(wachter.environment.PORT, "3007");
+  assert.deepEqual(wachter.healthcheck.test, ["CMD", "wget", "-qO-", "http://localhost:3007/ready"]);
+  assert.equal(wachter.environment.DATABASE_PATH, undefined, "Wächter has no database");
+
+  // The agent shares an image with the API - only its command differs.
+  // Without an explicit command it silently ran the API's default CMD.
+  assert.deepEqual(agent.command, ["node", "backend/dist/agent.js"]);
+  assert.equal(agent.environment.PORT, "3008");
+
+  for (const service of [wachter, agent]) {
+    assert.equal(service.read_only, true);
+    assert.deepEqual(service.cap_drop, ["ALL"]);
+    assert.deepEqual(service.security_opt, ["no-new-privileges:true"]);
+    assert.deepEqual(service.tmpfs, ["/tmp"]);
+    assert.deepEqual(service.labels, { "hof.wachter.critical": "true" });
+  }
+});
+
+test("every non-frontend service is restart-critical, every frontend is restartable", async () => {
+  const rendered = renderTopology(await contractsWith(["kuvert", "wachter"]));
+  const restartable = Object.entries(rendered.compose.services)
+    .filter(([, service]) => service.labels?.["hof.wachter.restartable"] === "true")
+    .map(([name]) => name);
+  const critical = Object.entries(rendered.compose.services)
+    .filter(([, service]) => service.labels?.["hof.wachter.critical"] === "true")
+    .map(([name]) => name);
+
+  assert.deepEqual(restartable.sort(), ["kuvert-frontend", "schlussel-frontend"]);
+  assert.deepEqual(
+    critical.sort(),
+    ["gateway", "kuvert-backend", "schloss", "schlussel", "wachter", "wachter-agent"].sort(),
+  );
+  // No service is ever labeled both - the agent gives critical precedence,
+  // but a service double-labeled would signal a rendering bug, not a
+  // real-world case to tolerate.
+  for (const service of Object.values(rendered.compose.services)) {
+    assert.ok(!(service.labels?.["hof.wachter.restartable"] === "true" && service.labels?.["hof.wachter.critical"] === "true"));
+  }
+});
+
 test("core-only topology contains no disabled service references", async () => {
   const rendered = renderTopology(await contractsWith([]));
   const serialized = JSON.stringify(rendered);

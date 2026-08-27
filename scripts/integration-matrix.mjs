@@ -151,6 +151,20 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
 
       if (runtime) {
         await dockerCompose(composePath, compose.name, ["pull", "--quiet"], environment);
+        // render-topology.mjs now renders MIGRATE_ON_STARTUP=false - a
+        // fresh volume's schema is only ever brought current by an
+        // explicit migration job, matching hofctl plan's own
+        // database.migrate operation (see PLATFORM-OPS-PLAN.md). Run one
+        // per persistent service before `up --wait`, or /ready never
+        // passes and every one of these fixtures times out.
+        for (const service of catalog.services) {
+          if (!service.database || !compose.services[service.database.component]) continue;
+          await dockerCompose(
+            composePath, compose.name,
+            ["run", "--rm", "--no-deps", service.database.component, ...service.database.command],
+            environment,
+          );
+        }
         try {
           // --wait blocks until every service with a healthcheck reports
           // healthy (or fails loudly if one doesn't within the timeout) -

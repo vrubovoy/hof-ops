@@ -25,6 +25,13 @@ services:
     health:
       component: schlussel
       path: /health
+    # schlussel is root-level (see the artifacts comment above), so its
+    # compiled entry point has no backend/ prefix, unlike every other
+    # service's database.command below.
+    database:
+      component: schlussel
+      command: [node, dist/migrate.js]
+      volume: schlussel-data
   - id: schloss
     mandatory: true
     hostname: null
@@ -45,6 +52,15 @@ services:
     health:
       component: kuvert-backend
       path: /health
+    # Kuvert's own runtime doesn't yet gate its startup migration behind
+    # MIGRATE_ON_STARTUP (unlike Tafel's five newer siblings below) - it
+    # always self-migrates on start regardless of this operation running.
+    # Harmless (migrations are idempotent), but a real, still-open gap -
+    # see PLATFORM-OPS-PLAN.md's hofctl plan design note.
+    database:
+      component: kuvert-backend
+      command: [node, backend/dist/migrate.js]
+      volume: kuvert-data
   - id: tafel
     mandatory: false
     hostname: tafel
@@ -54,6 +70,12 @@ services:
     health:
       component: tafel-backend
       path: /health
+    # Same open gap as Kuvert above - always self-migrates on start,
+    # this operation isn't yet the only trigger.
+    database:
+      component: tafel-backend
+      command: [node, backend/dist/migrate.js]
+      volume: tafel-data
   - id: zettel
     mandatory: false
     hostname: zettel
@@ -63,6 +85,10 @@ services:
     health:
       component: zettel-backend
       path: /health
+    database:
+      component: zettel-backend
+      command: [node, backend/dist/migrate.js]
+      volume: zettel-data
   - id: glocke
     mandatory: false
     hostname: glocke
@@ -72,6 +98,10 @@ services:
     health:
       component: glocke-backend
       path: /ready
+    database:
+      component: glocke-backend
+      command: [node, backend/dist/migrate.js]
+      volume: glocke-data
   - id: schrank
     mandatory: false
     hostname: schrank
@@ -81,6 +111,10 @@ services:
     health:
       component: schrank-backend
       path: /ready
+    database:
+      component: schrank-backend
+      command: [node, backend/dist/migrate.js]
+      volume: schrank-data
   - id: herold
     mandatory: false
     hostname: herold
@@ -90,6 +124,10 @@ services:
     health:
       component: herold-backend
       path: /ready
+    database:
+      component: herold-backend
+      command: [node, backend/dist/migrate.js]
+      volume: herold-data
   - id: wachter
     mandatory: false
     hostname: null

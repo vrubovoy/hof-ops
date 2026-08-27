@@ -21,6 +21,23 @@ function restartLabels(isFrontend) {
 // containers - a read-only root filesystem, no Linux capabilities, and no
 // privilege escalation, since one of them (the agent) holds the Docker
 // socket.
+// hofctl plan's drift diff (see PLATFORM-OPS-PLAN.md) needs a stable way
+// to tell "a Docker resource this platform generated" apart from
+// anything else on the host, and to tell which installation/service/
+// artifact/generation it belongs to - without ever reading
+// container env (which can hold secrets). installationId/generation are
+// supplied by the caller (state.mjs, once that owns generation numbers);
+// a bare `hofctl render` with neither has no real installation yet, so
+// they default to an empty/zero placeholder rather than failing.
+function ownershipLabels({ installationId, generation, service, artifact }) {
+  return {
+    "hof.managed": "true",
+    "hof.installation-id": installationId ?? "",
+    "hof.service": service,
+    "hof.artifact": artifact,
+    "hof.generation": String(generation ?? 0),
+  };
+}
 function wachterHardening() {
   return {
     read_only: true,
@@ -88,7 +105,7 @@ function healthyDependencies(service, catalogById) {
   );
 }
 
-export function renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema }) {
+export function renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId = null, generation = 0 }) {
   const errors = validateContracts({
     servicesSchema,
     catalogSchema,
@@ -118,7 +135,7 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
   const compose = { name: "hof", services: {}, volumes: {}, networks: { hof: {} } };
 
   compose.services.gateway = composeService(releaseLock.components.gateway.image, { DOMAIN: manifest.domains.base });
-  compose.services.gateway.labels = restartLabels(false);
+  compose.services.gateway.labels = { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "tor", artifact: "gateway" }) };
   compose.services.gateway.ports = ["80:80", "443:443"];
   compose.services.gateway.volumes = ["./Caddyfile:/etc/caddy/Caddyfile:ro", "caddy-data:/data"];
   if (manifest.tls.mode === "supplied") {
@@ -157,11 +174,11 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
         component.environment = {
           PORT: "4000", DATABASE_PATH: "/data/schlussel.db", KEYS_DIR: "/data/keys", EXPORT_DIR: "/data/exports",
           JWT_ISSUER: "schlussel", ALLOWED_ORIGINS: trustedOrigins.join(","),
-          // Interim default: there's no reconciler-driven explicit migration
-          // step yet (delivery item 8), so a freshly provisioned volume
-          // needs to migrate itself on first boot or /ready never passes.
-          // Revisit once Ansible reconciliation owns this instead.
-          MIGRATE_ON_STARTUP: "true",
+          // hofctl plan now owns migrations as an explicit, visible
+          // database.migrate operation (see PLATFORM-OPS-PLAN.md) instead
+          // of the app silently migrating itself on every boot - startup
+          // only ever schema-checks.
+          MIGRATE_ON_STARTUP: "false",
           ...Object.fromEntries(Object.entries(exportTargets).map(([name, url]) => [`${envName(name)}_EXPORT_URL`, url])),
           ...Object.fromEntries(Object.entries(deletionTargets).map(([name, url]) => [`${envName(name)}_DELETION_URL`, url])),
           GLOCKE_ENABLED: String(enabled.has("glocke")),
@@ -185,8 +202,11 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
         component.environment = {
           PORT: String(APP_PORTS[id]), DATABASE_PATH: `/data/${id}.db`, JWT_ISSUER: "schlussel",
           SCHLUSSEL_JWKS_URL: "http://schlussel:4000/.well-known/jwks.json",
-          // Interim default - see the identical comment on schlussel above.
-          MIGRATE_ON_STARTUP: "true",
+          // See the identical comment on schlussel above. (Kuvert and
+          // Tafel don't yet read this var at all and always self-migrate
+          // regardless - see the catalog's own database.command comment
+          // on those two services.)
+          MIGRATE_ON_STARTUP: "false",
           ALLOWED_ORIGINS: [origins.schloss, origins.schlussel, origins[id]].filter(Boolean).join(","),
         };
         if (enabled.has("glocke") && producers.includes(id)) Object.assign(component.environment, {
@@ -227,7 +247,7 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
       // Schloss shares the port-80/no-healthcheck-path shape of a
       // frontend artifact below, but per the platform's own restart
       // convention it is NOT restartable - it's the entry point itself.
-      component.labels = restartLabels(isFrontend);
+      component.labels = { ...restartLabels(isFrontend), ...ownershipLabels({ installationId, generation, service: id, artifact }) };
       if (artifact === service.health.component) component.healthcheck = healthcheck(port, service.health.path);
       else if (isFrontend || artifact === "schloss") component.healthcheck = healthcheck(80, "/");
       const dependencies = healthyDependencies(service, catalogById);
@@ -256,7 +276,7 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
       networks: ["hof", "wachter-internal"],
       depends_on: { "wachter-agent": { condition: "service_healthy" } },
       volumes: ["${WACHTER_AGENT_TOKEN_FILE:-/dev/null}:${WACHTER_AGENT_TOKEN_FILE:-/dev/null}:ro"],
-      labels: restartLabels(false),
+      labels: { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "wachter", artifact: "wachter-backend" }) },
       ...wachterHardening(),
     });
 
@@ -276,7 +296,7 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
       ],
       group_add: ["${DOCKER_GID:-998}"],
       healthcheck: healthcheck(3008, "/health"),
-      labels: restartLabels(false),
+      labels: { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "wachter", artifact: "wachter-backend" }) },
       ...wachterHardening(),
     };
     compose.networks["wachter-internal"] = { internal: true };

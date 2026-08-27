@@ -53,6 +53,21 @@
             "component": { "$ref": "#/$defs/identifier" },
             "path": { "type": "string", "pattern": "^/" }
           }
+        },
+        "database": {
+          "description": "Present only for services with a persistent, migratable database - lets hofctl plan emit a typed database.migrate operation instead of relying on MIGRATE_ON_STARTUP (see PLATFORM-OPS-PLAN.md's hofctl plan design). command is exact argv for the artifact's own image, not a shell string - Hof's backends don't share one WORKDIR/CMD layout (schlussel's is root-level, every other backend's is backend/-prefixed), so it must be given per service rather than derived.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["component", "command", "volume"],
+          "properties": {
+            "component": { "$ref": "#/$defs/identifier" },
+            "command": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string" }
+            },
+            "volume": { "$ref": "#/$defs/identifier" }
+          }
         }
       }
     }

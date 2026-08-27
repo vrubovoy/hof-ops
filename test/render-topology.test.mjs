@@ -57,7 +57,10 @@ test("Wächter's two containers get their real port, command, and hardening", as
     assert.deepEqual(service.cap_drop, ["ALL"]);
     assert.deepEqual(service.security_opt, ["no-new-privileges:true"]);
     assert.deepEqual(service.tmpfs, ["/tmp"]);
-    assert.deepEqual(service.labels, { "hof.wachter.critical": "true" });
+    assert.equal(service.labels["hof.wachter.critical"], "true");
+    assert.equal(service.labels["hof.managed"], "true");
+    assert.equal(service.labels["hof.service"], "wachter");
+    assert.equal(service.labels["hof.artifact"], "wachter-backend");
   }
 });
 
@@ -134,4 +137,25 @@ test("renderer rejects mismatched manifest and release-lock releases", async () 
   const contracts = await contractsWith([]);
   contracts.manifest.release = "2.0.0";
   assert.throws(() => renderTopology(contracts), /does not match release lock/);
+});
+
+test("every generated service is labeled with hofctl plan's ownership metadata", async () => {
+  const contracts = await contractsWith(["kuvert", "wachter"]);
+  const rendered = renderTopology({ ...contracts, installationId: "installation-42", generation: 7 });
+
+  for (const [name, service] of Object.entries(rendered.compose.services)) {
+    assert.equal(service.labels["hof.managed"], "true", name);
+    assert.equal(service.labels["hof.installation-id"], "installation-42", name);
+    assert.equal(service.labels["hof.generation"], "7", name);
+    assert.ok(service.labels["hof.service"], name);
+    assert.ok(service.labels["hof.artifact"], name);
+  }
+  assert.equal(rendered.compose.services["kuvert-backend"].labels["hof.service"], "kuvert");
+  assert.equal(rendered.compose.services["kuvert-backend"].labels["hof.artifact"], "kuvert-backend");
+});
+
+test("ownership labels default to an empty installation id and generation zero when unset", async () => {
+  const rendered = renderTopology(await contractsWith([]));
+  assert.equal(rendered.compose.services.schloss.labels["hof.installation-id"], "");
+  assert.equal(rendered.compose.services.schloss.labels["hof.generation"], "0");
 });

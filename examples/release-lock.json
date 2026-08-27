@@ -2,8 +2,8 @@
   "apiVersion": "hof.dev/release-lock/v1",
   "release": "1.0.0",
   "minimumHofctlVersion": "0.1.0",
-  "catalogDigest": "sha256:af32ce7f3bc832068dbf6e7b1ee50743b1f2748cb018a264fcd310307dccff7d",
-  "composeTemplateDigest": "sha256:83920758105013f3fe9d7dfdfe3539855df6f5c468492828ef63c61492b122a6",
+  "catalogDigest": "sha256:af33dd7d105f3f154f890d7dcc60b052078383ab40c9daf7d6e292479f9b6f1c",
+  "composeTemplateDigest": "sha256:cc923d8d2c4782474327a1d1d8ca12a0c06c56c7a0b8919c7a1255b50d3292fa",
   "ansibleEnvironment": {
     "source": "https://github.com/vrubovoy/hof-ops",
     "revision": "1111111111111111111111111111111111111111",

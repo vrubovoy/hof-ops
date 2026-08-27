@@ -108,7 +108,14 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
       `${manifest.tls.privateKeyPath}:/run/hof/tls/private-key.pem:ro`,
     );
   }
-  compose.services.gateway.healthcheck = healthcheck(80, "/");
+  // Deliberately no healthcheck here, matching Tor's own real
+  // docker-compose.yml (it has none for the gateway) - a wget-based probe
+  // can't meaningfully validate ACME certificate acquisition (which can
+  // legitimately take time, retry, or fail transiently against a real
+  // CA, and auto-HTTPS's HTTP->HTTPS redirect means a plain-HTTP probe
+  // doesn't even reach a stable answer either way), and
+  // healthyDependencies() below already excludes "tor" from any other
+  // service's own service_healthy condition, so nothing needs this.
 
   const exportTargets = {};
   const deletionTargets = {};

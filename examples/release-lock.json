@@ -3,7 +3,7 @@
   "release": "1.0.0",
   "minimumHofctlVersion": "0.1.0",
   "catalogDigest": "sha256:af32ce7f3bc832068dbf6e7b1ee50743b1f2748cb018a264fcd310307dccff7d",
-  "composeTemplateDigest": "sha256:45dd9551aae7fb42ada3dcb2d5cab72321eef7d65cb73f505f45a1eb8f4bd6f7",
+  "composeTemplateDigest": "sha256:cae8f3676c9d68475f351fd43434fce9f742a8cefa1adbf6c4433608ee82a4d1",
   "ansibleEnvironment": {
     "source": "https://github.com/vrubovoy/hof-ops",
     "revision": "1111111111111111111111111111111111111111",

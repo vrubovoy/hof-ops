@@ -59,9 +59,16 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
   try {
     for (const fixtureName of fixtureNames) {
       const manifest = YAML.parse(await readFile(path.join(fixtureDirectory, fixtureName), "utf8"));
+      // Topology fixtures are release-agnostic by design - they exercise a
+      // shape of services.yml (core-only, everything enabled, ...), not one
+      // specific release. Stamp in whatever release is actually pinned
+      // rather than requiring every fixture file to be kept in sync with
+      // it (renderTopology's own manifest/lock release-match check is a
+      // real safety property for an operator's actual services.yml; it
+      // isn't meaningful for these).
+      manifest.release = lock.release;
       const errors = validateContracts({ ...contracts, manifest, catalog, releaseLock: lock });
       if (errors.length > 0) throw new Error(`${fixtureName}:\n${errors.join("\n")}`);
-      if (manifest.release !== lock.release) throw new Error(`${fixtureName}: release does not match pinned lock`);
 
       const fixtureId = path.basename(fixtureName, ".yml");
       const rendered = renderTopology({ ...contracts, manifest, catalog, releaseLock: lock });

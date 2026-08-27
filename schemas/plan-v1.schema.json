@@ -93,14 +93,19 @@
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/identifier" }
     },
+    "generatedArtifacts": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/digestOrNull" }
+    },
     "baselineState": {
-      "description": "The last-applied state this plan is diffing from - either loaded from /var/lib/hof/state, or the synthetic empty baseline (mode: bootstrap, generation: 0) on a truly clean host.",
+      "description": "The last-applied state this plan is diffing from - either loaded from /var/lib/hof/state, or the synthetic empty baseline (mode: bootstrap, generation: 0, installationId: null) on a truly clean host.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["mode", "generation", "release", "manifestDigest", "releaseLockDigest", "topologyDigest", "services", "volumes"],
+      "required": ["mode", "generation", "installationId", "release", "manifestDigest", "releaseLockDigest", "topologyDigest", "services", "volumes", "networks", "generatedArtifacts"],
       "properties": {
         "mode": { "enum": ["bootstrap", "applied"] },
         "generation": { "type": "integer", "minimum": 0 },
+        "installationId": { "type": ["string", "null"] },
         "release": { "type": ["string", "null"], "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
         "manifestDigest": { "$ref": "#/$defs/digestOrNull" },
         "releaseLockDigest": { "$ref": "#/$defs/digestOrNull" },
@@ -109,21 +114,24 @@
           "$ref": "#/$defs/digestOrNull"
         },
         "services": { "$ref": "#/$defs/services" },
-        "volumes": { "$ref": "#/$defs/volumes" }
+        "volumes": { "$ref": "#/$defs/volumes" },
+        "networks": { "$ref": "#/$defs/volumes" },
+        "generatedArtifacts": { "$ref": "#/$defs/generatedArtifacts" }
       }
     },
     "desiredState": {
       "description": "What services.yml + the catalog + the release lock render to right now - a plain snapshot, not itself a generation.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["release", "manifestDigest", "releaseLockDigest", "topologyDigest", "services", "volumes"],
+      "required": ["release", "manifestDigest", "releaseLockDigest", "topologyDigest", "services", "volumes", "networks"],
       "properties": {
         "release": { "type": ["string", "null"], "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
         "manifestDigest": { "$ref": "#/$defs/digestOrNull" },
         "releaseLockDigest": { "$ref": "#/$defs/digestOrNull" },
         "topologyDigest": { "$ref": "#/$defs/digestOrNull" },
         "services": { "$ref": "#/$defs/services" },
-        "volumes": { "$ref": "#/$defs/volumes" }
+        "volumes": { "$ref": "#/$defs/volumes" },
+        "networks": { "$ref": "#/$defs/volumes" }
       }
     },
     "driftEntry": {
@@ -133,8 +141,8 @@
       "properties": {
         "resource": { "type": "string" },
         "kind": {
-          "description": "manual-change: observed doesn't match the last-applied baseline for a resource desired still wants. missing: a managed resource baseline expects is gone from Docker. unmanaged: a resource matching this installation's naming exists but carries no hof.managed label.",
-          "enum": ["manual-change", "missing", "unmanaged"]
+          "description": "manual-change: observed doesn't match the last-applied baseline for a resource desired still wants. missing: a managed resource baseline expects is gone from Docker. unmanaged: a resource matching this installation's naming exists but carries no hof.managed label, or belongs to a different installationId entirely. generated-missing: a generated file baseline recorded a checksum for is gone - repairable by config.write. generated-modified: a generated file's live checksum no longer matches what baseline recorded - someone hand-edited it; never silently overwritten.",
+          "enum": ["manual-change", "missing", "unmanaged", "generated-missing", "generated-modified"]
         },
         "detail": { "type": "string" }
       }
@@ -151,11 +159,16 @@
         "action": {
           "enum": [
             "host.prepare", "secret.ensure", "volume.ensure", "image.verify", "image.pull", "config.write",
-            "backup.create", "service.stop", "database.migrate", "service.start", "readiness.wait", "state.commit"
+            "backup.create", "service.stop", "service.remove", "database.migrate", "service.start", "readiness.wait",
+            "state.commit"
           ]
         },
         "resource": { "type": "string" },
         "image": { "type": "string" },
+        "condition": {
+          "description": "Only for readiness.wait - what actually counts as ready for this specific unit. Most units have a real Compose healthcheck and must reach \"healthy\"; the gateway deliberately has none (see render-topology.mjs's own comment on why), so it only ever waits for \"running\".",
+          "enum": ["running", "healthy"]
+        },
         "argv": {
           "description": "Only for database.migrate - the catalog's own database.command for this component, so an approved plan is self-sufficient and apply never has to re-interpret the catalog to know what to run.",
           "type": "array",

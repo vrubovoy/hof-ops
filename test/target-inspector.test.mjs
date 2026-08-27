@@ -27,16 +27,18 @@ function validCurrentJson(overrides = {}) {
   };
 }
 
-// Builds a valid HOF-PROBE-V2 transcript from a plain object of
-// singleton values plus port/container arrays - the same shape
-// target-probe.sh's own output decodes to, without needing a real shell.
-// Every mandatory singleton has a default so a test only has to
-// override the one thing it's exercising.
+// Builds a valid HOF-PROBE-V3 transcript from a plain object of
+// singleton values plus port/container/volume/network arrays - the
+// same shape target-probe.sh's own output decodes to, without needing a
+// real shell. Every mandatory singleton has a default so a test only
+// has to override the one thing it's exercising.
 function probeOutput({
   os = "debian|12", arch = "x86_64", cpu = "4", memory = "8589934592", disk = "53687091200",
-  clock = "yes", sudo = "yes", docker = "27.0.0|2.28.0", dockerResourcesStatus = "available",
+  clock = "yes", sudo = "yes", docker = "27.0.0|2.28.0",
+  dockerContainersStatus = "available", dockerVolumesStatus = "available", dockerNetworksStatus = "available",
   stateCurrentStatus = "absent", stateCurrent = "", stateTopologyStatus = "absent", stateTopology = "",
-  generatedArtifactsStatus = "available", generatedArtifacts = "{}", ports = [], containers = [], version = "HOF-PROBE-V2",
+  generatedArtifactsStatus = "available", generatedArtifacts = "{}",
+  ports = [], containers = [], volumes = [], networks = [], version = "HOF-PROBE-V3",
 } = {}) {
   const lines = [version];
   const record = (name, value) => lines.push(`R ${name} ${b64(value)}`);
@@ -48,9 +50,13 @@ function probeOutput({
   record("clock", clock);
   record("sudo", sudo);
   record("docker", docker);
-  record("docker-resources-status", dockerResourcesStatus);
+  record("docker-containers-status", dockerContainersStatus);
+  record("docker-volumes-status", dockerVolumesStatus);
+  record("docker-networks-status", dockerNetworksStatus);
   for (const port of ports) record("port", port);
   for (const container of containers) record("container", container);
+  for (const volume of volumes) record("volume", volume);
+  for (const network of networks) record("network", network);
   record("state-current-status", stateCurrentStatus);
   record("state-current", stateCurrent);
   record("state-topology-status", stateTopologyStatus);
@@ -70,6 +76,15 @@ function containerRecord({
   ports = "",
 } = {}) {
   return [name, image, state, health, managed, installationId, service, unit, artifact, generation, composeProject, composeService, networks, volumes, ports].join("\x1f");
+}
+
+// The exact field order/count for volume/network records - see
+// RESOURCE_FIELDS in target-inspector.mjs.
+function resourceRecord({
+  name = "kuvert-data", managed = "true", installationId = "inst-1", generation = "1", kind = "volume", resource = "kuvert-data",
+  composeProject = "hof",
+} = {}) {
+  return [name, managed, installationId, generation, kind, resource, composeProject].join("\x1f");
 }
 
 function fakeRun(responses) {
@@ -117,7 +132,7 @@ test("ssh mode builds exactly the hardened argument list, in known-hosts mode", 
   ]);
   // The fixed probe script, verbatim, over stdin - never a caller-built command.
   assert.match(call.options.input, /^#!\/bin\/sh/);
-  assert.match(call.options.input, /HOF-PROBE-V2/);
+  assert.match(call.options.input, /HOF-PROBE-V3/);
 });
 
 test("ssh mode never uses ssh-keyscan when a known-hosts file is supplied", async () => {
@@ -245,7 +260,7 @@ test("rejects a non-finite or non-positive connectTimeoutSeconds instead of sile
 });
 
 test("an oversized transcript is rejected by the protocol-level line bound, independent of execFile's own maxBuffer", async () => {
-  const huge = "HOF-PROBE-V2\n" + Array.from({ length: 3000 }, (_, i) => `R port ${b64(`${8000 + i}|free`)}`).join("\n") + "\nEND\n";
+  const huge = "HOF-PROBE-V3\n" + Array.from({ length: 3000 }, (_, i) => `R port ${b64(`${8000 + i}|free`)}`).join("\n") + "\nEND\n";
   const run = fakeRun({ sh: { stdout: huge, stderr: "" } });
   await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /more than the 2000-line bound/);
 });
@@ -257,8 +272,8 @@ test("a truncated transcript (no END) is rejected, not silently accepted as part
 });
 
 test("a wrong version marker is rejected", async () => {
-  const run = fakeRun({ sh: { stdout: probeOutput({ version: "HOF-PROBE-V1" }), stderr: "" } });
-  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /does not start with the expected HOF-PROBE-V2 marker/);
+  const run = fakeRun({ sh: { stdout: probeOutput({ version: "HOF-PROBE-V2" }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /does not start with the expected HOF-PROBE-V3 marker/);
 });
 
 test("an unrecognized record name is rejected, not ignored", async () => {
@@ -330,8 +345,39 @@ test("an out-of-range published port on a container is rejected", async () => {
   await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /published port 99999 is out of range/);
 });
 
+test("a volume/network record with the wrong field count is rejected", async () => {
+  const run = fakeRun({ sh: { stdout: probeOutput({ volumes: ["too\x1ffew"] }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /has 2 fields, expected exactly 7/);
+});
+
+test("an unrecognized availability status (e.g. a typo) is rejected, never silently read as unavailable or available", async () => {
+  const run = fakeRun({ sh: { stdout: probeOutput({ dockerContainersStatus: "availble" }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /probe record docker-containers-status has an unrecognized status/);
+});
+
+test("an unrecognized state-file status (e.g. \"presnt\") is rejected, never silently falls through to absent", async () => {
+  const run = fakeRun({ sh: { stdout: probeOutput({ stateCurrentStatus: "presnt" }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /probe record state-current-status has an unrecognized status/);
+});
+
+test("status/payload consistency: \"present\" with an empty payload is rejected", async () => {
+  const run = fakeRun({ sh: { stdout: probeOutput({ stateCurrentStatus: "present", stateCurrent: "" }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /is "present" but state-current is empty/);
+});
+
+test("status/payload consistency: \"absent\" with a non-empty payload is rejected", async () => {
+  const run = fakeRun({ sh: { stdout: probeOutput({ stateCurrentStatus: "absent", stateCurrent: JSON.stringify(validCurrentJson()) }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /is "absent" but state-current is unexpectedly non-empty/);
+});
+
 test("a state-current that fails schemas/state-v1.schema.json is rejected, not silently trusted", async () => {
   const invalid = JSON.stringify({ apiVersion: "hof.dev/state/v1" }); // missing every other required field
+  const run = fakeRun({ sh: { stdout: probeOutput({ stateCurrentStatus: "present", stateCurrent: invalid }), stderr: "" } });
+  await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /does not satisfy schemas\/state-v1\.schema\.json/);
+});
+
+test("a real current.json with generation: 0 fails schema validation - only the in-memory synthetic baseline may ever claim generation 0", async () => {
+  const invalid = JSON.stringify(validCurrentJson({ generation: 0 }));
   const run = fakeRun({ sh: { stdout: probeOutput({ stateCurrentStatus: "present", stateCurrent: invalid }), stderr: "" } });
   await assert.rejects(() => inspectTarget({ targetMode: "local", run }), /does not satisfy schemas\/state-v1\.schema\.json/);
 });
@@ -357,6 +403,16 @@ test("the parsed snapshot exposes only the whitelisted container fields - no Con
   ].sort());
   const serialized = JSON.stringify(snapshot);
   assert.doesNotMatch(serialized, /DATABASE_PATH|SECRET|PASSWORD|\/var\/lib\/docker|bind/i);
+});
+
+test("the parsed snapshot exposes only the whitelisted volume/network fields", async () => {
+  const run = fakeRun({ sh: { stdout: probeOutput({ volumes: [resourceRecord()], networks: [resourceRecord({ name: "hof", kind: "network", resource: "hof" })] }), stderr: "" } });
+  const snapshot = await inspectTarget({ targetMode: "local", run });
+
+  assert.equal(snapshot.docker.volumes.length, 1);
+  assert.deepEqual(Object.keys(snapshot.docker.volumes[0]).sort(), ["composeProject", "generation", "installationId", "kind", "managed", "name", "resource"].sort());
+  assert.equal(snapshot.docker.networks.length, 1);
+  assert.equal(snapshot.docker.networks[0].kind, "network");
 });
 
 test("port ownership is resolved only from a container matching this installation's own recorded installationId, actually running", async () => {
@@ -390,15 +446,23 @@ test("port ownership never claims anything as 'ours' when there is no recorded i
   assert.equal(snapshot.ports.find((p) => p.port === 80).owner, "foreign");
 });
 
-test("docker-resources-status distinguishes 'Docker is fine, nothing running' from 'the container listing itself failed'", async () => {
-  const runAvailable = fakeRun({ sh: { stdout: probeOutput({ dockerResourcesStatus: "available" }), stderr: "" } });
+test("docker-{containers,volumes,networks}-status each independently distinguish 'nothing there' from 'the listing itself failed'", async () => {
+  const runAvailable = fakeRun({ sh: { stdout: probeOutput(), stderr: "" } });
   const available = await inspectTarget({ targetMode: "local", run: runAvailable });
-  assert.equal(available.docker.resourcesStatus, "available");
+  assert.equal(available.docker.containersStatus, "available");
+  assert.equal(available.docker.volumesStatus, "available");
+  assert.equal(available.docker.networksStatus, "available");
   assert.deepEqual(available.docker.resources, []);
+  assert.deepEqual(available.docker.volumes, []);
+  assert.deepEqual(available.docker.networks, []);
 
-  const runUnavailable = fakeRun({ sh: { stdout: probeOutput({ dockerResourcesStatus: "unavailable" }), stderr: "" } });
+  const runUnavailable = fakeRun({
+    sh: { stdout: probeOutput({ dockerContainersStatus: "unavailable", dockerVolumesStatus: "unavailable", dockerNetworksStatus: "unavailable" }), stderr: "" },
+  });
   const unavailable = await inspectTarget({ targetMode: "local", run: runUnavailable });
-  assert.equal(unavailable.docker.resourcesStatus, "unavailable");
+  assert.equal(unavailable.docker.containersStatus, "unavailable");
+  assert.equal(unavailable.docker.volumesStatus, "unavailable");
+  assert.equal(unavailable.docker.networksStatus, "unavailable");
 });
 
 test("state file present/absent/unreadable statuses all parse distinctly", async () => {

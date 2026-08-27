@@ -150,24 +150,39 @@ test("a wrong identity key is refused by real publickey auth, not silently treat
   }
 });
 
-test("Docker genuinely absent from the target is reported as unavailable, not an empty-but-fine host", async () => {
+test("Docker genuinely absent from the target is reported as unavailable on all three resource kinds, not an empty-but-fine host", async () => {
   const snapshot = await inspectTarget({
     targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
     identityFile: userKeyPath, knownHostsFile: knownHostsPath, connectTimeoutSeconds: 10,
   });
   assert.equal(snapshot.docker.engineAvailable, false);
   assert.equal(snapshot.docker.composeAvailable, false);
-  assert.equal(snapshot.docker.resourcesStatus, "unavailable");
+  assert.equal(snapshot.docker.containersStatus, "unavailable");
+  assert.equal(snapshot.docker.volumesStatus, "unavailable");
+  assert.equal(snapshot.docker.networksStatus, "unavailable");
+  assert.deepEqual(snapshot.docker.resources, []);
+  assert.deepEqual(snapshot.docker.volumes, []);
+  assert.deepEqual(snapshot.docker.networks, []);
 });
 
-test("managed state genuinely absent on a fresh container reads as absent, not unreadable", async () => {
+// This fixture's hofprobe user deliberately has no sudoers entry at all
+// (see the "no sudo, mode 600" test below) - under the
+// positive-confirmation-only absence policy, that means a missing state
+// file can never be reported as "absent" (only root can positively
+// confirm non-existence); it's "unreadable", exactly like a permission
+// wall would be. A real production target must have passwordless sudo
+// anyway (hofctl preflight's own checkSudo already requires it) - the
+// genuine "absent, positively confirmed via sudo" path is covered by
+// target-probe.test.mjs's own real-shell (fake-sudo) execution instead.
+test("managed state on a fresh container with no sudo access reads as unreadable, never guessed as absent", async () => {
   const snapshot = await inspectTarget({
     targetMode: "ssh", host: "127.0.0.1", port: hostPort, user: "hofprobe",
     identityFile: userKeyPath, knownHostsFile: knownHostsPath, connectTimeoutSeconds: 10,
   });
-  assert.equal(snapshot.managedState.currentStatus, "absent");
+  assert.equal(snapshot.host.sudoNonInteractive, false);
+  assert.equal(snapshot.managedState.currentStatus, "unreadable");
   assert.equal(snapshot.managedState.current, null);
-  assert.equal(snapshot.managedState.topologyStatus, "absent");
+  assert.equal(snapshot.managedState.topologyStatus, "unreadable");
 });
 
 test("a real, readable current.json on the target parses through as genuine JSON content over the real transport", async () => {

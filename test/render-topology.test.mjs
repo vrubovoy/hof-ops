@@ -163,6 +163,27 @@ test("every generated service is labeled with hofctl plan's ownership metadata",
   assert.notEqual(rendered.compose.services.wachter.labels["hof.unit"], rendered.compose.services["wachter-agent"].labels["hof.unit"]);
 });
 
+test("every named volume and network is also labeled for orphan detection", async () => {
+  const contracts = await contractsWith(["kuvert", "wachter"]);
+  const rendered = renderTopology({ ...contracts, installationId: "installation-42", generation: 7 });
+
+  for (const [name, volume] of Object.entries(rendered.compose.volumes)) {
+    assert.equal(volume.labels["hof.managed"], "true", name);
+    assert.equal(volume.labels["hof.installation-id"], "installation-42", name);
+    assert.equal(volume.labels["hof.generation"], "7", name);
+    assert.equal(volume.labels["hof.kind"], "volume", name);
+    assert.equal(volume.labels["hof.resource"], name, name);
+  }
+  assert.ok(rendered.compose.volumes["kuvert-data"], "kuvert's own volume is rendered and labeled");
+
+  for (const [name, network] of Object.entries(rendered.compose.networks)) {
+    assert.equal(network.labels["hof.managed"], "true", name);
+    assert.equal(network.labels["hof.kind"], "network", name);
+    assert.equal(network.labels["hof.resource"], name, name);
+  }
+  assert.ok(rendered.compose.networks["wachter-internal"], "wachter's own internal network is rendered and labeled");
+});
+
 test("ownership labels default to an empty installation id and generation zero when unset", async () => {
   const rendered = renderTopology(await contractsWith([]));
   assert.equal(rendered.compose.services.schloss.labels["hof.installation-id"], "");

@@ -55,6 +55,18 @@ function parsePositiveNumber(rawValue, flagName) {
   return value;
 }
 
+// target-inspector.mjs's own connectTimeoutSeconds contract is a
+// positive integer (0 or fractional seconds both rejected there too) -
+// this must reject the same values here, at the CLI boundary, rather
+// than let a "5.5" or "0" through only to fail deeper inside a real SSH
+// connection attempt.
+function parsePositiveInteger(rawValue, flagName) {
+  if (rawValue === undefined) return undefined;
+  const value = Number(rawValue);
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${flagName} must be a positive integer, got ${JSON.stringify(rawValue)}`);
+  return value;
+}
+
 const [command, ...args] = process.argv.slice(2);
 
 if (command === "render") {
@@ -118,7 +130,7 @@ if (command === "render") {
       usage("--target-mode local does not accept --known-hosts/--host-key-sha256/--identity-file");
     } else {
       try {
-        const connectTimeoutSeconds = parsePositiveNumber(options.connectTimeoutSeconds, "--connect-timeout-seconds");
+        const connectTimeoutSeconds = parsePositiveInteger(options.connectTimeoutSeconds, "--connect-timeout-seconds");
         const minFreeDiskGb = parsePositiveNumber(options.minFreeDiskGb, "--min-free-disk-gb");
         const minMemoryGb = parsePositiveNumber(options.minMemoryGb, "--min-memory-gb");
         const minCpuCores = parsePositiveNumber(options.minCpuCores, "--min-cpu-cores");
@@ -139,7 +151,7 @@ if (command === "render") {
         console.log(JSON.stringify({ type: "preflight.result", ok }));
         if (!ok) process.exitCode = 1;
       } catch (error) {
-        if (/must be a non-negative number/.test(error?.message ?? "")) {
+        if (/must be a (non-negative number|positive integer)/.test(error?.message ?? "")) {
           usage(error.message);
         } else {
           console.log(JSON.stringify({ type: "preflight.fatal", message: error instanceof Error ? error.message : String(error) }));

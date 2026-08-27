@@ -1,0 +1,7 @@
+#!/usr/bin/env node
+// Fake "docker" for target-probe.test.mjs's real-shell-execution
+// scenarios - always denied when invoked directly, so target-probe.sh's
+// own docker_run() is forced down its sudo-fallback path (see ./sudo,
+// which actually answers docker commands). Never used outside this
+// fixture's fake PATH.
+process.exit(1);

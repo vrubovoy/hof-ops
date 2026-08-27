@@ -9,7 +9,9 @@
 // hofctl, and is it genuinely signed.
 
 import { execFile } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -52,7 +54,19 @@ async function fileExists(filePath) {
   }
 }
 
-async function verifyReleaseLockSignature(releaseLockPath, options) {
+// releaseLockBytes is the EXACT content already read into memory and
+// parsed into the releaseLock object this whole deployment (and, for
+// hofctl plan, the rendered topology) is built from - cosign verifies a
+// pathname, not bytes, so handing it releaseLockPath directly would
+// re-read the file a second time and could verify a signature against
+// different content than what was actually validated/planned if the
+// file was replaced in between (a real TOCTOU, not just a theoretical
+// one - nothing here holds any kind of lock on that path). Pinning the
+// already-read bytes into a fresh, immutable temp file before ever
+// invoking cosign closes that gap: cosign genuinely verifies the same
+// bytes this process already parsed, not whatever now happens to sit at
+// releaseLockPath.
+async function verifyReleaseLockSignature(releaseLockPath, releaseLockBytes, options) {
   const signaturePath = options.releaseLockSignature ?? `${releaseLockPath}.sig`;
   const certificatePath = options.releaseLockCertificate ?? `${releaseLockPath}.pem`;
   if (!(await fileExists(signaturePath)) || !(await fileExists(certificatePath))) {
@@ -61,6 +75,9 @@ async function verifyReleaseLockSignature(releaseLockPath, options) {
   if (!options.releaseLockIdentity) {
     return ["release lock: --release-lock-identity is required to verify a signature against (the expected signing workflow's identity)"];
   }
+
+  const pinnedBlobPath = path.join(tmpdir(), `hof-release-lock-${randomUUID()}.json`);
+  await writeFile(pinnedBlobPath, releaseLockBytes, { mode: 0o600 });
   try {
     await exec("cosign", [
       "verify-blob",
@@ -68,11 +85,13 @@ async function verifyReleaseLockSignature(releaseLockPath, options) {
       "--signature", signaturePath,
       "--certificate-identity", options.releaseLockIdentity,
       "--certificate-oidc-issuer", options.releaseLockOidcIssuer ?? "https://token.actions.githubusercontent.com",
-      releaseLockPath,
+      pinnedBlobPath,
     ]);
     return [];
   } catch (error) {
     return [`release lock: signature verification failed: ${error instanceof Error ? error.message : error}`];
+  } finally {
+    await unlink(pinnedBlobPath).catch(() => {});
   }
 }
 
@@ -139,7 +158,7 @@ export async function loadAndValidateDeployment(options) {
     // "passed".
     errors.push("release lock signature check was explicitly skipped (--skip-signature) - do not apply with this flag set");
   } else {
-    errors.push(...await verifyReleaseLockSignature(options.releaseLockPath, options));
+    errors.push(...await verifyReleaseLockSignature(options.releaseLockPath, releaseLockBytes, options));
   }
 
   return { errors, manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema };

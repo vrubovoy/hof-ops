@@ -141,8 +141,8 @@
       "properties": {
         "resource": { "type": "string" },
         "kind": {
-          "description": "manual-change: observed doesn't match the last-applied baseline for a resource desired still wants. missing: a managed resource baseline expects is gone from Docker. unmanaged: a resource matching this installation's naming exists but carries no hof.managed label, or belongs to a different installationId entirely. generated-missing: a generated file baseline recorded a checksum for is gone - repairable by config.write. generated-modified: a generated file's live checksum no longer matches what baseline recorded - someone hand-edited it; never silently overwritten.",
-          "enum": ["manual-change", "missing", "unmanaged", "generated-missing", "generated-modified"]
+          "description": "manual-change: observed doesn't match the last-applied baseline for a resource desired still wants. missing: a managed resource baseline expects is gone from Docker. unmanaged: a resource matching this installation's naming exists but carries no hof.managed label, or belongs to a different installationId entirely. generated-missing: a generated file baseline recorded a checksum for is positively confirmed gone - repairable by config.write. generated-modified: a generated file's live checksum no longer matches what baseline recorded - someone hand-edited it; never silently overwritten. generated-unreadable: a generated file baseline recorded a checksum for exists but couldn't be read even with sudo - genuinely unknown whether it's missing, modified, or untouched; never auto-repaired, --repair-drift or not.",
+          "enum": ["manual-change", "missing", "unmanaged", "generated-missing", "generated-modified", "generated-unreadable"]
         },
         "detail": { "type": "string" }
       }
@@ -158,9 +158,9 @@
         },
         "action": {
           "enum": [
-            "host.prepare", "secret.ensure", "volume.ensure", "image.verify", "image.pull", "config.write",
-            "backup.create", "service.stop", "service.remove", "database.migrate", "service.start", "readiness.wait",
-            "state.commit"
+            "host.prepare", "secret.ensure", "volume.ensure", "network.ensure", "image.verify", "image.pull",
+            "config.write", "backup.create", "service.stop", "service.remove", "database.migrate", "service.start",
+            "readiness.wait", "state.commit"
           ]
         },
         "resource": { "type": "string" },

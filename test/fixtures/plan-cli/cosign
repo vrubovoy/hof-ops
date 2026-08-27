@@ -1,13 +1,35 @@
 #!/usr/bin/env node
-// Fake "cosign" for plan-command tests - verifyReleaseLockSignature()
-// (scripts/validate-deployment.mjs) invokes the real `cosign verify-blob`
-// argv shape; this answers it without a real Sigstore/OIDC round trip,
-// scripted by HOF_TEST_COSIGN_OUTCOME so both the "genuinely valid,
-// signed deployment" and "signature verification failed" paths can be
+// Fake "cosign" for plan-command/validate-deployment tests -
+// verifyReleaseLockSignature() (scripts/validate-deployment.mjs)
+// invokes the real `cosign verify-blob` argv shape; this answers it
+// without a real Sigstore/OIDC round trip, scripted by
+// HOF_TEST_COSIGN_OUTCOME so both the "genuinely valid, signed
+// deployment" and "signature verification failed" paths can be
 // exercised for real through runPlan()/the real CLI.
+//
+// HOF_TEST_COSIGN_RECORD_BLOB, if set, additionally copies the exact
+// bytes of the blob argument cosign was actually asked to verify to
+// that path - lets a test prove which bytes really reached cosign
+// (the caller's already-pinned temp copy, not a fresh, possibly
+// mutated re-read of the original release-lock.json) without needing a
+// real signing/verification round trip at all.
+//
+// HOF_TEST_COSIGN_MUTATE_PATH, if set, overwrites that path with
+// tampered content FIRST, before recording the blob argument - lets a
+// test simulate "the original file was replaced during the
+// verification window" deterministically (no real race needed): if the
+// recorded blob still matches the pre-mutation bytes, verification
+// genuinely used a pinned copy, not a live re-read of the mutated path.
+const fs = require("node:fs");
+
 const outcome = process.env.HOF_TEST_COSIGN_OUTCOME ?? "success";
-if (process.argv[2] === "verify-blob" && outcome === "success") {
-  process.exit(0);
+const recordBlobTo = process.env.HOF_TEST_COSIGN_RECORD_BLOB;
+const mutatePath = process.env.HOF_TEST_COSIGN_MUTATE_PATH;
+if (process.argv[2] === "verify-blob") {
+  if (mutatePath) fs.writeFileSync(mutatePath, "{\"tampered\":true}");
+  const blobPath = process.argv.at(-1);
+  if (recordBlobTo) fs.copyFileSync(blobPath, recordBlobTo);
+  if (outcome === "success") process.exit(0);
 }
 process.stderr.write("Error: no matching signatures\n");
 process.exit(1);

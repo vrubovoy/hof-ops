@@ -1,5 +1,5 @@
 #!/bin/sh
-# HOF-PROBE-V3 - a single, fixed, versioned, read-only probe run on the
+# HOF-PROBE-V4 - a single, fixed, versioned, read-only probe run on the
 # target host (over SSH via `sh -s`, or locally under --target-mode
 # local). Never takes arguments, manifest values, or any other
 # caller-supplied input - the one thing this script does is describe the
@@ -27,7 +27,7 @@ record() {
   printf 'R %s %s\n' "$1" "$(b64 "$2")"
 }
 
-echo 'HOF-PROBE-V3'
+echo 'HOF-PROBE-V4'
 
 # --- os / arch --------------------------------------------------------
 if [ -r /etc/os-release ]; then
@@ -255,27 +255,48 @@ read_fixed_file /var/lib/hof/state/current.json state-current
 read_fixed_file /var/lib/hof/state/topology.json state-topology
 
 # --- generated artifact checksums (fixed filename list, never a
-# caller-supplied path) - same sudo-aware read as the state files.
+# caller-supplied path) - same sudo-aware, positive-confirmation-only
+# read as the state files (see read_fixed_file above), applied per file:
 # generated-artifacts-status distinguishes "sha256sum genuinely isn't on
-# this target at all" from "it's available and each file was
-# individually present or not". ---
+# this target at all" from "it's available and each file gets its own
+# present|absent|unreadable status". A file that exists but couldn't be
+# hashed even with sudo (a permission wall this script can't see past)
+# must never be indistinguishable from one that's genuinely gone - a
+# planner that can't tell them apart would treat a merely-unreadable
+# file as safe to silently regenerate, exactly like it does a real
+# missing one.
 if command -v sha256sum >/dev/null 2>&1; then
   record generated-artifacts-status available
   artifacts_json="{"
   first=1
   for name in compose.yml Caddyfile service.env runtime-config.json backup-inventory.json topology.json; do
     file_path="/etc/hof/generated/${name}"
-    sum=""
+    status=""
+    digest="null"
     if [ -r "$file_path" ]; then
-      sum=$(sha256sum "$file_path" | awk '{ print $1 }')
+      status="present"
+      digest="\"sha256:$(sha256sum "$file_path" | awk '{ print $1 }')\""
     elif [ "$sudo_reads" = "1" ]; then
       sum=$(sudo -n sha256sum "$file_path" 2>/dev/null | awk '{ print $1 }' || true)
+      if [ -n "$sum" ]; then
+        status="present"
+        digest="\"sha256:${sum}\""
+      elif sudo -n test -e "$file_path" 2>/dev/null; then
+        # Root confirms it exists, but even root couldn't hash it.
+        status="unreadable"
+      else
+        # Root positively confirms it does not exist.
+        status="absent"
+      fi
+    else
+      # No verified sudo file-read capability - "not directly readable"
+      # could mean either absent or permission-walled, and those are not
+      # the same thing. Never guess.
+      status="unreadable"
     fi
-    if [ -n "$sum" ]; then
-      [ "$first" = 1 ] || artifacts_json="${artifacts_json},"
-      artifacts_json="${artifacts_json}\"${name}\":\"sha256:${sum}\""
-      first=0
-    fi
+    [ "$first" = 1 ] || artifacts_json="${artifacts_json},"
+    artifacts_json="${artifacts_json}\"${name}\":{\"status\":\"${status}\",\"digest\":${digest}}"
+    first=0
   done
   artifacts_json="${artifacts_json}}"
   record generated-artifacts "$artifacts_json"

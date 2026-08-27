@@ -124,18 +124,22 @@ if (command === "render") {
 } else if (command === "validate") {
   const options = parseFlags(args);
   if (options) {
-    resolvePaths(options, [
-      "servicesPath", "catalogPath", "releaseLockPath", "releaseSelectionPath", "stableChannelPath",
-      "releaseLockSignature", "releaseLockCertificate",
-    ]);
     // hofctl's own CLI vocabulary matches render's (--services,
-    // --release-lock, --catalog); validateDeployment's option names are
-    // the more explicit *Path forms shared with its own standalone CLI.
+    // --release-lock, --catalog, --release-selection, --stable-channel);
+    // validateDeployment's own option names are the more explicit *Path
+    // forms shared with its own standalone CLI - every one of these five
+    // needs remapping, not just the first three (a --release-selection/
+    // --stable-channel value was previously resolved to a key
+    // (releaseSelectionPath/stableChannelPath) that parseFlags() never
+    // actually produced, so the file was silently never read at all).
+    resolvePaths(options, ["services", "catalog", "releaseLock", "releaseSelection", "stableChannel", "releaseLockSignature", "releaseLockCertificate"]);
     const normalized = {
       ...options,
-      servicesPath: options.services ? path.resolve(options.services) : options.servicesPath,
-      releaseLockPath: options.releaseLock ? path.resolve(options.releaseLock) : options.releaseLockPath,
-      catalogPath: options.catalog ? path.resolve(options.catalog) : options.catalogPath,
+      servicesPath: options.services,
+      releaseLockPath: options.releaseLock,
+      catalogPath: options.catalog,
+      releaseSelectionPath: options.releaseSelection,
+      stableChannelPath: options.stableChannel,
     };
     if (!normalized.servicesPath || !normalized.releaseLockPath) {
       usage("validate requires --services and --release-lock");

@@ -61,11 +61,20 @@ function observedMatching(baseline) {
       : [],
   );
   const asResourceRecord = (name, kind) => ({ resource: name, name, managed: true, installationId: baseline.installationId, kind, composeProject: "hof" });
+  // baseline.generatedArtifacts is the flat filename->digest shape
+  // current.json itself records (state-v1); the live observation's own
+  // shape is filename->{status, digest} per file (see
+  // target-inspector.mjs's parseGeneratedArtifacts) - "matching" means
+  // every baseline-recorded digest is reported "present" with that
+  // exact digest.
+  const generatedArtifacts = Object.fromEntries(
+    Object.entries(baseline.generatedArtifacts ?? {}).map(([filename, digest]) => [filename, { status: "present", digest }]),
+  );
   return {
     containersStatus: "available", resources,
     volumesStatus: "available", volumes: baseline.volumes.map((name) => asResourceRecord(name, "volume")),
     networksStatus: "available", networks: baseline.networks.map((name) => asResourceRecord(name, "network")),
-    generatedArtifactsStatus: "available", generatedArtifacts: { ...baseline.generatedArtifacts },
+    generatedArtifactsStatus: "available", generatedArtifacts,
   };
 }
 
@@ -397,17 +406,17 @@ test("missing network: a baseline-expected network that's gone from Docker is sa
   const plan = buildDesired({ baseline, rendered, contracts, observation });
   assert.equal(plan.executable, true);
   assert.deepEqual(plan.blockers, []);
-  const repair = plan.operations.find((o) => o.action === "volume.ensure" && o.resource === "hof");
-  assert.ok(repair, "a missing network is repaired via the same volume.ensure-shaped operation");
+  const repair = plan.operations.find((o) => o.action === "network.ensure" && o.resource === "hof");
+  assert.ok(repair, "a missing network is repaired via its own typed network.ensure operation");
   assert.match(repair.reason, /recreate a missing network/);
 });
 
-test("generated-file drift: a missing generated file is always auto-repaired via config.write, with no blocker either way", async () => {
+test("generated-file drift: a positively-confirmed-absent generated file is always auto-repaired via config.write, with no blocker either way", async () => {
   const { contracts, rendered } = await fixture();
   const digest = "sha256:" + "d".repeat(64);
   const baseline = baselineFrom(rendered, contracts.catalog, 1, { generatedArtifacts: { "compose.yml": digest } });
   const observation = observedMatching(baseline);
-  observation.generatedArtifacts = {}; // the file is simply gone
+  observation.generatedArtifacts = { "compose.yml": { status: "absent", digest: null } };
 
   for (const repairDrift of [false, true]) {
     const plan = buildDesired({ baseline, rendered, contracts, observation, repairDrift });
@@ -423,7 +432,7 @@ test("generated-file drift: a hand-modified generated file is a blocker unless -
   const observedDigest = "sha256:" + "e".repeat(64);
   const baseline = baselineFrom(rendered, contracts.catalog, 1, { generatedArtifacts: { "compose.yml": baselineDigest } });
   const observation = observedMatching(baseline);
-  observation.generatedArtifacts = { "compose.yml": observedDigest };
+  observation.generatedArtifacts = { "compose.yml": { status: "present", digest: observedDigest } };
 
   const blocked = buildDesired({ baseline, rendered, contracts, observation });
   assert.equal(blocked.executable, false);
@@ -437,12 +446,33 @@ test("generated-file drift: a hand-modified generated file is a blocker unless -
   assert.ok(repaired.warnings.some((warning) => warning.includes("generated/compose.yml")), "still surfaced as a warning even once repaired");
 });
 
+// A file that exists but couldn't be hashed even with sudo must never
+// be treated the same as one positively confirmed gone - config.write
+// might otherwise silently clobber something that isn't actually
+// missing at all. Never auto-repaired, not even with --repair-drift,
+// unlike every other generated-file drift kind.
+test("generated-file drift: an unreadable generated file (exists, but couldn't be hashed even with sudo) always blocks, is never folded into a repair, --repair-drift or not", async () => {
+  const { contracts, rendered } = await fixture();
+  const digest = "sha256:" + "d".repeat(64);
+  const baseline = baselineFrom(rendered, contracts.catalog, 1, { generatedArtifacts: { "compose.yml": digest } });
+  const observation = observedMatching(baseline);
+  observation.generatedArtifacts = { "compose.yml": { status: "unreadable", digest: null } };
+
+  for (const repairDrift of [false, true]) {
+    const plan = buildDesired({ baseline, rendered, contracts, observation, repairDrift });
+    assert.equal(plan.executable, false, `repairDrift=${repairDrift}`);
+    assert.ok(plan.drift.some((entry) => entry.kind === "generated-unreadable" && entry.resource === "generated/compose.yml"), `repairDrift=${repairDrift}`);
+    assert.ok(plan.blockers.some((blocker) => blocker.includes("generated/compose.yml") && blocker.includes("could not be read")), `repairDrift=${repairDrift}`);
+    assert.ok(!plan.operations.some((o) => o.action === "config.write"), `repairDrift=${repairDrift}: never silently regenerated`);
+  }
+});
+
 test("generated-file drift: a regenerated Caddyfile forces the gateway to actually restart, not just config.write", async () => {
   const { contracts, rendered } = await fixture();
   const digest = "sha256:" + "d".repeat(64);
   const baseline = baselineFrom(rendered, contracts.catalog, 1, { generatedArtifacts: { Caddyfile: digest } });
   const observation = observedMatching(baseline);
-  observation.generatedArtifacts = {};
+  observation.generatedArtifacts = { Caddyfile: { status: "absent", digest: null } };
 
   const plan = buildDesired({ baseline, rendered, contracts, observation });
   assert.ok(plan.operations.some((o) => o.action === "service.stop" && o.resource === "gateway"));
@@ -456,7 +486,7 @@ test("generated-file drift: a non-Caddyfile file (e.g. compose.yml) never trigge
   const digest = "sha256:" + "d".repeat(64);
   const baseline = baselineFrom(rendered, contracts.catalog, 1, { generatedArtifacts: { "compose.yml": digest } });
   const observation = observedMatching(baseline);
-  observation.generatedArtifacts = {};
+  observation.generatedArtifacts = { "compose.yml": { status: "absent", digest: null } };
 
   const plan = buildDesired({ baseline, rendered, contracts, observation });
   assert.ok(!plan.operations.some((o) => o.resource === "gateway"));

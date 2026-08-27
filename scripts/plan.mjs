@@ -158,20 +158,33 @@ function computeMissingResources(baseline, kind, status, list) {
 }
 
 // Compares baseline's own recorded checksums (from the last successful
-// apply) against what's actually on disk right now. A missing file is
-// auto-repairable (config.write regenerates it); a modified one is
-// never silently overwritten - see computeBlockers/buildOperations for
-// how each kind is actually handled.
+// apply) against what's actually on disk right now, using each file's
+// own present|absent|unreadable status (see target-inspector.mjs's
+// parseGeneratedArtifacts) rather than just "is there a digest" - a
+// positively-confirmed-absent file is auto-repairable (config.write
+// regenerates it); a modified one is never silently overwritten; an
+// unreadable one (exists, but couldn't be hashed even with sudo) is
+// genuinely unknown territory - it might be exactly what baseline
+// expects, might be hand-modified, might be about to be deleted - and
+// must never be folded into "missing" just because there's no digest to
+// compare (that would let a merely permission-walled file be silently
+// regenerated as if it were confirmed gone). See computeBlockers/
+// buildOperations for how each kind is actually handled.
 function computeGeneratedDrift(baseline, observation) {
   if (observation.generatedArtifactsStatus !== "available") return [];
   const drift = [];
   for (const [filename, expectedDigest] of Object.entries(baseline.generatedArtifacts ?? {})) {
     if (!expectedDigest) continue;
-    const observedDigest = observation.generatedArtifacts?.[filename] ?? null;
-    if (!observedDigest) {
+    const observed = observation.generatedArtifacts?.[filename];
+    if (!observed || observed.status === "unreadable") {
+      drift.push({
+        resource: `generated/${filename}`, kind: "generated-unreadable",
+        detail: `expected sha256 ${expectedDigest}, could not be read (even with sudo) - refusing to guess whether it's missing or merely permission-walled`,
+      });
+    } else if (observed.status === "absent") {
       drift.push({ resource: `generated/${filename}`, kind: "generated-missing", detail: `expected sha256 ${expectedDigest}, file is missing` });
-    } else if (observedDigest !== expectedDigest) {
-      drift.push({ resource: `generated/${filename}`, kind: "generated-modified", detail: `expected sha256 ${expectedDigest}, observed ${observedDigest}` });
+    } else if (observed.digest !== expectedDigest) {
+      drift.push({ resource: `generated/${filename}`, kind: "generated-modified", detail: `expected sha256 ${expectedDigest}, observed ${observed.digest}` });
     }
   }
   return drift;
@@ -302,7 +315,12 @@ function buildOperations({ baseline, desired, create, update, remove, migrations
   for (const volume of newVolumes) next(`volume.ensure.${volume}`, "volume", "volume.ensure", volume, { reason: "new persistent volume" });
   // A network is stateless - unlike a volume, a baseline-expected one
   // that's simply gone is safe to just recreate rather than block on.
-  for (const network of missingNetworks) next(`network.ensure.${network}`, "volume", "volume.ensure", network, { reason: "recreate a missing network" });
+  // Its own typed action (network.ensure), not volume.ensure reused - a
+  // consumer that only knows how to act on the operation's own `action`
+  // field (an apply executor, an audit log) must be able to tell "make
+  // sure this named volume exists" and "make sure this named network
+  // exists" apart without also reading `resource`/`reason` text.
+  for (const network of missingNetworks) next(`network.ensure.${network}`, "volume", "network.ensure", network, { reason: "recreate a missing network" });
 
   for (const entry of [...create, ...update].filter((entry) => entry.imageChanged)) {
     next(`image.verify.${entry.service}.${entry.unit}`, "image", "image.verify", entry.unit, { image: entry.image ?? entry.toImage, reason: "confirm the release-locked, hofctl validate-approved image" });
@@ -384,6 +402,13 @@ function computeBlockers({ baseline, observation, migrationBlockers, drift, gene
   for (const entry of generatedDrift) {
     if (entry.kind === "generated-modified" && !repairDrift) {
       blockers.push(`${entry.resource}: ${entry.detail} (a hand-modified generated file is never silently overwritten - pass --repair-drift to restore it)`);
+    }
+    // Unlike a positively-confirmed-missing file, an unreadable one is
+    // never auto-repaired even with --repair-drift - it might not
+    // actually be gone at all, and config.write would silently clobber
+    // whatever's really there.
+    if (entry.kind === "generated-unreadable") {
+      blockers.push(`${entry.resource}: ${entry.detail}`);
     }
   }
   for (const volume of missingVolumes) {

@@ -9,6 +9,19 @@ import { requiredSecrets } from "./secrets.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP_PORTS = { kuvert: 3001, tafel: 3002, zettel: 3003, glocke: 3004, schrank: 3005, herold: 3006, wachter: 3007 };
+// The fixed secret names apply.mjs delivers a supplied TLS certificate/
+// private key under, via the same secret.ensure mechanism every other
+// real secret uses (see apply.mjs's own comment: never through extra-
+// vars/the journal, never through the generic config.write path). A
+// 2026-08-28 review found the gateway's own compose volumes previously
+// bind-mounted manifest.tls.certificatePath/privateKeyPath directly - a
+// WORKSTATION path, meaningless on the target Compose actually runs on
+// (see PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry). Defined here
+// (not in supplied-tls.mjs, which already depends on this module for
+// publicHostnames()) so the compose volumes below and apply.mjs's own
+// delivery share one literal, never two independently-maintained copies.
+export const SUPPLIED_TLS_CERTIFICATE_SECRET_NAME = "hof.tls.certificate";
+export const SUPPLIED_TLS_PRIVATE_KEY_SECRET_NAME = "hof.tls.privateKey";
 // Matches Wächter's own restart-control contract (see its README/SECURITY):
 // only stateless frontend containers may ever be restarted through it, and
 // every other declared service is critical - the agent gives critical=true
@@ -205,9 +218,15 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
   compose.services.gateway.ports = ["80:80", "443:443"];
   compose.services.gateway.volumes = ["./Caddyfile:/etc/caddy/Caddyfile:ro", "caddy-data:/data"];
   if (manifest.tls.mode === "supplied") {
+    // Fixed TARGET-side paths (never manifest.tls.certificatePath/
+    // privateKeyPath - those are workstation paths, meaningless to
+    // Compose running on the target) - apply.mjs's own secret role
+    // delivers the real certificate/key content to exactly these two
+    // paths (root:root, mode 0400, see the secret role's own copy loop)
+    // before this gateway container ever starts.
     compose.services.gateway.volumes.push(
-      `${manifest.tls.certificatePath}:/run/hof/tls/certificate.pem:ro`,
-      `${manifest.tls.privateKeyPath}:/run/hof/tls/private-key.pem:ro`,
+      `/etc/hof/secrets/${SUPPLIED_TLS_CERTIFICATE_SECRET_NAME}:/run/hof/tls/certificate.pem:ro`,
+      `/etc/hof/secrets/${SUPPLIED_TLS_PRIVATE_KEY_SECRET_NAME}:/run/hof/tls/private-key.pem:ro`,
     );
   }
   // Deliberately no healthcheck here, matching Tor's own real

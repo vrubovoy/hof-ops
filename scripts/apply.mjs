@@ -25,17 +25,20 @@ import { fileURLToPath } from "node:url";
 import { sha256 } from "./digest.mjs";
 import { verifyExecutionEnvironmentSignature } from "./execution-environment.mjs";
 import {
-  assertJournalResumable, buildEvent, buildJournalDocument, buildLockDocument,
+  assertJournalResumable, assertJournalValid, assertLockValid, buildEvent, buildJournalDocument, buildLockDocument,
   currentOperator, decideStepResumption, newOperationId, withJournalStatus,
 } from "./operation-journal.mjs";
-import { checkManagedStateReadable, observationFromSnapshot } from "./preflight.mjs";
+import { checkArchitecture, checkManagedStateReadable, checkOs, observationFromSnapshot } from "./preflight.mjs";
 import { validateBootstrapActions } from "./bootstrap-actions.mjs";
 import { buildPlanV2, planV2Validator } from "./plan-v2.mjs";
 import { BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER } from "./plan-command.mjs";
-import { enabledServiceIds, renderedFilesContents, renderTopology } from "./render-topology.mjs";
+import {
+  enabledServiceIds, renderedFilesContents, renderTopology,
+  SUPPLIED_TLS_CERTIFICATE_SECRET_NAME, SUPPLIED_TLS_PRIVATE_KEY_SECRET_NAME,
+} from "./render-topology.mjs";
 import { readSecretsStore, requiredSecrets } from "./secrets.mjs";
 import { resolveBaseline } from "./state.mjs";
-import { suppliedTlsCertificateFingerprint } from "./supplied-tls.mjs";
+import { readSuppliedTlsMaterial } from "./supplied-tls.mjs";
 import { inspectTarget } from "./target-inspector.mjs";
 import * as realMutate from "./target-mutate.mjs";
 import { loadAndValidateDeployment } from "./validate-deployment.mjs";
@@ -252,6 +255,18 @@ function summarizePlanDiff(approved, recomputed) {
 // the two calls can never quietly drift apart from each other.
 // Returns either a blocked() result or { plan }.
 async function computeLivePlanV2({ snapshot, manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, targetMode, host, port, user, recoveryAgeRecipient, repairDrift }) {
+  // `hofctl preflight` already runs this exact check, but apply itself
+  // never required a successful preflight run first, and the Ansible
+  // roles' own OS assert (host role) only runs AFTER host.prepare has
+  // already started a real apt-get install - too late to be the actual
+  // mutating boundary. Checked here, on every live recompute (so it's
+  // re-verified under the lock too, not just once at the very start),
+  // before anything about this target's own topology is even resolved.
+  const osCheck = checkOs(snapshot);
+  if (osCheck.status !== "pass") return blocked("platform", osCheck.message);
+  const architectureCheck = checkArchitecture(snapshot);
+  if (architectureCheck.status !== "pass") return blocked("platform", architectureCheck.message);
+
   const readable = checkManagedStateReadable(snapshot);
   if (readable.status !== "pass") return blocked("state", readable.message);
   const observation = observationFromSnapshot(snapshot);
@@ -269,7 +284,7 @@ async function computeLivePlanV2({ snapshot, manifest, catalog, releaseLock, ser
 
   let suppliedTls;
   try {
-    suppliedTls = await suppliedTlsCertificateFingerprint(manifest);
+    suppliedTls = await readSuppliedTlsMaterial(manifest, catalog);
   } catch (error) {
     return blocked("tls", error instanceof Error ? error.message : String(error));
   }
@@ -291,7 +306,8 @@ async function computeLivePlanV2({ snapshot, manifest, catalog, releaseLock, ser
       baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift: repairDrift ?? false,
       target: { mode: targetMode, host, port, user, hostKeySha256: snapshot.transport.trustDigest },
       recoveryAgeRecipient,
-      suppliedTlsCertificateFingerprint: suppliedTls,
+      suppliedTlsCertificateFingerprint: suppliedTls?.certificateFingerprint,
+      suppliedTlsPrivateKeyFingerprint: suppliedTls?.privateKeyFingerprint,
     });
   } catch (error) {
     return blocked("plan", error instanceof Error ? error.message : String(error));
@@ -466,10 +482,24 @@ export async function runApply(options) {
     // inputs it was journaled against haven't silently changed.
     const { status, lock } = await m.readLock(mutateConn);
     if (status !== "present") return blocked("resume", "no lock found on this target - there is nothing to resume");
+    // target-mutate.mjs's own readLock() only ever JSON.parses the raw
+    // bytes it reads back - a hand-tampered or genuinely corrupted lock
+    // document must never be silently trusted before this run acts on
+    // its own operationId field.
+    try {
+      await assertLockValid(lock);
+    } catch (error) {
+      return blocked("resume", `the lock on the target does not satisfy its own schema - refusing to trust it: ${error instanceof Error ? error.message : error}`);
+    }
     operationId = lock.operationId;
 
     const { status: journalStatus, journal: existing } = await m.readJournal(mutateConn, operationId);
     if (journalStatus !== "present") return blocked("resume", `lock references operation ${operationId} but its journal could not be read (status: ${journalStatus})`);
+    try {
+      await assertJournalValid(existing);
+    } catch (error) {
+      return blocked("resume", `the journal for operation ${operationId} does not satisfy its own schema - refusing to trust it: ${error instanceof Error ? error.message : error}`);
+    }
     assertJournalResumable(existing);
 
     const currentDigests = {
@@ -505,6 +535,11 @@ export async function runApply(options) {
     const lockDoc = await buildLockDocument({ operationId, approvedPlanId: plan.planId, target: plan.target, acquiredBy: currentOperator() });
     const { acquired, lock: held } = await m.acquireLock(mutateConn, lockDoc);
     if (!acquired) {
+      try {
+        await assertLockValid(held);
+      } catch (error) {
+        return blocked("lock", `target is locked by a document that does not satisfy its own schema - refusing to trust it: ${error instanceof Error ? error.message : error}`);
+      }
       return blocked("lock", `target is already locked by operation ${held.operationId} (started ${held.acquiredAt} by ${held.acquiredBy?.user}@${held.acquiredBy?.workstation}) - use --resume to continue it, or investigate why it's stuck`);
     }
 
@@ -582,6 +617,29 @@ export async function runApply(options) {
     try {
       const inventoryFile = path.join(workDir, "inventory.ini");
       await writeFile(inventoryFile, buildInventory({ host, port, user, connectTimeoutSeconds }), { mode: 0o600 });
+
+      // A supplied TLS certificate+private key are real, sensitive
+      // content, delivered exactly like any other secret - through the
+      // secret role's own mount, never through extra-vars or the
+      // journal, never through the generic config.write/generated-files
+      // path (that one is scoped to the operator's own declared-desired-
+      // state-derived, non-secret files). Read fresh here (never reused
+      // from computeLivePlanV2's own earlier, fingerprint-only reads) -
+      // the same "read the real content once, right before it's
+      // actually delivered" pattern secretValues/generatedFiles below
+      // already follow. render-topology.mjs's own compose gateway
+      // volumes reference these exact two fixed secret names.
+      let suppliedTlsForDelivery;
+      try {
+        suppliedTlsForDelivery = await readSuppliedTlsMaterial(manifest, catalog);
+      } catch (error) {
+        if (!options.resume) await m.releaseLock(mutateConn, operationId).catch(() => {});
+        return blocked("tls", error instanceof Error ? error.message : String(error));
+      }
+      if (suppliedTlsForDelivery) {
+        secretValues[SUPPLIED_TLS_CERTIFICATE_SECRET_NAME] = suppliedTlsForDelivery.certificatePem;
+        secretValues[SUPPLIED_TLS_PRIVATE_KEY_SECRET_NAME] = suppliedTlsForDelivery.privateKeyPem;
+      }
 
       // Written unconditionally (even when required is empty, or this
       // plan has no config-affecting change) - plan.mjs's own

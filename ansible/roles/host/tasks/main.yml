@@ -45,6 +45,19 @@
   changed_when: false
   failed_when: false
 
+# Checked independently of Engine's own presence - a target can genuinely
+# have Docker Engine already installed (from an image, a different
+# playbook, a manual install) with the Compose plugin specifically
+# missing, e.g. an Engine-only install predating the plugin, or one that
+# used docker-compose (the old standalone binary) instead. The original
+# recipe only ever checked for this inside the "Engine absent" branch
+# below, so that real case was silently never fixed.
+- name: Check whether the Docker Compose plugin is already installed
+  ansible.builtin.command: docker compose version
+  register: hof_compose_check
+  changed_when: false
+  failed_when: false
+
 # community.docker's own modules (volume/network/image roles) run
 # their own Python code ON THIS TARGET, against its own local Docker
 # socket - not from the Execution Environment container talking to a
@@ -64,9 +77,12 @@
 # positively confirmed Docker is absent (see ADR 0004's "Docker Absent"
 # rules) - this second, independent check (docker --version, right here
 # on the target) is a real, current-moment confirmation of the same
-# fact, not a re-trust of a possibly-stale plan.
-- name: Install Docker Engine + Compose plugin (only when genuinely absent)
-  when: hof_docker_check.rc != 0
+# fact, not a re-trust of a possibly-stale plan. Also runs whenever the
+# Compose plugin alone is missing (a target with Engine already present
+# but no Docker apt repository configured yet still needs it, to
+# install just the plugin below).
+- name: Docker's own apt repository (needed whenever Engine or the Compose plugin alone is missing)
+  when: hof_docker_check.rc != 0 or hof_compose_check.rc != 0
   block:
     - name: Docker's own prerequisites
       ansible.builtin.apt:
@@ -98,14 +114,28 @@
         components: [stable]
         signed_by: /etc/apt/keyrings/docker.asc
 
-    - name: Docker Engine, CLI, containerd, and the Compose plugin
-      ansible.builtin.apt:
-        name: [docker-ce, docker-ce-cli, containerd.io, docker-compose-plugin]
-        state: present
-        update_cache: true
+- name: Docker Engine, CLI, and containerd (only when genuinely absent)
+  when: hof_docker_check.rc != 0
+  ansible.builtin.apt:
+    name: [docker-ce, docker-ce-cli, containerd.io]
+    state: present
+    update_cache: true
 
-    - name: Docker service is enabled and running
-      ansible.builtin.systemd:
-        name: docker
-        enabled: true
-        state: started
+# Deliberately its own task, independent of the Engine-absent condition
+# above - a target whose Engine already worked but never had the plugin
+# (see this file's own check right below hof_docker_check) must still
+# get it installed here, not silently skipped because Engine itself
+# didn't need a fresh install.
+- name: Docker Compose plugin (only when genuinely absent)
+  when: hof_compose_check.rc != 0
+  ansible.builtin.apt:
+    name: docker-compose-plugin
+    state: present
+    update_cache: true
+
+- name: Docker service is enabled and running
+  when: hof_docker_check.rc != 0
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started

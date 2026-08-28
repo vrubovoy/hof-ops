@@ -417,6 +417,16 @@ const SSH_HARDENING = [
   "-o", "PermitLocalCommand=no",
   "-o", "RequestTTY=no",
   "-o", "ConnectionAttempts=1",
+  // Explicitly refused, not left to whatever the operator's own
+  // ~/.ssh/config (or a system-wide one) happens to say about this
+  // hostname - ADR 0004's exact target binding only ever records
+  // mode/host/port/user/the accepted host-key fingerprint, none of
+  // which would change if a stray ProxyJump/ProxyCommand silently
+  // routed the real bytes through an intermediary host the plan never
+  // accounted for. "none" is OpenSSH's own documented way to override
+  // and disable either directive for this one invocation.
+  "-o", "ProxyCommand=none",
+  "-o", "ProxyJump=none",
   // -v (LogLevel DEBUG1) is how ADR 0004's exact target binding is
   // actually obtained: OpenSSH itself prints the one host key it
   // negotiated and accepted for THIS connection ("Server host key: ...")

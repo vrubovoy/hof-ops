@@ -15,24 +15,29 @@
 //
 // This run genuinely installs Docker on the target for real
 // (host.prepare, apt), delivers real secret files over real SSH
-// (secret.ensure), and creates real Hof-labeled Docker volumes
-// (volume.ensure) - all the way through, successfully. It then hits a
-// REAL, EXPECTED failure at the first image operation: examples/
-// release-lock.json is illustrative (fake digests/signing identities,
-// see contracts.mjs's own comment on that fixture), so a real `cosign
-// verify`/`docker pull` against those references genuinely fails - the
-// same way it would against any release lock whose images don't
-// actually exist. This is deliberately NOT patched around: it's real
-// coverage of apply.mjs's own failure path (a real operation failure
-// marking the journal failed and releasing the lock), exercised here
-// for the first time against a genuinely real failure rather than a
-// mocked one (see test/apply.test.mjs's own mocked failure test for
-// the complementary orchestration-level coverage). config.write and
-// every role after it (database/service/readiness/state, still PR #26
-// skeletons, real implementation is PR #29) are consequently never
-// reached by this run - a real image pull is a real prerequisite the
-// rest of a real bootstrap must have, exactly like it would in
-// production.
+// (secret.ensure) - including a genuine self-signed TLS certificate/
+// private key (manifest.tls.mode "supplied", not acme-http01 - a real
+// openssl-generated key pair with a real SAN, exercising the exact real
+// delivery path a 2026-08-28 review found completely missing, see
+// PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry) - and creates real
+// Hof-labeled Docker volumes (volume.ensure) - all the way through,
+// successfully. It then hits a REAL, EXPECTED failure at the first
+// image operation: examples/release-lock.json is illustrative (fake
+// digests/signing identities, see contracts.mjs's own comment on that
+// fixture), so a real `cosign verify`/`docker pull` against those
+// references genuinely fails - the same way it would against any
+// release lock whose images don't actually exist. This is deliberately
+// NOT patched around: it's real coverage of apply.mjs's own failure
+// path (a real operation failure marking the journal failed and
+// releasing the lock), exercised here for the first time against a
+// genuinely real failure rather than a mocked one (see
+// test/apply.test.mjs's own mocked failure test for the complementary
+// orchestration-level coverage). config.write and every role after it
+// (database/service/readiness/state - all real since PR #29) are
+// consequently never reached by THIS run - a real image pull is a real
+// prerequisite the rest of a real bootstrap must have, exactly like it
+// would in production; see ansible/README.md for exactly what those
+// four roles have instead (real local verification, not this live run).
 //
 // Both the ssh-fixture container and the Execution Environment
 // container run on a shared, dedicated Docker bridge network so the EE
@@ -93,6 +98,10 @@ let hostKeyFingerprint;
 let servicesPath;
 let releaseLockPath;
 let eeImageReference;
+let suppliedTlsCertificatePath;
+let suppliedTlsPrivateKeyPath;
+let suppliedTlsCertificatePem;
+let suppliedTlsPrivateKeyPem;
 let fakeSecretValues;
 
 async function waitForSsh(ip, timeoutMs) {
@@ -200,6 +209,31 @@ before(async () => {
 
   const manifest = YAML.parse(await exec("cat", [path.join(root, "examples/services.yml")]).then((r) => r.stdout));
   manifest.target = { host: targetIp, user: "hofprobe", port: 22 };
+
+  // Real supplied TLS material - a genuine self-signed cert/key pair
+  // (openssl, real X.509 content, real SAN covering exactly the
+  // hostnames this manifest's own catalog serves), not acme-http01 -
+  // exercises the real delivery path a 2026-08-28 review found
+  // completely missing (the rendered Compose file bind-mounted a
+  // WORKSTATION path directly into the target-side volume definition,
+  // meaningless on the actual target - see render-topology.mjs's own
+  // fixed-secret-path fix, and scripts/supplied-tls.mjs's own real
+  // parse/key-match/validity/SAN validation). secret.ensure (which now
+  // also delivers this) runs and succeeds well before this run's own
+  // expected image-pull failure, so its real, on-target result is fully
+  // observable below.
+  suppliedTlsCertificatePath = path.join(workDir, "tls-certificate.pem");
+  suppliedTlsPrivateKeyPath = path.join(workDir, "tls-private-key.pem");
+  await exec("openssl", [
+    "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+    "-keyout", suppliedTlsPrivateKeyPath, "-out", suppliedTlsCertificatePath,
+    "-days", "1", "-subj", "/CN=example.com",
+    "-addext", `subjectAltName=DNS:${manifest.domains.base},DNS:*.${manifest.domains.base}`,
+  ]);
+  suppliedTlsCertificatePem = await exec("cat", [suppliedTlsCertificatePath]).then((r) => r.stdout);
+  suppliedTlsPrivateKeyPem = await exec("cat", [suppliedTlsPrivateKeyPath]).then((r) => r.stdout);
+  manifest.tls = { mode: "supplied", certificatePath: suppliedTlsCertificatePath, privateKeyPath: suppliedTlsPrivateKeyPath };
+
   servicesPath = path.join(workDir, "services.yml");
   await writeFile(servicesPath, YAML.stringify(manifest));
 
@@ -347,6 +381,19 @@ test("a real bootstrap apply: real Docker install, real secret delivery, real vo
   assert.equal(secretRaw, fakeSecretValues[firstSecretName]);
   const { stdout: secretStat } = await exec("docker", ["exec", containerName, "stat", "--format", "%a %U", `/etc/hof/secrets/${firstSecretName}`]);
   assert.equal(secretStat.trim(), "400 root");
+
+  // The real supplied TLS certificate/private key genuinely landed on
+  // the target too, byte-for-byte, root-owned, mode 0400 - the exact
+  // real delivery a 2026-08-28 review found completely missing (see
+  // this file's own top comment on manifest.tls above).
+  const { stdout: deliveredCertificate } = await exec("docker", ["exec", containerName, "cat", "/etc/hof/secrets/hof.tls.certificate"]);
+  assert.equal(deliveredCertificate, suppliedTlsCertificatePem);
+  const { stdout: deliveredPrivateKey } = await exec("docker", ["exec", containerName, "cat", "/etc/hof/secrets/hof.tls.privateKey"]);
+  assert.equal(deliveredPrivateKey, suppliedTlsPrivateKeyPem);
+  const { stdout: tlsCertStat } = await exec("docker", ["exec", containerName, "stat", "--format", "%a %U", "/etc/hof/secrets/hof.tls.certificate"]);
+  assert.equal(tlsCertStat.trim(), "400 root");
+  const { stdout: tlsKeyStat } = await exec("docker", ["exec", containerName, "stat", "--format", "%a %U", "/etc/hof/secrets/hof.tls.privateKey"]);
+  assert.equal(tlsKeyStat.trim(), "400 root");
 
   // Docker itself was genuinely installed by host.prepare, not merely
   // reported as installed.

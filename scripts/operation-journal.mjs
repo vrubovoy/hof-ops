@@ -39,6 +39,31 @@ async function assertValid(kind, value) {
   return value;
 }
 
+// The same schema, but for a document READ off a real target rather
+// than one this module itself just built - target-mutate.mjs's own
+// readLock()/readJournal() only ever JSON.parse the raw bytes they read
+// back, with no schema check of their own (see that module's own top
+// comment on why: it's a narrow, fixed-vocabulary transport layer, not
+// a validator). A hand-tampered, corrupted, or simply stale-shaped
+// document must never be silently trusted as if it were schema-valid -
+// callers (apply.mjs's own resume path in particular) validate here
+// before ever reading a field off it.
+async function assertReadValid(kind, value) {
+  const { [kind]: validate } = await loadValidators();
+  if (!validate(value)) {
+    throw new Error(`the ${kind} read from the target does not satisfy schemas/operation-${kind}-v1.schema.json: ${JSON.stringify(validate.errors)}`);
+  }
+  return value;
+}
+
+export function assertLockValid(lock) {
+  return assertReadValid("lock", lock);
+}
+
+export function assertJournalValid(journal) {
+  return assertReadValid("journal", journal);
+}
+
 export function newOperationId() {
   return randomUUID();
 }

@@ -469,12 +469,31 @@ test("lock already held by another operation refuses, without touching the journ
   const mutate = makeFakeMutate();
   const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
   const { plan, planPath } = await computeApprovedPlan(options);
-  mutate.state.lock = { operationId: "11111111-1111-1111-1111-111111111111", acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { user: "someone", workstation: "elsewhere", pid: 1 } };
+  // A real, schema-valid lock document - target-mutate.mjs's own
+  // acquireLock() now has its response validated against
+  // operation-lock-v1 before apply ever reads a field off it.
+  mutate.state.lock = {
+    apiVersion: "hof.dev/operation-lock/v1", operationId: "11111111-1111-1111-1111-111111111111",
+    approvedPlanId: "sha256:" + "9".repeat(64), target: plan.target,
+    acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { user: "someone", workstation: "elsewhere", pid: 1 },
+  };
   const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
   assert.equal(result.blocked, true);
   assert.equal(result.reason, "lock");
   assert.ok(result.diagnostics[0].includes("11111111-1111-1111-1111-111111111111"));
   assert.equal(mutate.state.journals.size, 0);
+});
+
+test("lock held by a document that fails its own schema is refused, not silently trusted for its operationId", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  // Missing apiVersion/approvedPlanId/target - not a real lock document.
+  mutate.state.lock = { operationId: "11111111-1111-1111-1111-111111111111", acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { user: "someone", workstation: "elsewhere", pid: 1 } };
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lock");
+  assert.match(result.diagnostics[0], /does not satisfy its own schema/);
 });
 
 test("stale-plan recheck: a host-key change between lock acquisition and the post-lock recheck is refused, and the freshly-acquired lock is released", async () => {
@@ -621,6 +640,21 @@ test("resume: an input that changed since this operation was journaled is refuse
   assert.equal(result.blocked, true);
   assert.equal(result.reason, "resume");
   assert.match(result.diagnostics[0], /manifestDigest has changed/);
+});
+
+test("resume: a journal that fails its own schema is refused, not silently trusted", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const operationId = "77777777-7777-7777-7777-777777777777";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  // Missing plan/inputDigests entirely - not a real journal document.
+  mutate.state.journals.set(operationId, { apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null });
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /does not satisfy its own schema/);
 });
 
 test("resume: a step with an unresolved (started, never confirmed) outcome blocks the whole run and keeps the lock held", async () => {

@@ -64,11 +64,14 @@ function imageTrustFor(component) {
 //     diffed against.
 //   recoveryAgeRecipient: string - required (this builder only ever
 //     produces a bootstrap plan, and a bootstrap always needs one).
-//   suppliedTlsCertificateFingerprint: sha256 digest of the operator's
-//     own certificate file, read and hashed at planning time - required
-//     when manifest.tls.mode is "supplied", must be omitted otherwise.
+//   suppliedTlsCertificateFingerprint/suppliedTlsPrivateKeyFingerprint:
+//     sha256 digests of the operator's own certificate/private-key
+//     files, read, VALIDATED (key match, validity, SAN coverage - see
+//     scripts/supplied-tls.mjs's own readSuppliedTlsMaterial), and
+//     hashed at planning time - required together when manifest.tls.mode
+//     is "supplied", must both be omitted otherwise.
 export function buildPlanV2(options) {
-  const { baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift, target, recoveryAgeRecipient, suppliedTlsCertificateFingerprint } = options;
+  const { baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift, target, recoveryAgeRecipient, suppliedTlsCertificateFingerprint, suppliedTlsPrivateKeyFingerprint } = options;
 
   if (baseline.mode !== "bootstrap") {
     throw new Error("buildPlanV2 only ever produces a bootstrap plan in this delivery item - applied-mode reconciliation is a later delivery item, see ADR 0004");
@@ -76,11 +79,11 @@ export function buildPlanV2(options) {
   if (!recoveryAgeRecipient) {
     throw new Error("a bootstrap plan requires an external age recovery recipient (recoveryAgeRecipient) - see ADR 0004");
   }
-  if (manifest.tls.mode === "supplied" && suppliedTlsCertificateFingerprint === undefined) {
-    throw new Error("manifest.tls.mode is \"supplied\" but no suppliedTlsCertificateFingerprint was given - the operator's certificate file must be read and hashed before planning");
+  if (manifest.tls.mode === "supplied" && (suppliedTlsCertificateFingerprint === undefined || suppliedTlsPrivateKeyFingerprint === undefined)) {
+    throw new Error("manifest.tls.mode is \"supplied\" but no suppliedTlsCertificateFingerprint/suppliedTlsPrivateKeyFingerprint was given - the operator's certificate and private key files must be read, validated, and hashed before planning");
   }
-  if (manifest.tls.mode !== "supplied" && suppliedTlsCertificateFingerprint !== undefined) {
-    throw new Error("suppliedTlsCertificateFingerprint was given but manifest.tls.mode is not \"supplied\"");
+  if (manifest.tls.mode !== "supplied" && (suppliedTlsCertificateFingerprint !== undefined || suppliedTlsPrivateKeyFingerprint !== undefined)) {
+    throw new Error("suppliedTlsCertificateFingerprint/suppliedTlsPrivateKeyFingerprint was given but manifest.tls.mode is not \"supplied\"");
   }
 
   const v1 = buildPlan({ baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift });
@@ -118,7 +121,9 @@ export function buildPlanV2(options) {
     },
     policy: { repairDrift: Boolean(repairDrift) },
     recovery: { ageRecipient: recoveryAgeRecipient },
-    ...(suppliedTlsCertificateFingerprint !== undefined ? { suppliedTls: { mode: "supplied", certificateFingerprint: suppliedTlsCertificateFingerprint } } : {}),
+    ...(suppliedTlsCertificateFingerprint !== undefined
+      ? { suppliedTls: { mode: "supplied", certificateFingerprint: suppliedTlsCertificateFingerprint, privateKeyFingerprint: suppliedTlsPrivateKeyFingerprint } }
+      : {}),
     baseline: v1.baseline,
     desired: v1.desired,
     drift: v1.drift,

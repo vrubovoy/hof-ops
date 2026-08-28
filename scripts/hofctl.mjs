@@ -18,7 +18,7 @@ function usage(message) {
   console.error("       hofctl preflight --services <services.yml> [--catalog <catalog.yaml>] [--target-mode ssh|local] [--known-hosts <file> | --host-key-sha256 <sha>] [--identity-file <path>] [--connect-timeout-seconds <n>] [--min-free-disk-gb <n>] [--min-memory-gb <n>] [--min-cpu-cores <n>]");
   console.error("       hofctl plan --services <services.yml> --release-lock <release-lock.json> --release-lock-identity <identity> (--known-hosts <file> | --host-key-sha256 <sha>) [--catalog <catalog.yaml>] [--identity-file <path>] [--target-mode ssh|local] [--connect-timeout-seconds <n>] [--repair-drift]");
   console.error("       hofctl secrets ensure --services <services.yml> --store <secrets.sops.yaml> --operator-age-recipient <age1...> --recovery-age-recipient <age1...> [--catalog <catalog.yaml>] [--identity-file <path>]");
-  console.error("       hofctl apply --services <services.yml> --release-lock <release-lock.json> --release-lock-identity <identity> (--known-hosts <file> | --host-key-sha256 <sha>) --identity-file <path> --recovery-age-recipient <age1...> (--approve-plan-id <exact-plan-id> | --resume) [--catalog <catalog.yaml>] [--connect-timeout-seconds <n>] [--repair-drift]");
+  console.error("       hofctl apply --services <services.yml> --release-lock <release-lock.json> --release-lock-identity <identity> (--known-hosts <file> | --host-key-sha256 <sha>) --identity-file <path> --recovery-age-recipient <age1...> (--approve-plan-id <exact-plan-id> | --resume) [--catalog <catalog.yaml>] [--connect-timeout-seconds <n>] [--repair-drift] [--secrets-store <secrets.sops.yaml>] [--secrets-age-identity-file <path>]");
   process.exitCode = 2;
 }
 
@@ -99,6 +99,7 @@ const APPLY_FLAGS = new Set([
   "--services", "--release-lock", "--release-lock-identity", "--known-hosts", "--host-key-sha256",
   "--catalog", "--identity-file", "--connect-timeout-seconds", "--repair-drift",
   "--recovery-age-recipient", "--approve-plan-id", "--resume",
+  "--secrets-store", "--secrets-age-identity-file",
 ]);
 const APPLY_BOOLEAN_FLAGS = new Set(["--repair-drift", "--resume"]);
 
@@ -317,7 +318,7 @@ if (command === "render") {
 } else if (command === "apply") {
   const options = parseApplyFlags(args);
   if (options) {
-    resolvePaths(options, ["services", "releaseLock", "catalog", "knownHosts", "identityFile"]);
+    resolvePaths(options, ["services", "releaseLock", "catalog", "knownHosts", "identityFile", "secretsStore", "secretsAgeIdentityFile"]);
     if (!options.services || !options.releaseLock || !options.releaseLockIdentity || !options.identityFile || !options.recoveryAgeRecipient) {
       usage("apply requires --services, --release-lock, --release-lock-identity, --identity-file, and --recovery-age-recipient");
     } else if (Boolean(options.knownHosts) === Boolean(options.hostKeySha256)) {
@@ -338,6 +339,8 @@ if (command === "render") {
           connectTimeoutSeconds,
           repairDrift: options.repairDrift === true,
           recoveryAgeRecipient: options.recoveryAgeRecipient,
+          secretsStorePath: options.secretsStore,
+          secretsAgeIdentityFile: options.secretsAgeIdentityFile,
           approvePlanId: options.approvePlanId,
           resume: options.resume === true,
           // Bounded NDJSON on stdout, one line per event - nothing else

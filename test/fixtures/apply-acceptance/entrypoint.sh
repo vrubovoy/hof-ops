@@ -1,10 +1,12 @@
 #!/bin/sh
 # Installs the bind-mounted, freshly-generated (per test run) host key
 # and authorized_keys with correct container-side ownership/permissions,
-# then execs sshd. Nothing here is baked into the image - the actual
-# key material always comes from /hof-keys, mounted read-only by
-# test/ssh-acceptance.mjs.
-set -eu
+# then hands off to real systemd as PID 1 (ssh.service is already
+# enabled - see the Dockerfile - so systemd starts sshd itself once it
+# comes up, exactly like it would on a real target). Nothing here is
+# baked into the image - the actual key material always comes from
+# /hof-keys, mounted read-only by test/apply-acceptance.mjs.
+set -eux
 
 cp /hof-keys/host_key /etc/ssh/ssh_host_ed25519_key
 chmod 600 /etc/ssh/ssh_host_ed25519_key
@@ -21,4 +23,4 @@ chown -R hofprobe:hofprobe /home/hofprobe/.ssh
 chmod 700 /home/hofprobe/.ssh
 chmod 600 /home/hofprobe/.ssh/authorized_keys
 
-exec /usr/sbin/sshd -D -e -o HostKey=/etc/ssh/ssh_host_ed25519_key
+exec /lib/systemd/systemd --log-target=console

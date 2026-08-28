@@ -8,6 +8,13 @@
 # keeps hof_role restricted to one of this image's own ten roles - this
 # playbook itself has no opinion on that, it just dispatches whatever
 # role name it's given.
+# gather_facts stays false at the play level - a genuinely clean
+# bootstrap target may not even have python3 yet (host.prepare's own
+# first task installs it via a raw command, which needs no interpreter
+# at all), and Ansible's own fact-gathering itself requires python3 -
+# gathering facts here, before host.prepare ever runs, would fail on
+# exactly the host this whole item exists to provision. Only host.prepare
+# itself calls ansible.builtin.setup, once python3 is confirmed present.
 - hosts: all
   gather_facts: false
   become: true

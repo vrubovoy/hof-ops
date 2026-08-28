@@ -13,6 +13,16 @@
 # after a fresh pull.
 FROM python:3.13-slim-bookworm@sha256:c45a22ea000adfd9cda29364bbe7edd23001ce5cc2ad15857cfbf7766943b9ca
 
+# A real OpenSSH client - Ansible's own default connection plugin
+# (ssh, ansible.cfg never overrides it) shells out to a real `ssh`
+# binary to reach the target at all; the base image has none. Found for
+# real via a genuine CI failure ("Unable to execute ssh command line on
+# a controller due to: [Errno 2] No such file or directory: b'ssh'"),
+# not assumed.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssh-client \
+  && rm -rf /var/lib/apt/lists/*
+
 # Ansible itself, plus the Python bindings community.docker's own
 # modules need to talk to Docker over its socket (docker>=7, the
 # maintained "docker" package - "docker-py" is its old, unmaintained
@@ -23,6 +33,20 @@ RUN pip install --no-cache-dir \
   ansible-core==2.17.* \
   docker==7.* \
   cryptography==43.*
+
+# Cosign - the image role's own image.verify action runs its real
+# signature check from inside this container (never on the target;
+# `cosign verify` only ever needs network access to the image's own
+# registry and Sigstore's Fulcio/Rekor infrastructure, nothing
+# target-side), the same real invocation shape scripts/build-release-
+# lock.mjs's own verifySupplyChain already uses. Pinned exact version,
+# checksum-verified against cosign's own published checksums file (see
+# https://github.com/sigstore/cosign/releases/tag/v3.1.3) - the same
+# digest-pinning discipline every other artifact this platform pulls in
+# already follows.
+ADD --checksum=sha256:4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71 \
+  https://github.com/sigstore/cosign/releases/download/v3.1.3/cosign-linux-amd64 /usr/local/bin/cosign
+RUN chmod +x /usr/local/bin/cosign
 
 # Collections are pinned in requirements.yml (real versions, resolved
 # and locked the same way `pnpm install --frozen-lockfile` locks a

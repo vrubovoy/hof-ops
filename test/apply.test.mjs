@@ -12,13 +12,16 @@
 // real-container, real-SSH coverage.
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile as readFileText, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { runApply } from "../scripts/apply.mjs";
+import { enabledServiceIds } from "../scripts/render-topology.mjs";
+import { requiredSecrets } from "../scripts/secrets.mjs";
+import { loadContracts } from "../scripts/contracts.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const fakeCosignDir = path.join(root, "test/fixtures/plan-cli");
@@ -27,6 +30,7 @@ const examplesReleaseLock = path.join(root, "examples/release-lock.json");
 
 let workDir;
 let signedReleaseLockPath;
+let fakeSecretValues;
 
 test.before(async () => {
   workDir = await mkdtemp(path.join(tmpdir(), "hof-apply-test-"));
@@ -35,6 +39,12 @@ test.before(async () => {
   await writeFile(signedReleaseLockPath, await readFile(examplesReleaseLock));
   await writeFile(`${signedReleaseLockPath}.sig`, "fake-signature\n");
   await writeFile(`${signedReleaseLockPath}.pem`, "fake-certificate\n");
+
+  // examples/services.yml's own real requiredSecrets() list, not a
+  // hand-maintained copy - stays correct if that fixture's enabled
+  // services ever change.
+  const { manifest, catalog } = await loadContracts();
+  fakeSecretValues = Object.fromEntries(requiredSecrets(manifest, enabledServiceIds(manifest, catalog)).map((s) => [s.name, `fake-value-${s.name}`]));
 });
 
 test.after(async () => {
@@ -128,6 +138,8 @@ function baseApplyOptions(overrides = {}) {
     recoveryAgeRecipient: "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
     verifyEeSignature: async () => {},
     dockerRun: async () => ({ stdout: "", stderr: "" }),
+    secretsStorePath: "/dev/null", // never actually read - readSecretsStore is stubbed below
+    readSecretsStore: async () => fakeSecretValues,
     ...overrides,
   };
 }
@@ -238,6 +250,107 @@ test("image.pull inherits its own hof_image_trust from the preceding image.verif
   const verifies = seen.filter((vars) => vars.hof_role === "image" && vars.hof_image_reference && "policy" in (vars.hof_image_trust ?? {}));
   assert.ok(verifies.length > 0, "at least one image.verify/pull pair was dispatched");
   for (const vars of verifies) assert.ok(vars.hof_image_trust, JSON.stringify(vars));
+  // Both actions are always tagged so the role can tell them apart.
+  const actions = new Set(verifies.map((vars) => vars.hof_image_action));
+  assert.deepEqual(actions, new Set(["verify", "pull"]));
+});
+
+test("volume.ensure/network.ensure carry the real installationId/generation, matching what the renderer already labeled Compose's own volumes/networks with", async () => {
+  const mutate = makeFakeMutate();
+  const seen = [];
+  const options = baseApplyOptions({
+    mutate, inspect: async () => cleanSnapshot(),
+    dockerRun: async (command, args) => { seen.push(JSON.parse(args.at(-1))); return { stdout: "", stderr: "" }; },
+  });
+  const planId = await discoverPlanId(options);
+  await withFakeCosign("success", () => runApply({ ...options, approvePlanId: planId }));
+  const volumeVars = seen.filter((vars) => vars.hof_role === "volume");
+  assert.ok(volumeVars.length > 0, "at least one volume.ensure was dispatched for this multi-service topology");
+  for (const vars of volumeVars) {
+    assert.equal(vars.hof_installation_id, "00000000-0000-0000-0000-000000000000");
+    assert.equal(vars.hof_generation, 1);
+  }
+});
+
+test("secrets blocked: a deployment needing secrets refuses without --secrets-store, before ever touching the network", async () => {
+  const result = await withFakeCosign("success", () => runApply({
+    ...baseApplyOptions(), secretsStorePath: undefined, inspect: async () => { throw new Error("must never be called"); }, approvePlanId: "sha256:" + "0".repeat(64),
+  }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "secrets");
+  assert.match(result.diagnostics[0], /--secrets-store was not given/);
+});
+
+test("secrets blocked: a store missing a required secret refuses, naming which one", async () => {
+  const result = await withFakeCosign("success", () => runApply({
+    ...baseApplyOptions(), readSecretsStore: async () => ({}), inspect: async () => { throw new Error("must never be called"); },
+    approvePlanId: "sha256:" + "0".repeat(64),
+  }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "secrets");
+  assert.match(result.diagnostics[0], /missing required secret/);
+});
+
+// Both of the next two tests read the mounted file's content from
+// WITHIN the dockerRun mock itself, not after runApply() returns -
+// runApply() deletes its own workDir (and everything mounted from it)
+// in a finally block before ever returning.
+test("secret.ensure mounts a real, correctly-scoped secrets file into the Execution Environment container - never through extra-vars", async () => {
+  const mutate = makeFakeMutate();
+  const dockerCalls = [];
+  let mountedSecrets;
+  const options = baseApplyOptions({
+    mutate, inspect: async () => cleanSnapshot(),
+    dockerRun: async (command, args) => {
+      dockerCalls.push(args);
+      const mountArg = args.find((a) => a.endsWith(":/hof/secrets.json:ro"));
+      if (mountArg) mountedSecrets = JSON.parse(await readFileText(mountArg.slice(0, -":/hof/secrets.json:ro".length), "utf8"));
+      return { stdout: "", stderr: "" };
+    },
+  });
+  const planId = await discoverPlanId(options);
+  await withFakeCosign("success", () => runApply({ ...options, approvePlanId: planId }));
+
+  const secretCall = dockerCalls.find((args) => JSON.parse(args.at(-1)).hof_role === "secret");
+  assert.ok(secretCall, "a secret.ensure operation was dispatched");
+  const vars = JSON.parse(secretCall.at(-1));
+  assert.equal(vars.hof_secrets_file, "/hof/secrets.json");
+  assert.ok(!("hof_secrets" in vars) && !JSON.stringify(vars).includes("fake-value-"), "no secret value ever appears in extra-vars");
+  assert.deepEqual(mountedSecrets, fakeSecretValues);
+
+  // Every OTHER operation's own docker run never mounts the secrets
+  // file at all - it's scoped to exactly the one operation that needs it.
+  const otherCalls = dockerCalls.filter((args) => JSON.parse(args.at(-1)).hof_role !== "secret");
+  assert.ok(otherCalls.every((args) => !args.some((a) => a.includes("secrets.json"))));
+});
+
+test("config.write mounts the real rendered file contents into the Execution Environment container", async () => {
+  const mutate = makeFakeMutate();
+  const dockerCalls = [];
+  let mountedNames;
+  let mountedCompose;
+  const options = baseApplyOptions({
+    mutate, inspect: async () => cleanSnapshot(),
+    dockerRun: async (command, args) => {
+      dockerCalls.push(args);
+      const mountArg = args.find((a) => a.endsWith(":/hof/generated:ro"));
+      if (mountArg) {
+        const hostDir = mountArg.slice(0, -":/hof/generated:ro".length);
+        mountedNames = (await (await import("node:fs/promises")).readdir(hostDir)).sort();
+        mountedCompose = await readFileText(path.join(hostDir, "compose.yml"), "utf8");
+      }
+      return { stdout: "", stderr: "" };
+    },
+  });
+  const planId = await discoverPlanId(options);
+  await withFakeCosign("success", () => runApply({ ...options, approvePlanId: planId }));
+
+  const configCall = dockerCalls.find((args) => JSON.parse(args.at(-1)).hof_role === "config");
+  assert.ok(configCall, "a config.write operation was dispatched");
+  const vars = JSON.parse(configCall.at(-1));
+  assert.equal(vars.hof_generated_files_dir, "/hof/generated");
+  assert.deepEqual(mountedNames, ["Caddyfile", "backup-inventory.json", "compose.yml", "runtime-config.json", "service.env", "topology.json"]);
+  assert.match(mountedCompose, /services:/);
 });
 
 test("lock already held by another operation refuses, without touching the journal", async () => {

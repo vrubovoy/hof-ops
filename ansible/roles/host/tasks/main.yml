@@ -1,20 +1,111 @@
 ---
-# Skeleton only (item 8, PR #26) - real host.prepare implementation
-# lands in PR #28. Every role in this Execution Environment enforces
-# its own operation's variable contract even before it does real work,
-# so a caller (hofctl apply's own dispatcher, PR #27) that got the
-# typed operation-to-role mapping wrong fails loudly here, not deep
-# inside a half-applied task.
-- name: Assert this operation's own identity is present
+- name: Assert this operation's own required variables are present
   ansible.builtin.assert:
     that:
       - hof_operation_id is not none
-    fail_msg: "host role requires hof_operation_id (the bound plan-v2 operation's own id) - never invoked without it"
+    fail_msg: "host role requires hof_operation_id - never invoked without it"
 
-- name: host.prepare is not yet implemented
-  ansible.builtin.debug:
-    msg: >-
-      host.prepare skeleton reached for operation {{ hof_operation_id }} -
-      real host preparation (OS baseline, Docker Engine/Compose install
-      when genuinely absent, the fixed /etc/hof and /var/lib/hof
-      directory layout) lands in a later item-8 PR.
+# A genuinely clean bootstrap target may not have python3 at all - every
+# other module in this role (and every other role in this Execution
+# Environment) needs it. `raw` is the one task in the whole image that
+# runs without an interpreter on the target at all, exactly so it can
+# install the interpreter everything else depends on.
+- name: Bootstrap python3 if the target doesn't have it yet
+  ansible.builtin.raw: command -v python3 >/dev/null 2>&1 || (apt-get update && apt-get install -y python3)
+  changed_when: false
+
+- name: Gather the facts this role's own OS-specific Docker install needs
+  ansible.builtin.setup:
+    gather_subset: min
+
+- name: Refuse an unsupported OS - hofctl preflight's own checkOs already scoped this platform to Debian/Ubuntu
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution in ["Debian", "Ubuntu"]
+    fail_msg: "host.prepare only supports Debian or Ubuntu, found {{ ansible_facts.distribution }}"
+
+- name: Fixed Hof directory layout
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: /etc/hof, mode: "0755" }
+    - { path: /etc/hof/generated, mode: "0755" }
+    - { path: /etc/hof/secrets, mode: "0700" }
+    - { path: /var/lib/hof, mode: "0755" }
+    - { path: /var/lib/hof/state, mode: "0755" }
+    - { path: /var/lib/hof/state/journal, mode: "0755" }
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Check whether Docker is already installed
+  ansible.builtin.command: docker --version
+  register: hof_docker_check
+  changed_when: false
+  failed_when: false
+
+# community.docker's own modules (volume/network/image roles) run
+# their own Python code ON THIS TARGET, against its own local Docker
+# socket - not from the Execution Environment container talking to a
+# remote API. They need the Docker Python SDK (and its own
+# dependency, requests) installed here, regardless of whether Docker
+# itself needed a fresh install just above - a target that already had
+# Docker from a previous install may still be missing this. Found for
+# real via a genuine CI failure ("Failed to import the required Python
+# library (requests)"), not assumed.
+- name: The Docker Python SDK, for every community.docker module this Execution Environment runs against this target
+  ansible.builtin.apt:
+    name: python3-docker
+    state: present
+    update_cache: true
+
+# Only ever runs when target-inspector.mjs's own probe already
+# positively confirmed Docker is absent (see ADR 0004's "Docker Absent"
+# rules) - this second, independent check (docker --version, right here
+# on the target) is a real, current-moment confirmation of the same
+# fact, not a re-trust of a possibly-stale plan.
+- name: Install Docker Engine + Compose plugin (only when genuinely absent)
+  when: hof_docker_check.rc != 0
+  block:
+    - name: Docker's own prerequisites
+      ansible.builtin.apt:
+        # python3-debian is deb822_repository's own dependency (its
+        # Python "debian" module), not Docker's - needed on the target
+        # for the repository task right below this block to run at all.
+        name: [ca-certificates, curl, gnupg, python3-debian]
+        state: present
+        update_cache: true
+
+    - name: /etc/apt/keyrings
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Docker's own signing key
+      ansible.builtin.get_url:
+        url: "https://download.docker.com/linux/{{ ansible_facts.distribution | lower }}/gpg"
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Docker's own apt repository
+      ansible.builtin.deb822_repository:
+        name: docker
+        types: [deb]
+        uris: "https://download.docker.com/linux/{{ ansible_facts.distribution | lower }}"
+        suites: "{{ ansible_facts.distribution_release }}"
+        components: [stable]
+        signed_by: /etc/apt/keyrings/docker.asc
+
+    - name: Docker Engine, CLI, containerd, and the Compose plugin
+      ansible.builtin.apt:
+        name: [docker-ce, docker-ce-cli, containerd.io, docker-compose-plugin]
+        state: present
+        update_cache: true
+
+    - name: Docker service is enabled and running
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started

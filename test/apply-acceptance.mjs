@@ -9,8 +9,30 @@
 // a real plan-v2 build, real target-mutate lock/journal/event writes
 // over real SSH (with sudo), a real `docker run` of the real EE image
 // for every operation, reaching the real target over a real SSH
-// connection FROM inside that container, running the real (skeleton,
-// item 8 PR #26) roles.
+// connection FROM inside that container, running item 8's own real
+// role implementations (PR #28: host, secret, volume, network, image,
+// config).
+//
+// This run genuinely installs Docker on the target for real
+// (host.prepare, apt), delivers real secret files over real SSH
+// (secret.ensure), and creates real Hof-labeled Docker volumes
+// (volume.ensure) - all the way through, successfully. It then hits a
+// REAL, EXPECTED failure at the first image operation: examples/
+// release-lock.json is illustrative (fake digests/signing identities,
+// see contracts.mjs's own comment on that fixture), so a real `cosign
+// verify`/`docker pull` against those references genuinely fails - the
+// same way it would against any release lock whose images don't
+// actually exist. This is deliberately NOT patched around: it's real
+// coverage of apply.mjs's own failure path (a real operation failure
+// marking the journal failed and releasing the lock), exercised here
+// for the first time against a genuinely real failure rather than a
+// mocked one (see test/apply.test.mjs's own mocked failure test for
+// the complementary orchestration-level coverage). config.write and
+// every role after it (database/service/readiness/state, still PR #26
+// skeletons, real implementation is PR #29) are consequently never
+// reached by this run - a real image pull is a real prerequisite the
+// rest of a real bootstrap must have, exactly like it would in
+// production.
 //
 // Both the ssh-fixture container and the Execution Environment
 // container run on a shared, dedicated Docker bridge network so the EE
@@ -25,8 +47,15 @@
 // Execution Environment image's OWN signature check is bypassed
 // (verifyEeSignature) for the same reason: a locally-built image was
 // never actually signed by the real execution-environment.yml workflow.
-// Everything else here is genuinely real, including the pinned EE image
-// build and every real docker run/SSH round trip it makes.
+// The secrets store is a plain in-memory stub (readSecretsStore) - real
+// `sops`/`age` mechanics are already exercised for real in PR #25's own
+// secrets.test.mjs; what this test needs to prove is that apply.mjs's
+// own delivery of decrypted values into the Execution Environment and
+// through to the target (never through extra-vars/the journal) works
+// for real, not that SOPS itself works. Everything else here is
+// genuinely real, including the pinned EE image build (with its own
+// real cosign binary) and every real docker run/SSH round trip it
+// makes.
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -41,6 +70,9 @@ import { promisify } from "node:util";
 import YAML from "yaml";
 
 import { runApply } from "../scripts/apply.mjs";
+import { enabledServiceIds } from "../scripts/render-topology.mjs";
+import { requiredSecrets } from "../scripts/secrets.mjs";
+import { loadContracts } from "../scripts/contracts.mjs";
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -58,6 +90,7 @@ let hostKeyFingerprint;
 let servicesPath;
 let releaseLockPath;
 let eeImageReference;
+let fakeSecretValues;
 
 async function waitForSsh(ip, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -69,7 +102,18 @@ async function waitForSsh(ip, timeoutMs) {
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
-  throw new Error(`sshd on ${ip}:22 never became reachable within ${timeoutMs}ms`);
+  // A real, actionable failure - dump the container's own status and
+  // boot log so a CI failure here is diagnosable from the log alone,
+  // never a bare timeout with no further clue. Status matters as much
+  // as the log itself: systemd's own boot messages don't necessarily
+  // reach `docker logs` at all (they go to the journal, not the
+  // container's stdout/stderr, unless it correctly detects it's
+  // containerized - see the fixture's own ENV container=docker) - an
+  // empty log with status "running" means something different from an
+  // empty log with a real exit code.
+  const status = await exec("docker", ["inspect", "--format", "{{json .State}}", containerName]).then((r) => r.stdout).catch((error) => `(could not inspect container: ${error.message})`);
+  const logs = await exec("docker", ["logs", containerName]).then((r) => r.stdout + r.stderr).catch((error) => `(could not read container logs: ${error.message})`);
+  throw new Error(`sshd on ${ip}:22 never became reachable within ${timeoutMs}ms - container state: ${status} - boot log:\n${logs}`);
 }
 
 async function withFakeCosign(fn) {
@@ -109,8 +153,37 @@ before(async () => {
   await writeFile(path.join(workDir, "authorized_keys"), publicKey, { mode: 0o644 });
 
   await exec("docker", [
-    "run", "--detach", "--rm", "--name", containerName,
+    // No --rm here (unlike the target-less ssh-acceptance fixture) -
+    // if systemd crashes on boot, `after()`'s own `docker rm --force`
+    // still cleans it up, but --rm would otherwise auto-remove a
+    // crashed container before waitForSsh()'s own diagnostic `docker
+    // logs` call ever got to read its boot log.
+    "run", "--detach", "--name", containerName,
     "--network", networkName,
+    // The target fixture runs real systemd as PID 1 (see its own
+    // Dockerfile comment on why). A real, serious incident happened
+    // during this PR's own LOCAL development: `--privileged
+    // --cgroupns=host`, run on what turned out to be a real desktop (not
+    // an isolated sandbox), gave a test container real host tty/cgroup
+    // access and disrupted a real login session. The narrower,
+    // non-privileged alternative tried afterward (--cap-add SYS_ADMIN,
+    // no --privileged, no --cgroupns=host) is the documented way to run
+    // systemd in Docker without full privilege - but it did not
+    // actually work here: systemd itself exited silently (code 255,
+    // no output even with --log-target=console --log-level=debug)
+    // within ~100ms on this specific runner/kernel/Docker combination,
+    // confirmed by CI, not guessed at. `--privileged` is used here
+    // instead, deliberately scoped to ONLY this CI-run acceptance test
+    // (pnpm test:apply-ssh, never run locally in this session again,
+    // by the same standing decision the earlier incident produced) -
+    // a GitHub Actions runner is a genuinely disposable, single-purpose
+    // VM with nothing else on it a stray device/tty access could ever
+    // disrupt, unlike a developer's own real desktop. --cgroupns=host
+    // is still deliberately NOT added - --privileged alone is
+    // sufficient and keeps this from being the exact flag combination
+    // that caused the original incident.
+    "--privileged",
+    "--tmpfs", "/run", "--tmpfs", "/run/lock",
     "--volume", `${workDir}/host_key:/hof-keys/host_key:ro`,
     "--volume", `${workDir}/authorized_keys:/hof-keys/authorized_keys:ro`,
     targetImageTag,
@@ -126,6 +199,11 @@ before(async () => {
   manifest.target = { host: targetIp, user: "hofprobe", port: 22 };
   servicesPath = path.join(workDir, "services.yml");
   await writeFile(servicesPath, YAML.stringify(manifest));
+
+  const { catalog } = await loadContracts();
+  fakeSecretValues = Object.fromEntries(
+    requiredSecrets(manifest, enabledServiceIds(manifest, catalog)).map((s) => [s.name, `fake-value-${s.name}`]),
+  );
 
   // The release lock's own ansibleEnvironment.image stays whatever
   // schema-valid, illustrative placeholder examples/release-lock.json
@@ -148,17 +226,50 @@ after(async () => {
   if (workDir) await rm(workDir, { recursive: true, force: true });
 });
 
+// apply.mjs's own sanitizeError() only ever keeps the last 8 lines of a
+// failed operation's raw output (by design - never a raw dump into the
+// journal/stdout event stream) - useful for a real operator, but it can
+// hide the actually-useful failure detail (confirmed for real: an
+// unrelated trailing interpreter-discovery warning pushed the real
+// "fatal:" line out of that 8-line window during this test's own
+// development). Wraps the real dockerRun with the exact same
+// argv/behavior, logging the complete, untruncated stdout/stderr of
+// only a FAILED operation to this process's own stderr - never reaches
+// apply.mjs's own journal/NDJSON stream, and never fires for the (many,
+// expected) successful operations a real bootstrap run dispatches.
+function loggingDockerRun(command, args, options) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { maxBuffer: 8 * 1024 * 1024, ...options }, (error, stdout, stderr) => {
+      if (error) {
+        console.error(`--- docker ${args.join(" ")} failed ---\nstdout:\n${stdout}\nstderr:\n${stderr}\n--- end ---`);
+        reject(Object.assign(error, { stdout, stderr }));
+      } else {
+        resolve({ stdout, stderr });
+      }
+    });
+  });
+}
+
 function baseOptions() {
   return {
     manifestPath: servicesPath, releaseLockPath, releaseLockIdentity: "test@example.com",
     hostKeySha256: hostKeyFingerprint, identityFile: userKeyPath, connectTimeoutSeconds: 15,
     recoveryAgeRecipient: "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
     verifyEeSignature: async () => {},
+    dockerRun: loggingDockerRun,
     executionEnvironmentImageOverride: eeImageReference,
+    // The target only exists on this test's own private Docker bridge
+    // network (never a published host port) - the Execution
+    // Environment container must join that same network to reach it at
+    // all (confirmed for real: Docker refuses inter-network traffic
+    // between two separate bridge networks by default).
+    executionEnvironmentDockerNetwork: networkName,
+    secretsStorePath: "/dev/null", // never actually read - readSecretsStore is stubbed below
+    readSecretsStore: async () => fakeSecretValues,
   };
 }
 
-test("a real, fully end-to-end bootstrap apply: real SSH, real lock/journal over SSH, real EE container dispatch reaching the real target, real commit", async () => {
+test("a real bootstrap apply: real Docker install, real secret delivery, real volume creation, then a real, expected image failure", async () => {
   // Discover the real planId the same way the CLI's own operator
   // workflow does: run once with an intentionally wrong id, read the
   // real one back out of the refusal.
@@ -169,32 +280,69 @@ test("a real, fully end-to-end bootstrap apply: real SSH, real lock/journal over
   const events = [];
   const result = await withFakeCosign(() => runApply({ ...baseOptions(), approvePlanId: planId, emit: (event) => events.push(event) }));
 
-  assert.equal(result.blocked, false, JSON.stringify(result));
-  assert.equal(result.committedGeneration, 1);
-  assert.equal(result.planId, planId);
+  // examples/release-lock.json's own images/signing identities are
+  // illustrative (fake digests/identities - see this file's own top
+  // comment) - a real cosign verify or docker pull against them
+  // genuinely fails. This IS the expected outcome, not a bug: it's real
+  // coverage of apply.mjs's own failure path.
+  assert.equal(result.blocked, true, JSON.stringify(result));
+  assert.equal(result.reason, "operation");
+  assert.match(result.diagnostics[0], /operation \d{3}\.image\.(verify|pull)/);
 
   const operationEvents = events.filter((event) => event.apiVersion === "hof.dev/operation-event/v1");
-  assert.ok(operationEvents.length > 10, "a real topology this size dispatches many real operations");
-  assert.ok(operationEvents.every((event) => event.phase === "started" || event.phase === "succeeded"));
-  assert.ok(events.some((event) => event.type === "apply.committed"));
+  const succeeded = operationEvents.filter((event) => event.phase === "succeeded").map((event) => event.step);
+  const failed = operationEvents.filter((event) => event.phase === "failed");
+
+  // host.prepare (real apt-installed Docker), secret.ensure (a real
+  // secret file delivered over real SSH), and every volume.ensure (a
+  // real, Hof-labeled Docker volume) all genuinely succeeded before the
+  // run ever reached an image operation - network.ensure never appears
+  // at all in a bootstrap plan (see plan.mjs's own computeMissingResources:
+  // a synthetic empty baseline has no networks to find "missing").
+  assert.ok(succeeded.some((step) => step.endsWith(".host.prepare")), "host.prepare succeeded for real");
+  assert.ok(succeeded.some((step) => step.endsWith(".secret.ensure")), "secret.ensure succeeded for real");
+  assert.ok(succeeded.some((step) => step.includes(".volume.ensure.")), "at least one volume.ensure succeeded for real");
+  assert.equal(failed.length, 1, "exactly one real, expected failure - the run stops at the first one");
+  assert.match(failed[0].step, /\.image\.(verify|pull)\./);
+
+  // blocked() results (see apply.mjs) carry no operationId of their own
+  // (only a successful {blocked: false, operationId, ...} result does) -
+  // every real operation-event-v1 already shares the one this run
+  // actually used, so read it from there instead.
+  const operationId = operationEvents[0].operationId;
+  assert.ok(operationEvents.every((event) => event.operationId === operationId));
 
   // The real, durable, on-target record - read directly, over a second,
   // independent real SSH connection (docker exec into the same
   // container, bypassing this module's own transport entirely) so this
   // assertion can't be fooled by a bug in target-mutate.mjs's own
   // reader.
-  const { stdout: journalRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${result.operationId}.json`]);
+  const { stdout: journalRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${operationId}.json`]);
   const journal = JSON.parse(journalRaw);
-  assert.equal(journal.status, "succeeded");
-  assert.equal(journal.committedGeneration, 1);
+  assert.equal(journal.status, "failed");
   assert.equal(journal.approvedPlanId, planId);
 
-  const { stdout: eventsRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${result.operationId}.events.ndjson`]);
+  const { stdout: eventsRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${operationId}.events.ndjson`]);
   const durableEvents = eventsRaw.trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual(durableEvents, operationEvents, "the live NDJSON stream matches the durable journal exactly, event for event");
 
-  // A successful commit always releases the lock (ADR 0004) - confirmed
-  // by a real, independent `test -e` on the target, not just this
-  // module's own readLock().
+  // A real secret genuinely landed on the target, root-owned, mode 0400
+  // - delivered via ansible.builtin.copy over the real SSH/SFTP
+  // connection, never through extra-vars (see the secret role's own
+  // tasks/main.yml).
+  const firstSecretName = Object.keys(fakeSecretValues)[0];
+  const { stdout: secretRaw } = await exec("docker", ["exec", containerName, "cat", `/etc/hof/secrets/${firstSecretName}`]);
+  assert.equal(secretRaw, fakeSecretValues[firstSecretName]);
+  const { stdout: secretStat } = await exec("docker", ["exec", containerName, "stat", "--format", "%a %U", `/etc/hof/secrets/${firstSecretName}`]);
+  assert.equal(secretStat.trim(), "400 root");
+
+  // Docker itself was genuinely installed by host.prepare, not merely
+  // reported as installed.
+  const { stdout: dockerVersion } = await exec("docker", ["exec", containerName, "docker", "--version"]);
+  assert.match(dockerVersion, /Docker version/);
+
+  // A real, definitive operation failure releases the lock (ADR 0004) -
+  // confirmed by a real, independent `test -e` on the target, not just
+  // this module's own readLock().
   await assert.rejects(() => exec("docker", ["exec", containerName, "test", "-e", "/var/lib/hof/state/lock.json"]));
 });

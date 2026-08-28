@@ -1,5 +1,12 @@
 ---
-# volume.ensure - a named, Hof-labeled Docker volume (see render-topology.mjs's own resourceOwnershipLabels).
-# Real implementation (PR #28/#29): community.docker.docker_volume, idempotent, with the exact same hof.managed/installation-id/generation/kind/resource labels the renderer already puts on it.
+# volume.ensure - a named, Hof-labeled Docker volume, idempotent - the
+# exact same hof.managed/installation-id/generation/kind/resource label
+# set render-topology.mjs's own resourceOwnershipLabels() already writes
+# into the compose.yml this same apply run's config.write operation
+# places on the target, so a volume created here and one Compose would
+# have created on its own first `up` are byte-for-byte the same
+# resource, never two different label sets fighting each other.
 hof_operation_id: null
 hof_volume_name: null
+hof_installation_id: null
+hof_generation: null

@@ -102,7 +102,12 @@ async function waitForSsh(ip, timeoutMs) {
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
-  throw new Error(`sshd on ${ip}:22 never became reachable within ${timeoutMs}ms`);
+  // A real, actionable failure - dump the container's own boot log (its
+  // systemd journal, since the target fixture runs systemd as PID 1) so
+  // a CI failure here is diagnosable from the log alone, never a bare
+  // timeout with no further clue.
+  const logs = await exec("docker", ["logs", containerName]).then((r) => r.stdout + r.stderr).catch((error) => `(could not read container logs: ${error.message})`);
+  throw new Error(`sshd on ${ip}:22 never became reachable within ${timeoutMs}ms - container boot log:\n${logs}`);
 }
 
 async function withFakeCosign(fn) {
@@ -145,21 +150,26 @@ before(async () => {
     "run", "--detach", "--rm", "--name", containerName,
     "--network", networkName,
     // The target fixture runs real systemd as PID 1 (see its own
-    // Dockerfile comment on why). Deliberately NOT --privileged and
-    // NOT --cgroupns=host - both were tried during this PR's own
+    // Dockerfile comment on why). Deliberately NOT --privileged and NOT
+    // --cgroupns=host - both were tried during this PR's own
     // development and caused a real, serious incident (a privileged,
-    // host-cgroup-namespace-sharing systemd container reached real
-    // host tty devices and interfered with real host services/cgroups
-    // on the machine it was run on). --cgroupns=private (the default -
-    // left unspecified here) keeps the container's systemd confined to
-    // its own isolated cgroup namespace; mounting the host's cgroupfs
-    // read-write, WITHOUT sharing the namespace itself, is the
-    // standard, narrower way to let a container's own systemd manage
-    // services within its own delegated slice on a cgroup v2 host
-    // (which GitHub Actions' own ubuntu-24.04 runners are) - no device
-    // access, no host cgroup namespace, no `--privileged` at all.
+    // host-cgroup-namespace-sharing systemd container reached real host
+    // tty devices and interfered with real host services/cgroups on the
+    // machine it was run on). This is the documented, narrower,
+    // non-privileged recipe instead (confirmed against Docker/systemd's
+    // own guidance on cgroup v2 hosts - see this PR's own history for
+    // the sources): --cgroupns=private (the default, left unspecified)
+    // keeps the container's own cgroup namespace fully isolated from
+    // the host's, and Docker itself automatically delegates a private,
+    // writable cgroup2 mount for it - manually bind-mounting the host's
+    // own /sys/fs/cgroup (an earlier version of this recipe did) is
+    // explicitly the WRONG thing to do here, since it fights Docker's
+    // own delegation instead of using it. --cap-add SYS_ADMIN is the
+    // one real capability systemd needs to manage its own mounts inside
+    // that isolated namespace - a real, narrow grant, nowhere near
+    // `--privileged`'s full capability set plus host device access.
     "--tmpfs", "/run", "--tmpfs", "/run/lock",
-    "--volume", "/sys/fs/cgroup:/sys/fs/cgroup:rw",
+    "--cap-add", "SYS_ADMIN",
     "--volume", `${workDir}/host_key:/hof-keys/host_key:ro`,
     "--volume", `${workDir}/authorized_keys:/hof-keys/authorized_keys:ro`,
     targetImageTag,

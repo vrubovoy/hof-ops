@@ -46,6 +46,13 @@ const SSH_HARDENING = [
   "-o", "PermitLocalCommand=no",
   "-o", "RequestTTY=no",
   "-o", "ConnectionAttempts=1",
+  // Same reasoning as target-inspector.mjs's own identical hardening
+  // list (duplicated deliberately, not imported - see this file's own
+  // top comment): never let a stray ~/.ssh/config ProxyJump/ProxyCommand
+  // for this hostname silently route target-mutate's own real mutations
+  // through an intermediary the target binding never recorded.
+  "-o", "ProxyCommand=none",
+  "-o", "ProxyJump=none",
 ];
 
 const HOSTNAME_PATTERN = /^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*$/;

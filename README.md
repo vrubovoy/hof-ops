@@ -151,10 +151,15 @@ workstation, SOPS-encrypted to age (see below).
 push keypair, Herold's credential-encryption key, Wächter's agent token) -
 fresh random values the first time each is needed, never regenerated once
 present. The plaintext store never leaves the operator's own workstation
-(matching `tls.certificatePath`'s own "supplied TLS reads from the
-workstation" convention) - it's SOPS-encrypted to age, to both the
-operator's own recipient and a required external recovery recipient, so a
-lost workstation doesn't also mean permanently lost secrets.
+(matching `tls.certificatePath`/`tls.privateKeyPath`'s own "supplied TLS
+reads from the workstation" convention - `scripts/supplied-tls.mjs`
+genuinely parses both files, confirms the key actually matches the
+certificate, checks it's currently valid, and confirms its SAN covers
+every public hostname this deployment serves, before `apply` delivers
+either to the target the same way it delivers any other secret) - it's
+SOPS-encrypted to age, to both the operator's own recipient and a
+required external recovery recipient, so a lost workstation doesn't also
+mean permanently lost secrets.
 
 ```sh
 node scripts/hofctl.mjs secrets ensure \

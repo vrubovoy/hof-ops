@@ -119,35 +119,43 @@ test("refuses a bootstrap plan with no recovery age recipient at all", async () 
   );
 });
 
-test("suppliedTls: required and embedded correctly when manifest.tls.mode is \"supplied\", omitted for acme-http01", async () => {
+test("suppliedTls: both fingerprints required and embedded correctly when manifest.tls.mode is \"supplied\", omitted for acme-http01", async () => {
   const validate = await planV2Validator();
   const supplied = await fixture((c) => {
     c.manifest.tls = { mode: "supplied", certificatePath: "/etc/hof/tls/fullchain.pem", privateKeyPath: "/etc/hof/tls/privkey.pem" };
   });
-  const fingerprint = "sha256:" + "a".repeat(64);
+  const certificateFingerprint = "sha256:" + "a".repeat(64);
+  const privateKeyFingerprint = "sha256:" + "b".repeat(64);
   const plan = buildPlanV2({
-    ...bootstrapOptions({ suppliedTlsCertificateFingerprint: fingerprint }),
+    ...bootstrapOptions({ suppliedTlsCertificateFingerprint: certificateFingerprint, suppliedTlsPrivateKeyFingerprint: privateKeyFingerprint }),
     desiredRendered: supplied.rendered, manifest: supplied.contracts.manifest, releaseLock: supplied.contracts.releaseLock, catalog: supplied.contracts.catalog,
   });
-  assert.deepEqual(plan.suppliedTls, { mode: "supplied", certificateFingerprint: fingerprint });
+  assert.deepEqual(plan.suppliedTls, { mode: "supplied", certificateFingerprint, privateKeyFingerprint });
   assert.ok(validate(plan), JSON.stringify(validate.errors));
 });
 
-test("suppliedTls: refuses to plan a \"supplied\" tls mode with no certificate fingerprint given", async () => {
+test("suppliedTls: refuses to plan a \"supplied\" tls mode with no certificate/private-key fingerprint given", async () => {
   const supplied = await fixture((c) => {
     c.manifest.tls = { mode: "supplied", certificatePath: "/etc/hof/tls/fullchain.pem", privateKeyPath: "/etc/hof/tls/privkey.pem" };
   });
   assert.throws(
     () => buildPlanV2({ ...bootstrapOptions(), desiredRendered: supplied.rendered, manifest: supplied.contracts.manifest, releaseLock: supplied.contracts.releaseLock, catalog: supplied.contracts.catalog }),
-    /manifest\.tls\.mode is "supplied" but no suppliedTlsCertificateFingerprint was given/,
+    /manifest\.tls\.mode is "supplied" but no suppliedTlsCertificateFingerprint\/suppliedTlsPrivateKeyFingerprint was given/,
+  );
+  // Half-given (a real bug this test exists to catch: only one of the
+  // two fingerprints supplied) must refuse too, not silently plan with
+  // an incomplete pair.
+  assert.throws(
+    () => buildPlanV2({ ...bootstrapOptions({ suppliedTlsCertificateFingerprint: "sha256:" + "a".repeat(64) }), desiredRendered: supplied.rendered, manifest: supplied.contracts.manifest, releaseLock: supplied.contracts.releaseLock, catalog: supplied.contracts.catalog }),
+    /manifest\.tls\.mode is "supplied" but no suppliedTlsCertificateFingerprint\/suppliedTlsPrivateKeyFingerprint was given/,
   );
 });
 
 test("suppliedTls: refuses a fingerprint given for a non-\"supplied\" tls mode", async () => {
   const { contracts, rendered } = await fixture();
   assert.throws(
-    () => buildPlanV2({ ...bootstrapOptions({ suppliedTlsCertificateFingerprint: "sha256:" + "a".repeat(64) }), desiredRendered: rendered, manifest: contracts.manifest, releaseLock: contracts.releaseLock, catalog: contracts.catalog }),
-    /suppliedTlsCertificateFingerprint was given but manifest\.tls\.mode is not "supplied"/,
+    () => buildPlanV2({ ...bootstrapOptions({ suppliedTlsCertificateFingerprint: "sha256:" + "a".repeat(64), suppliedTlsPrivateKeyFingerprint: "sha256:" + "b".repeat(64) }), desiredRendered: rendered, manifest: contracts.manifest, releaseLock: contracts.releaseLock, catalog: contracts.catalog }),
+    /suppliedTlsCertificateFingerprint\/suppliedTlsPrivateKeyFingerprint was given but manifest\.tls\.mode is not "supplied"/,
   );
 });
 

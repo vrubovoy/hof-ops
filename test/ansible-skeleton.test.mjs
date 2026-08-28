@@ -79,6 +79,21 @@ test("host role bootstraps python3 via raw before gathering facts, then installs
   assert.match(tasksYaml, /when: hof_docker_check\.rc != 0/, "Docker install must be skipped when target-inspector.mjs already confirmed it's present");
 });
 
+test("host role checks and installs the Compose plugin independently of Engine's own presence - a real gap found in a 2026-08-28 review", () => {
+  const { tasksYaml } = loadRoleFiles("host");
+  assert.match(tasksYaml, /docker compose version/, "must independently probe for the Compose plugin, not just `docker --version`");
+  assert.match(tasksYaml, /when: hof_compose_check\.rc != 0/, "the plugin install itself must be gated on hof_compose_check alone");
+  // The actual install task (docker-compose-plugin as an apt package
+  // name, not just mentioned in a comment) must exist as its own task -
+  // never nested only inside the Engine-absent block, which is exactly
+  // the real gap a 2026-08-28 review found: an Engine-present-but-
+  // Compose-absent target silently never got it installed.
+  const tasks = YAML.parseAllDocuments(tasksYaml)[0].toJSON();
+  const composeInstallTask = tasks.find((t) => t["ansible.builtin.apt"]?.name === "docker-compose-plugin");
+  assert.ok(composeInstallTask, "must have its own dedicated task installing docker-compose-plugin");
+  assert.equal(composeInstallTask.when, "hof_compose_check.rc != 0");
+});
+
 test("secret role never logs secret content and delivers each value via a real SSH-transported copy, not extra-vars", () => {
   const { tasksYaml } = loadRoleFiles("secret");
   assert.match(tasksYaml, /no_log: true/);

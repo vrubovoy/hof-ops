@@ -163,3 +163,55 @@ revisiting the design itself:
 Every other decision above (target binding, the signed Execution
 Environment, the durable lock, the whitelist, the atomic last commit)
 is unchanged.
+
+## Errata (2026-08-28, PR #32)
+
+The same review named five further, High-severity gaps in item 8's
+bootstrap/apply scope, all closed without revisiting this ADR's own
+decisions:
+
+- **Supplied TLS material was fingerprinted into the plan but never
+  actually delivered.** The rendered Compose file's gateway service
+  bind-mounted `manifest.tls.certificatePath`/`privateKeyPath` directly
+  - workstation paths, meaningless to Compose running on the target.
+  `scripts/supplied-tls.mjs` also never validated the certificate/key at
+  all (no parse, no key-match check, the private key was never even
+  read). Fixed: that module now genuinely parses the certificate (Node's
+  builtin `X509Certificate`), confirms the private key corresponds to it
+  (`checkPrivateKey`), checks current validity, and confirms the SAN
+  covers every public hostname the deployment serves (exact or wildcard
+  match); `apply` delivers the real certificate/key content the same way
+  it delivers any other secret (never through extra-vars/the journal,
+  never through the generic config.write path); the rendered Compose
+  file now bind-mounts the two fixed target-side paths that delivery
+  actually writes to.
+- **A target with Docker Engine already present but the Compose plugin
+  specifically missing was never fixed.** The `host` role's install
+  block only ever ran when `docker --version` failed - a target with a
+  working Engine from an Engine-only install (or the old standalone
+  `docker-compose` binary) silently never got the plugin. Fixed: the
+  role now checks `docker compose version` independently of Engine's own
+  presence, and installs the plugin in its own task, gated on that check
+  alone.
+- **`apply` never re-verified the exact supported platform itself.**
+  `hofctl preflight` already checks Debian 12/Ubuntu 24.04/x86_64, but
+  nothing required a successful preflight run before `apply`, and the
+  Ansible host role's own OS assert only runs after `host.prepare` has
+  already started a real `apt-get` install - too late to be the actual
+  mutating boundary. Fixed: `apply`'s own live plan recompute (both
+  before the lock and, again, under it) now runs the identical OS/
+  architecture checks before resolving anything about the target's own
+  topology.
+- **Journal and lock documents read off the target were never schema-
+  validated.** `target-mutate.mjs`'s own `readLock()`/`readJournal()`
+  only ever `JSON.parse` the raw bytes they read back; a hand-tampered
+  or corrupted document would have been silently trusted. Fixed: `apply`
+  now validates both against their own schemas immediately after every
+  read, before ever acting on a field from either.
+- **A stray `~/.ssh/config` `ProxyJump`/`ProxyCommand` for the target
+  hostname could silently route real bytes through an intermediary the
+  target binding never recorded.** Neither `target-inspector.mjs` nor
+  `target-mutate.mjs`'s own SSH hardening disabled either directive.
+  Fixed: both now pass `-o ProxyCommand=none -o ProxyJump=none`
+  (OpenSSH's own documented override), so a connection is always direct,
+  matching the target binding's own literal host/port.

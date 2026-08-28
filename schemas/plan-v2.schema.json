@@ -70,13 +70,14 @@
       }
     },
     "suppliedTls": {
-      "description": "Present only when the manifest's tls.mode is \"supplied\" - the sha256 of the certificate file as read from the operator's own workstation at planning time (never the certificate or key content itself, and never the private key's digest either - only enough to let apply detect the file changing between planning and execution).",
+      "description": "Present only when the manifest's tls.mode is \"supplied\" - the sha256 of the certificate and private key files as read from the operator's own workstation at planning time (never the certificate or key content itself - only enough to let apply detect either file changing between planning and execution). By the time these fingerprints exist, scripts/supplied-tls.mjs has already confirmed the key pair actually matches, the certificate is currently valid, and its Subject Alternative Name covers every public hostname this deployment serves.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["mode", "certificateFingerprint"],
+      "required": ["mode", "certificateFingerprint", "privateKeyFingerprint"],
       "properties": {
         "mode": { "const": "supplied" },
-        "certificateFingerprint": { "$ref": "#/$defs/digestOrNull" }
+        "certificateFingerprint": { "$ref": "#/$defs/digestOrNull" },
+        "privateKeyFingerprint": { "$ref": "#/$defs/digestOrNull" }
       }
     },
     "baseline": { "$ref": "#/$defs/baselineState" },

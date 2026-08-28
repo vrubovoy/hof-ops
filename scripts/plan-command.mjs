@@ -39,7 +39,7 @@ import { buildPlanV2, planV2Validator } from "./plan-v2.mjs";
 import { checkManagedStateReadable, observationFromSnapshot } from "./preflight.mjs";
 import { renderTopology } from "./render-topology.mjs";
 import { resolveBaseline } from "./state.mjs";
-import { suppliedTlsCertificateFingerprint } from "./supplied-tls.mjs";
+import { readSuppliedTlsMaterial } from "./supplied-tls.mjs";
 import { inspectTarget } from "./target-inspector.mjs";
 import { loadAndValidateDeployment } from "./validate-deployment.mjs";
 
@@ -166,7 +166,7 @@ export async function runPlan(options) {
     // approved planId actually mean something (see ADR 0004).
     let suppliedTls;
     try {
-      suppliedTls = await suppliedTlsCertificateFingerprint(manifest);
+      suppliedTls = await readSuppliedTlsMaterial(manifest, catalog);
     } catch (error) {
       return blocked("tls", error instanceof Error ? error.message : String(error));
     }
@@ -188,7 +188,8 @@ export async function runPlan(options) {
         baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift: options.repairDrift ?? false,
         target: { mode: targetMode, host, port, user, hostKeySha256: snapshot.transport.trustDigest },
         recoveryAgeRecipient: options.recoveryAgeRecipient,
-        suppliedTlsCertificateFingerprint: suppliedTls,
+        suppliedTlsCertificateFingerprint: suppliedTls?.certificateFingerprint,
+        suppliedTlsPrivateKeyFingerprint: suppliedTls?.privateKeyFingerprint,
       });
     } catch (error) {
       return blocked("plan", error instanceof Error ? error.message : String(error));

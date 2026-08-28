@@ -6,7 +6,7 @@
 # comes up, exactly like it would on a real target). Nothing here is
 # baked into the image - the actual key material always comes from
 # /hof-keys, mounted read-only by test/apply-acceptance.mjs.
-set -eu
+set -eux
 
 cp /hof-keys/host_key /etc/ssh/ssh_host_ed25519_key
 chmod 600 /etc/ssh/ssh_host_ed25519_key
@@ -23,4 +23,4 @@ chown -R hofprobe:hofprobe /home/hofprobe/.ssh
 chmod 700 /home/hofprobe/.ssh
 chmod 600 /home/hofprobe/.ssh/authorized_keys
 
-exec /lib/systemd/systemd
+exec /lib/systemd/systemd --log-target=console --log-level=debug

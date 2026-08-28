@@ -73,3 +73,10 @@ provenance) `ghcr.io/vrubovoy/hof-ops-ee:v0.1.0` - the `v0.1.0` image
 tag (not `ee-v0.1.0`) is what `examples/release-selection.yml`'s own
 `ansibleEnvironment.image` and `version: "0.1.0"` reference, matching
 every other component's own `:v${version}` convention.
+
+`ee-v0.1.0` has actually been cut this way, for real, closing out item 8:
+`ghcr.io/vrubovoy/hof-ops-ee@sha256:ff58ec8b377fe72f86317bad606c5412ea09e6a678f16c113b7b2be2c791b306`,
+independently re-verified with a real `cosign verify` against the exact
+workflow identity above (real transparency-log/certificate-authority
+checks, not skipped) and confirmed to carry both attestations
+(`https://spdx.dev/Document/v2.3` and `https://slsa.dev/provenance/v1`).

@@ -72,8 +72,12 @@ resume after an interruption. The Execution Environment's own ten roles
 verification (Cosign, delegated to the control node) and pull, generated-file
 delivery, database migration, service startup, readiness polling, and the
 final atomic state commit - see `ansible/README.md` for exactly what's
-verified for real in CI versus locally. Item 8 itself closes with this:
-a bootstrap onto a genuinely clean host, start to finish. Applied-mode
+verified for real in CI versus locally. The Execution Environment image
+itself has been cut and published for real
+(`ghcr.io/vrubovoy/hof-ops-ee:v0.1.0`, real keyless Cosign signature and
+SBOM/provenance attestations - see `ansible/README.md`'s own
+Versioning section). Item 8 itself closes with this: a bootstrap onto a
+genuinely clean host, start to finish. Applied-mode
 reconciliation (update/remove), backup/restore, upgrade/rollback,
 first-admin bootstrap, and the installer UI are later delivery items - see
 the Delivery Order in the plan linked above.

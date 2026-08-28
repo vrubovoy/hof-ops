@@ -382,10 +382,12 @@ test("a real, full bootstrap apply against the real, published, signed v0.1.2 re
   // the target too, byte-for-byte, root-owned, mode 0400. (A real gap a
   // 2026-08-28 review found - Compose's own file-based secrets are a
   // plain bind-mount, so 0400 root-owned is invisible to any non-root
-  // consuming container - is fixed in a following PR that also cuts a
-  // new Execution Environment to actually deliver the new 0444 mode
-  // this exact pinned image doesn't have baked in yet; this assertion
-  // flips to 444 there, once it's genuinely true.)
+  // consuming container - is fixed in ansible/roles/secret/tasks/
+  // main.yml as of this very commit, but that source change alone
+  // doesn't affect this exact pinned ee-v0.1.1 image at all - roles/ is
+  // baked in at image-build time. This assertion flips to 444 in the
+  // PR that cuts a new Execution Environment and platform release
+  // actually carrying this fix, once it's genuinely true.)
   const { stdout: deliveredCertificate } = await exec("docker", ["exec", containerName, "cat", "/etc/hof/secrets/hof.tls.certificate"]);
   assert.equal(deliveredCertificate, suppliedTlsCertificatePem);
   const { stdout: deliveredPrivateKey } = await exec("docker", ["exec", containerName, "cat", "/etc/hof/secrets/hof.tls.privateKey"]);

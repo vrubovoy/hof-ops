@@ -228,19 +228,24 @@ after(async () => {
 
 // apply.mjs's own sanitizeError() only ever keeps the last 8 lines of a
 // failed operation's raw output (by design - never a raw dump into the
-// journal/stdout event stream) - useful for a real operator, but it
-// hides the actually-useful failure detail when THIS test itself is
-// what's failing during development. Wraps the real dockerRun with the
-// exact same argv/behavior, additionally logging the complete,
-// untruncated stdout/stderr of every dispatched operation to this
-// process's own stderr - never reaches apply.mjs's own journal/NDJSON
-// stream, purely a local diagnostic aid.
+// journal/stdout event stream) - useful for a real operator, but it can
+// hide the actually-useful failure detail (confirmed for real: an
+// unrelated trailing interpreter-discovery warning pushed the real
+// "fatal:" line out of that 8-line window during this test's own
+// development). Wraps the real dockerRun with the exact same
+// argv/behavior, logging the complete, untruncated stdout/stderr of
+// only a FAILED operation to this process's own stderr - never reaches
+// apply.mjs's own journal/NDJSON stream, and never fires for the (many,
+// expected) successful operations a real bootstrap run dispatches.
 function loggingDockerRun(command, args, options) {
   return new Promise((resolve, reject) => {
-    const child = execFile(command, args, { maxBuffer: 8 * 1024 * 1024, ...options }, (error, stdout, stderr) => {
-      console.error(`--- docker ${args.join(" ")} ---\nstdout:\n${stdout}\nstderr:\n${stderr}\n--- end ---`);
-      if (error) reject(Object.assign(error, { stdout, stderr }));
-      else resolve({ stdout, stderr });
+    execFile(command, args, { maxBuffer: 8 * 1024 * 1024, ...options }, (error, stdout, stderr) => {
+      if (error) {
+        console.error(`--- docker ${args.join(" ")} failed ---\nstdout:\n${stdout}\nstderr:\n${stderr}\n--- end ---`);
+        reject(Object.assign(error, { stdout, stderr }));
+      } else {
+        resolve({ stdout, stderr });
+      }
     });
   });
 }
@@ -300,17 +305,24 @@ test("a real bootstrap apply: real Docker install, real secret delivery, real vo
   assert.equal(failed.length, 1, "exactly one real, expected failure - the run stops at the first one");
   assert.match(failed[0].step, /\.image\.(verify|pull)\./);
 
+  // blocked() results (see apply.mjs) carry no operationId of their own
+  // (only a successful {blocked: false, operationId, ...} result does) -
+  // every real operation-event-v1 already shares the one this run
+  // actually used, so read it from there instead.
+  const operationId = operationEvents[0].operationId;
+  assert.ok(operationEvents.every((event) => event.operationId === operationId));
+
   // The real, durable, on-target record - read directly, over a second,
   // independent real SSH connection (docker exec into the same
   // container, bypassing this module's own transport entirely) so this
   // assertion can't be fooled by a bug in target-mutate.mjs's own
   // reader.
-  const { stdout: journalRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${result.operationId}.json`]);
+  const { stdout: journalRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${operationId}.json`]);
   const journal = JSON.parse(journalRaw);
   assert.equal(journal.status, "failed");
   assert.equal(journal.approvedPlanId, planId);
 
-  const { stdout: eventsRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${result.operationId}.events.ndjson`]);
+  const { stdout: eventsRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${operationId}.events.ndjson`]);
   const durableEvents = eventsRaw.trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual(durableEvents, operationEvents, "the live NDJSON stream matches the durable journal exactly, event for event");
 

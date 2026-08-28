@@ -72,8 +72,17 @@ function flattenPages(json) {
   return Array.isArray(value[0]) ? value.flat() : value;
 }
 
-async function resolveRevision(repository, version) {
-  const sourceTag = `v${version}`;
+// tagPrefix defaults to the platform's own "v" (every ordinary component
+// tag, e.g. v1.0.0) - the Ansible Execution Environment is the one
+// exception: it versions independently of the platform release inside
+// this SAME repository (see ansible/README.md's own "Versioning"
+// section), so its own git tag is ee-vX.Y.Z, never plain vX.Y.Z - two
+// different things sharing one repository must never be able to collide
+// on the same git tag. Only the git tag differs; the GHCR image tag it
+// produces is still the ordinary v${version} (see resolveBuiltArtifact's
+// own caller, which never changes selection.image's own expected suffix).
+async function resolveRevision(repository, version, tagPrefix = "v") {
+  const sourceTag = `${tagPrefix}${version}`;
   const revision = JSON.parse(await gh(["api", `repos/${repository}/commits/${sourceTag}`])).sha;
   if (!/^[a-f0-9]{40}$/.test(revision)) {
     throw new Error(`${repository}@${sourceTag}: GitHub did not resolve a full commit SHA`);
@@ -175,8 +184,8 @@ async function verifySupplyChain(selection, revision, image) {
   };
 }
 
-async function resolveBuiltArtifact(selection, includeComponentMetadata) {
-  const { revision, sourceTag } = await resolveRevision(selection.repository, selection.version);
+async function resolveBuiltArtifact(selection, includeComponentMetadata, tagPrefix = "v") {
+  const { revision, sourceTag } = await resolveRevision(selection.repository, selection.version, tagPrefix);
   await verifyChecks(selection.repository, revision, selection.requiredChecks);
   const digest = await resolveDigest(selection.image);
   const image = `${selection.image.replace(/:[^/:]+$/, "")}@${digest}`;
@@ -270,7 +279,11 @@ export async function buildReleaseLock(args) {
     components,
   };
   if (selection.ansibleEnvironment) {
-    releaseLock.ansibleEnvironment = await resolveBuiltArtifact(selection.ansibleEnvironment, false);
+    // "ee-v" - the Execution Environment's own git tag convention (see
+    // ansible/README.md's "Versioning" section and resolveRevision's own
+    // comment above) - never plain "v", which is the platform's own
+    // release tag in this SAME repository.
+    releaseLock.ansibleEnvironment = await resolveBuiltArtifact(selection.ansibleEnvironment, false, "ee-v");
   }
   validateWithSchema(lockSchema, releaseLock, "release lock");
   return releaseLock;

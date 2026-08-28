@@ -11,7 +11,7 @@
     "minimumHofctlVersion": { "$ref": "#/$defs/semver" },
     "catalogDigest": { "$ref": "#/$defs/sha256" },
     "composeTemplateDigest": { "$ref": "#/$defs/sha256" },
-    "ansibleEnvironment": { "$ref": "#/$defs/artifact" },
+    "ansibleEnvironment": { "$ref": "#/$defs/ansibleEnvironmentArtifact" },
     "components": {
       "type": "object",
       "minProperties": 1,
@@ -48,6 +48,22 @@
         "source": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/" },
         "revision": { "$ref": "#/$defs/commit" },
         "sourceTag": { "type": "string", "pattern": "^v?(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" },
+        "image": { "$ref": "#/$defs/image" },
+        "signatureIdentity": { "type": "string", "pattern": "^https://github\\.com/" },
+        "signatureOidcIssuer": { "type": "string", "format": "uri", "pattern": "^https://" },
+        "provenanceDigest": { "$ref": "#/$defs/sha256" },
+        "sbomDigest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "ansibleEnvironmentArtifact": {
+      "description": "Identical to $defs/artifact, except sourceTag - the Execution Environment versions independently of the platform release inside this SAME repository (see ansible/README.md's own \"Versioning\" section), so its own git tag is ee-vX.Y.Z, never plain vX.Y.Z (which build-release-lock.mjs's own resolveRevision() always uses for every ordinary component) - two different things sharing one repository must never be able to collide on the same git tag. Deliberately a full duplicate of $defs/artifact, not a $ref override (JSON Schema's own $ref inclusion is additive, not an override mechanism - a sibling `properties.sourceTag` next to a $ref to $defs/artifact would require BOTH patterns to match at once, which is never satisfiable).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "revision", "sourceTag", "image", "signatureIdentity", "signatureOidcIssuer", "provenanceDigest", "sbomDigest"],
+      "properties": {
+        "source": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/" },
+        "revision": { "$ref": "#/$defs/commit" },
+        "sourceTag": { "type": "string", "pattern": "^ee-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" },
         "image": { "$ref": "#/$defs/image" },
         "signatureIdentity": { "type": "string", "pattern": "^https://github\\.com/" },
         "signatureOidcIssuer": { "type": "string", "format": "uri", "pattern": "^https://" },

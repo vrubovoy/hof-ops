@@ -56,11 +56,14 @@ tag, a real passing CI check, a real Cosign signature, real SBOM/
 provenance attestations - see `resolveBuiltArtifact()`). Its own tag is
 `ee-vX.Y.Z`, **not** plain `vX.Y.Z` - hof-ops's own platform release
 (`.github/workflows/release.yml`) creates a plain `vX.Y.Z` tag on this
-same repository via `gh release create`, and
-`scripts/build-release-lock.mjs`'s `resolveRevision()` always looks up
-a component's own tag as literally `v${version}` regardless of
-component - two different things sharing the same repository must never
-be able to collide on the same git tag.
+same repository via `gh release create`. `resolveBuiltArtifact()` takes
+an explicit `tagPrefix` argument for exactly this reason - `"v"` for
+every ordinary component, `"ee-v"` only for the Ansible Execution
+Environment - so the two can never be able to collide on the same git
+tag (a real gap a 2026-08-28 review found: `resolveRevision()` used to
+always look up `v${version}` regardless of component, meaning a real
+release build could never actually have resolved this component's own
+real tag at all - see PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry).
 
 ```sh
 git tag ee-v0.1.0

@@ -40,6 +40,14 @@ RUN { \
 COPY entrypoint.sh /usr/local/bin/hof-probe-entrypoint.sh
 RUN chmod +x /usr/local/bin/hof-probe-entrypoint.sh
 
+# The standard signal every systemd-in-Docker image sets - without it,
+# systemd doesn't reliably detect it's running inside a container and
+# can behave unpredictably (including, in practice, never actually
+# logging its own boot sequence to stdout/stderr the way `docker logs`
+# can see - a real, confirmed symptom hit during this fixture's own
+# development, not a hypothetical one).
+ENV container=docker
+
 EXPOSE 22
 STOPSIGNAL SIGRTMIN+3
 CMD ["/usr/local/bin/hof-probe-entrypoint.sh"]

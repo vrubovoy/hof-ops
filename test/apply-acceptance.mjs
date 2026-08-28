@@ -102,12 +102,18 @@ async function waitForSsh(ip, timeoutMs) {
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
-  // A real, actionable failure - dump the container's own boot log (its
-  // systemd journal, since the target fixture runs systemd as PID 1) so
-  // a CI failure here is diagnosable from the log alone, never a bare
-  // timeout with no further clue.
+  // A real, actionable failure - dump the container's own status and
+  // boot log so a CI failure here is diagnosable from the log alone,
+  // never a bare timeout with no further clue. Status matters as much
+  // as the log itself: systemd's own boot messages don't necessarily
+  // reach `docker logs` at all (they go to the journal, not the
+  // container's stdout/stderr, unless it correctly detects it's
+  // containerized - see the fixture's own ENV container=docker) - an
+  // empty log with status "running" means something different from an
+  // empty log with a real exit code.
+  const status = await exec("docker", ["inspect", "--format", "{{json .State}}", containerName]).then((r) => r.stdout).catch((error) => `(could not inspect container: ${error.message})`);
   const logs = await exec("docker", ["logs", containerName]).then((r) => r.stdout + r.stderr).catch((error) => `(could not read container logs: ${error.message})`);
-  throw new Error(`sshd on ${ip}:22 never became reachable within ${timeoutMs}ms - container boot log:\n${logs}`);
+  throw new Error(`sshd on ${ip}:22 never became reachable within ${timeoutMs}ms - container state: ${status} - boot log:\n${logs}`);
 }
 
 async function withFakeCosign(fn) {

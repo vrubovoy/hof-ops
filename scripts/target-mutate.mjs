@@ -197,6 +197,7 @@ function parseReadResponse(stdout) {
 }
 
 const LOCK_PATH = "/var/lib/hof/state/lock.json";
+const CURRENT_STATE_PATH = "/var/lib/hof/state/current.json";
 const journalPath = (operationId) => `/var/lib/hof/state/journal/${validateOperationId(operationId)}.json`;
 const eventsPath = (operationId) => `/var/lib/hof/state/journal/${validateOperationId(operationId)}.events.ndjson`;
 
@@ -256,6 +257,18 @@ export async function readJournal(conn, operationId) {
   const stdout = await runScript(conn, readScript(journalPath(operationId)));
   const { status, value } = parseReadResponse(stdout);
   return { status, journal: value };
+}
+
+// The state role's own real, durable result (see
+// ansible/roles/state/tasks/main.yml) - the one independent, target-side
+// oracle for "did state.commit's own real effect actually land", used by
+// apply.mjs's own resume path to recover from the narrow crash window
+// between state.commit's dispatch succeeding and its own succeeded event
+// being durably appended (see ADR 0004's errata on post-commit recovery).
+export async function readCurrentState(conn) {
+  const stdout = await runScript(conn, readScript(CURRENT_STATE_PATH));
+  const { status, value } = parseReadResponse(stdout);
+  return { status, current: value };
 }
 
 // Atomic write-then-rename (ADR 0004: "only ever atomically") - the

@@ -64,6 +64,16 @@ export function assertJournalValid(journal) {
   return assertReadValid("journal", journal);
 }
 
+// Same reasoning as assertLockValid/assertJournalValid, for the
+// append-only NDJSON event log - target-mutate.mjs's own readEvents()
+// only ever JSON.parses each line, with no schema check of its own (a
+// real gap a 2026-08-28 review found: a hand-tampered event, or one with
+// phase: "succeeded" for a step id that doesn't belong to this plan at
+// all, would otherwise be silently trusted by decideStepResumption()).
+export function assertEventValid(event) {
+  return assertReadValid("event", event);
+}
+
 export function newOperationId() {
   return randomUUID();
 }

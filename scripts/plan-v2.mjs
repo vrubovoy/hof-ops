@@ -133,5 +133,21 @@ export function buildPlanV2(options) {
     blockers: v1.blockers,
   };
 
-  return { ...plan, planId: sha256(Buffer.from(JSON.stringify(plan))) };
+  return { ...plan, planId: computePlanId(plan) };
+}
+
+// The exact, canonical planId computation - a plan-v2 document (or
+// plan-v1's own object, this formula is action-shape-agnostic) minus its
+// own `planId` field, hashed. Exported so a caller reading a plan back
+// off disk (a --plan file, or a journal's own embedded plan) can
+// recompute this independently and confirm the document's own `planId`
+// field genuinely matches its content - a schema-valid plan document
+// with a stale or hand-edited `planId` field would otherwise be
+// silently trusted (a real gap a 2026-08-28 review found: apply.mjs
+// schema-validated a loaded --plan file and compared the caller's
+// --approve-plan-id against the file's own `planId` property, but never
+// confirmed that property was itself honest).
+export function computePlanId(planWithoutId) {
+  const { planId: _ignored, ...rest } = planWithoutId;
+  return sha256(Buffer.from(JSON.stringify(rest)));
 }

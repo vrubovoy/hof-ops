@@ -30,21 +30,22 @@ only ever runs signed, digest-pinned artifacts.
   `defaults/main.yml` for its real variable contract. Every role asserts
   its own required variables before doing anything else, so a caller
   that got the typed operation-to-role mapping wrong fails loudly there,
-  not deep inside a half-applied task. All ten now have their real
+  not deep inside a half-applied task. All ten have their real
   implementation (item 8's PR #28: `host`/`secret`/`volume`/`network`/
-  `image`/`config`; PR #29: `database`/`service`/`readiness`/`state`).
-  `host`/`secret`/`volume`/`network`/`image`/`config` and the whole
-  apply pipeline around them (lock, journal, dispatch, a real failure
-  path) are exercised end to end for real in CI
-  (`test/apply-acceptance.mjs`, `pnpm test:apply-ssh`) against a
-  genuinely ephemeral target - that run stops at a real, expected image
-  pull failure (`examples/release-lock.json`'s own images are
-  illustrative, not real published digests), so `database`/`service`/
-  `readiness`/`state` are verified locally (real Jinja rendering, real
-  `docker compose`/`docker inspect` argv construction, real
-  `ansible.builtin.copy` byte-for-byte delivery confirmed via `--check
-  --diff`) rather than through that same live target - see PR #29's own
-  commit message for exactly what was checked.
+  `image`/`config`; PR #29: `database`/`service`/`readiness`/`state`),
+  and - since PR #36 - every one of them is exercised end to end for
+  real in CI (`test/apply-acceptance.mjs`, `pnpm test:apply-ssh`), not
+  just some of them: a real, published, signed platform release lock
+  (`v0.1.2`), a real, published, independently-signed Execution
+  Environment (`ee-v0.1.1`, no local build, no signature bypass), real
+  application images (`schlussel`/`schlussel-frontend`/`schloss` - the
+  platform's own mandatory core), taken all the way through a real
+  `database.migrate`, real `service.start`, real `readiness.wait` (real
+  `docker inspect` `Health.Status` polling), and a real generation-1
+  `state.commit` - confirmed afterward by a second real `hofctl plan`
+  seeing a genuine `"applied"` baseline, not `"bootstrap"`. See
+  PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry (and its own closure
+  note once every finding there was fixed) for the full story.
 
 ## Versioning
 

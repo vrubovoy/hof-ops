@@ -22,15 +22,18 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
+
 import { sha256 } from "./digest.mjs";
 import { verifyExecutionEnvironmentSignature } from "./execution-environment.mjs";
 import {
-  assertJournalResumable, assertJournalValid, assertLockValid, buildEvent, buildJournalDocument, buildLockDocument,
+  assertEventValid, assertJournalResumable, assertJournalValid, assertLockValid, buildEvent, buildJournalDocument, buildLockDocument,
   currentOperator, decideStepResumption, newOperationId, withJournalStatus,
 } from "./operation-journal.mjs";
 import { checkArchitecture, checkManagedStateReadable, checkOs, observationFromSnapshot } from "./preflight.mjs";
 import { validateBootstrapActions } from "./bootstrap-actions.mjs";
-import { buildPlanV2, planV2Validator } from "./plan-v2.mjs";
+import { buildPlanV2, computePlanId, planV2Validator } from "./plan-v2.mjs";
 import { BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER } from "./plan-command.mjs";
 import {
   enabledServiceIds, renderedFilesContents, renderTopology,
@@ -47,6 +50,28 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 function blocked(reason, message) {
   return { blocked: true, reason, diagnostics: [message] };
+}
+
+// A narrow, local validator for one read path only: resume's own
+// state.commit crash-recovery check (see below) reads current.json off
+// the target through target-mutate.mjs, a different transport than
+// target-inspector.mjs's own (already schema-validating) read of the
+// same file - this file's own conventions deliberately duplicate a
+// schema check like this locally rather than share one across modules
+// (see target-mutate.mjs's own SSH_HARDENING comment for the same
+// reasoning applied elsewhere).
+let stateV1Validator;
+async function validateStateV1(value) {
+  stateV1Validator ??= await (async () => {
+    const ajv = new Ajv2020({ allErrors: true, strict: true });
+    addFormats(ajv);
+    const schema = JSON.parse(await readFile(path.join(root, "schemas/state-v1.schema.json"), "utf8"));
+    return ajv.compile(schema);
+  })();
+  if (!stateV1Validator(value)) {
+    throw new Error(`current.json read from the target does not satisfy schemas/state-v1.schema.json: ${JSON.stringify(stateV1Validator.errors)}`);
+  }
+  return value;
 }
 
 // Every plan-v2 action this executor ever dispatches maps to exactly
@@ -225,6 +250,16 @@ function buildInventory({ host, port, user, connectTimeoutSeconds }) {
     "-o GlobalKnownHostsFile=/dev/null",
     "-o BatchMode=yes",
     `-o ConnectTimeout=${connectTimeoutSeconds}`,
+    // Same reasoning as target-inspector.mjs's/target-mutate.mjs's own
+    // identical hardening (a 2026-08-28 review found this exact
+    // Ansible-facing connection - carrying every real mutation and
+    // secret delivery - was the one SSH channel this platform makes
+    // that had been missed) - never let a stray ~/.ssh/config
+    // ProxyJump/ProxyCommand for this hostname silently route the
+    // Execution Environment's own connection through an intermediary
+    // the target binding never recorded.
+    "-o ProxyCommand=none",
+    "-o ProxyJump=none",
   ].join(" ");
   return `target ansible_host=${host} ansible_port=${port} ansible_user=${user} ansible_ssh_private_key_file=/hof/identity ansible_ssh_common_args="${sshCommonArgs}"\n`;
 }
@@ -434,6 +469,17 @@ export async function runApply(options) {
     if (!validatePlanV2(approvedPlanRaw)) {
       return blocked("plan-file", `--plan ${options.planPath} does not satisfy schemas/plan-v2.schema.json: ${JSON.stringify(validatePlanV2.errors)}`);
     }
+    // Schema validity alone doesn't prove the file's own `planId` field
+    // is honest - a hand-edited, still schema-valid plan (any field
+    // changed, the original `planId` left in place) would otherwise be
+    // silently accepted here, only ever caught later by the live
+    // recompute below (which is real protection, but "approving a plan
+    // approves those exact bytes" - ADR 0004 - deserves catching a
+    // tampered file at the file itself, not just downstream).
+    const recomputedFileId = computePlanId(approvedPlanRaw);
+    if (recomputedFileId !== approvedPlanRaw.planId) {
+      return blocked("plan-file", `--plan ${options.planPath}'s own planId field (${approvedPlanRaw.planId}) does not match its own content (recomputes to ${recomputedFileId}) - refusing to trust a plan file whose own identity doesn't match its bytes`);
+    }
     approvedPlan = approvedPlanRaw;
     if (options.approvePlanId !== approvedPlan.planId) {
       return blocked("approval", `--approve-plan-id ${options.approvePlanId} does not match the plan file's own planId ${approvedPlan.planId} (${options.planPath}) - approving a plan approves those exact bytes, see ADR 0004`);
@@ -500,7 +546,52 @@ export async function runApply(options) {
     } catch (error) {
       return blocked("resume", `the journal for operation ${operationId} does not satisfy its own schema - refusing to trust it: ${error instanceof Error ? error.message : error}`);
     }
+
+    // A journal already marked "succeeded" means state.commit's own
+    // real effect landed AND the journal update itself landed - the
+    // only thing that could still be outstanding is releasing the lock
+    // (a crash between the journal update and the lock release). Below,
+    // assertJournalResumable() would otherwise throw "nothing to
+    // resume" and leave that lock stuck forever, since nothing else
+    // ever calls releaseLock() for an already-succeeded journal.
+    // Finishing that one remaining step here is not "guessing" - both
+    // durable facts this run cares about (the journal's own terminal
+    // status, already schema-validated above) already say it's done.
+    if (existing.status === "succeeded") {
+      await m.releaseLock(mutateConn, operationId).catch(() => {});
+      emit({ type: "apply.committed", operationId, committedGeneration: existing.committedGeneration });
+      return { blocked: false, operationId, committedGeneration: existing.committedGeneration, planId: existing.approvedPlanId };
+    }
     assertJournalResumable(existing);
+
+    // The journal's own embedded plan is what every later step in this
+    // resume run trusts completely (operations[], the real installation
+    // id, the target binding) - assertJournalValid() above only checked
+    // the OUTER journal shape (plan itself is loosely typed there on
+    // purpose, see that schema's own comment), so a hand-tampered or
+    // corrupted embedded plan would otherwise reach dispatch unchecked.
+    const validateEmbeddedPlan = await planV2Validator();
+    if (!validateEmbeddedPlan(existing.plan)) {
+      return blocked("resume", `the journal for operation ${operationId} carries a plan that does not satisfy schemas/plan-v2.schema.json - refusing to trust it: ${JSON.stringify(validateEmbeddedPlan.errors)}`);
+    }
+    if (computePlanId(existing.plan) !== existing.plan.planId || existing.plan.planId !== existing.approvedPlanId) {
+      return blocked("resume", `the journal for operation ${operationId} carries a plan whose own planId does not match its content or its own approvedPlanId - refusing to trust it`);
+    }
+    const embeddedWhitelistErrors = validateBootstrapActions(existing.plan);
+    if (embeddedWhitelistErrors.length > 0) {
+      return blocked("resume", `the journal for operation ${operationId} carries a plan that fails the bootstrap action whitelist - refusing to trust it: ${embeddedWhitelistErrors.join("; ")}`);
+    }
+    if (JSON.stringify(existing.plan.target) !== JSON.stringify(existing.target) || JSON.stringify(existing.target) !== JSON.stringify(lock.target)) {
+      return blocked("resume", `the journal for operation ${operationId} carries a plan/journal/lock whose own target bindings disagree - refusing to trust it`);
+    }
+
+    // The exact same platform check the fresh path runs (see
+    // computeLivePlanV2) - resume must never skip it just because it
+    // also, deliberately, skips baseline resolution.
+    const resumeOsCheck = checkOs(snapshot);
+    if (resumeOsCheck.status !== "pass") return blocked("platform", resumeOsCheck.message);
+    const resumeArchitectureCheck = checkArchitecture(snapshot);
+    if (resumeArchitectureCheck.status !== "pass") return blocked("platform", resumeArchitectureCheck.message);
 
     const currentDigests = {
       manifestDigest: sha256(servicesBytes),
@@ -637,6 +728,25 @@ export async function runApply(options) {
         return blocked("tls", error instanceof Error ? error.message : String(error));
       }
       if (suppliedTlsForDelivery) {
+        // TOCTOU close: the plan's own approved suppliedTls fingerprints
+        // (checked as part of the full canonical-document recompute
+        // both pre-lock and, again, under the lock) describe the
+        // certificate/key pair at THOSE two moments - this is a THIRD,
+        // later read, right before real delivery. Without comparing
+        // fingerprints here too, a certificate/key swapped on the
+        // workstation between the post-lock recheck and this exact
+        // delivery step (or, on --resume, since resume never repeats
+        // the live recompute at all) would be delivered to the target
+        // without ever having been part of what was actually approved.
+        const deliveredCertificateFingerprint = sha256(Buffer.from(suppliedTlsForDelivery.certificatePem));
+        const deliveredPrivateKeyFingerprint = sha256(Buffer.from(suppliedTlsForDelivery.privateKeyPem));
+        if (
+          deliveredCertificateFingerprint !== plan.suppliedTls?.certificateFingerprint
+          || deliveredPrivateKeyFingerprint !== plan.suppliedTls?.privateKeyFingerprint
+        ) {
+          if (!options.resume) await m.releaseLock(mutateConn, operationId).catch(() => {});
+          return blocked("tls", `the supplied TLS certificate/private key read at delivery time no longer match the fingerprints the approved plan recorded - refusing to deliver unapproved material (certificatePath/privateKeyPath may have changed since the plan was approved)`);
+        }
         secretValues[SUPPLIED_TLS_CERTIFICATE_SECRET_NAME] = suppliedTlsForDelivery.certificatePem;
         secretValues[SUPPLIED_TLS_PRIVATE_KEY_SECRET_NAME] = suppliedTlsForDelivery.privateKeyPem;
       }
@@ -707,11 +817,67 @@ export async function runApply(options) {
         installationId: realInstallationId, generation, dockerNetwork: options.executionEnvironmentDockerNetwork,
       };
 
-      const eventsByStep = options.resume ? groupByStep(await m.readEvents(mutateConn, operationId)) : new Map();
+      let eventsByStep = new Map();
+      if (options.resume) {
+        let rawEvents;
+        try {
+          rawEvents = await m.readEvents(mutateConn, operationId);
+        } catch (error) {
+          return blocked("resume", `could not read operation events for ${operationId}: ${error instanceof Error ? error.message : error}`);
+        }
+        // target-mutate.mjs's own readEvents() only ever JSON.parses
+        // each NDJSON line - a hand-tampered or foreign event (a
+        // different operationId, or a step that isn't even part of this
+        // approved plan) must never be silently trusted, since
+        // decideStepResumption() below acts directly on phase:
+        // "succeeded" to skip a step outright.
+        const knownStepIds = new Set(plan.operations.map((operation) => operation.id));
+        for (const event of rawEvents) {
+          try {
+            await assertEventValid(event);
+          } catch (error) {
+            return blocked("resume", `a recorded event for operation ${operationId} does not satisfy its own schema - refusing to trust it: ${error instanceof Error ? error.message : error}`);
+          }
+          if (event.operationId !== operationId) {
+            return blocked("resume", `a recorded event claims operationId ${event.operationId}, but this resume is for ${operationId} - refusing to trust it`);
+          }
+          if (!knownStepIds.has(event.step)) {
+            return blocked("resume", `a recorded event references step ${event.step}, which isn't part of the approved plan's own operations - refusing to trust it`);
+          }
+        }
+        eventsByStep = groupByStep(rawEvents);
+      }
       const imageTrustByUnit = new Map();
 
       for (const operation of plan.operations) {
-        const outcome = decideStepResumption(eventsByStep.get(operation.id) ?? []);
+        let outcome = decideStepResumption(eventsByStep.get(operation.id) ?? []);
+        // state.commit's own target-side effect (current.json/
+        // topology.json, written via an idempotent, atomic
+        // ansible.builtin.copy) is independently, durably verifiable on
+        // the target itself - unlike every other operation, an
+        // ambiguous "started, no resolution" outcome for this ONE step
+        // doesn't have to stay a permanent dead end (the real crash
+        // window this closes: dispatch succeeding but the succeeded
+        // event never getting durably appended). Never guessed at for
+        // any OTHER step, and never trusted here either without
+        // independently confirming it against the target's own real,
+        // schema-valid record for THIS exact operationId/generation.
+        if (outcome === "blocked" && operation.action === "state.commit" && options.resume) {
+          const { status: currentStatus, current } = await m.readCurrentState(mutateConn);
+          if (currentStatus === "present") {
+            try {
+              await validateStateV1(current);
+            } catch (error) {
+              return blocked("resume", error instanceof Error ? error.message : String(error));
+            }
+            if (current.lastSuccessfulOperationId === operationId && current.generation === generation) {
+              const recovered = await buildEvent({ operationId, step: operation.id, attempt: 1, phase: "succeeded" });
+              await m.appendEvent(mutateConn, operationId, recovered);
+              emit(recovered);
+              outcome = "skip";
+            }
+          }
+        }
         if (outcome === "skip") {
           emit({ type: "apply.resume-skip", operationId, step: operation.id });
           if (operation.action === "image.verify") imageTrustByUnit.set(operation.resource, operation.imageTrust);

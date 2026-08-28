@@ -52,6 +52,15 @@
 //
 // GH_TOKEN must be set in the environment (see .github/workflows/
 // test.yml) - `gh release download` needs it to reach the GitHub API.
+//
+// Assertions cover every one of PLATFORM-OPS-PLAN.md's own PR #33
+// promises for real, not just some of them (a 2026-08-28 review found
+// this file under-delivered on that promise at first): current.json is
+// schema-validated against schemas/state-v1.schema.json, not just
+// spot-checked field by field; topology.json's own full snapshot is
+// read and sanity-checked; and a second real `hofctl apply` reusing the
+// same approved bootstrap plan against the now-applied host is
+// confirmed refused (reason: "scope"), not just a second `hofctl plan`.
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -63,6 +72,8 @@ import test, { after, before } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
 import YAML from "yaml";
 
 import { runApply } from "../scripts/apply.mjs";
@@ -338,17 +349,43 @@ test("a real, full bootstrap apply against the real, published, signed v0.1.2 re
   const durableEvents = eventsRaw.trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual(durableEvents, operationEvents, "the live NDJSON stream matches the durable journal exactly, event for event");
 
-  // A real, schema-shaped current.json genuinely landed on the target -
-  // generation 1, this exact operation, this exact release.
+  // A real, schema-valid current.json genuinely landed on the target -
+  // generation 1, this exact operation, this exact release. Validated
+  // against the real schema, not just spot-checked field by field
+  // (PLATFORM-OPS-PLAN.md's own PR #33 promise, under-delivered until a
+  // 2026-08-28 review named it).
   const { stdout: currentRaw } = await exec("docker", ["exec", containerName, "cat", "/var/lib/hof/state/current.json"]);
   const current = JSON.parse(currentRaw);
+  const stateSchema = JSON.parse(await readFile(path.join(root, "schemas/state-v1.schema.json"), "utf8"));
+  const stateAjv = new Ajv2020({ allErrors: true, strict: true });
+  addFormats(stateAjv);
+  const validateState = stateAjv.compile(stateSchema);
+  assert.ok(validateState(current), `current.json does not satisfy schemas/state-v1.schema.json: ${JSON.stringify(validateState.errors)}`);
   assert.equal(current.generation, 1);
   assert.equal(current.lastSuccessfulOperationId, result.operationId);
   assert.equal(current.release, RELEASE_VERSION);
   assert.match(current.installationId, /^[0-9a-f-]{36}$/);
 
+  // A real, full topology.json snapshot landed too - the entire
+  // renderTopology() wrapper (compose/caddyfile/topology/backup), not
+  // just the inner generated files config.write separately delivers
+  // under the same filename for a different purpose (see state.mjs's
+  // own assertRenderedShape comment on why those two are never
+  // confused).
+  const { stdout: topologyRaw } = await exec("docker", ["exec", containerName, "cat", "/var/lib/hof/state/topology.json"]);
+  const topology = JSON.parse(topologyRaw);
+  assert.ok(topology.compose && typeof topology.compose === "object", "topology.json must carry the full rendered compose object");
+  assert.ok(topology.caddyfile && typeof topology.caddyfile === "string", "topology.json must carry the rendered Caddyfile");
+  assert.ok(topology.compose.services.schlussel && topology.compose.services.schloss, "the real mandatory-core services must appear in the delivered topology");
+
   // The real supplied TLS certificate/private key genuinely landed on
-  // the target too, byte-for-byte, root-owned, mode 0400.
+  // the target too, byte-for-byte, root-owned, mode 0400. (A real gap a
+  // 2026-08-28 review found - Compose's own file-based secrets are a
+  // plain bind-mount, so 0400 root-owned is invisible to any non-root
+  // consuming container - is fixed in a following PR that also cuts a
+  // new Execution Environment to actually deliver the new 0444 mode
+  // this exact pinned image doesn't have baked in yet; this assertion
+  // flips to 444 there, once it's genuinely true.)
   const { stdout: deliveredCertificate } = await exec("docker", ["exec", containerName, "cat", "/etc/hof/secrets/hof.tls.certificate"]);
   assert.equal(deliveredCertificate, suppliedTlsCertificatePem);
   const { stdout: deliveredPrivateKey } = await exec("docker", ["exec", containerName, "cat", "/etc/hof/secrets/hof.tls.privateKey"]);
@@ -383,4 +420,16 @@ test("a real, full bootstrap apply against the real, published, signed v0.1.2 re
   assert.equal(secondPlan.plan.mode, "applied");
   assert.equal(secondPlan.plan.baseline.installationId, current.installationId);
   assert.equal(secondPlan.plan.baseline.generation, 1);
+
+  // A second real `hofctl apply` against the same, now-applied host -
+  // reusing the exact same approved bootstrap plan/id the first,
+  // successful run used - is correctly refused, never re-applying a
+  // bootstrap plan against a host that already has one (PLATFORM-OPS-
+  // PLAN.md's own PR #33 promise; under-delivered - only a second PLAN
+  // was checked - until a 2026-08-28 review named it). apply's own live
+  // recompute hits this before ever comparing plan documents: a
+  // bootstrap plan is only ever valid against a genuinely clean host.
+  const secondApply = await runApply({ ...baseOptions(), approvePlanId: plan.planId, planPath });
+  assert.equal(secondApply.blocked, true, "a second bootstrap apply against an already-applied host must be refused");
+  assert.equal(secondApply.reason, "scope");
 });

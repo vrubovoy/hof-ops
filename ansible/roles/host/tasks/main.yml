@@ -45,6 +45,21 @@
   changed_when: false
   failed_when: false
 
+# community.docker's own modules (volume/network/image roles) run
+# their own Python code ON THIS TARGET, against its own local Docker
+# socket - not from the Execution Environment container talking to a
+# remote API. They need the Docker Python SDK (and its own
+# dependency, requests) installed here, regardless of whether Docker
+# itself needed a fresh install just above - a target that already had
+# Docker from a previous install may still be missing this. Found for
+# real via a genuine CI failure ("Failed to import the required Python
+# library (requests)"), not assumed.
+- name: The Docker Python SDK, for every community.docker module this Execution Environment runs against this target
+  ansible.builtin.apt:
+    name: python3-docker
+    state: present
+    update_cache: true
+
 # Only ever runs when target-inspector.mjs's own probe already
 # positively confirmed Docker is absent (see ADR 0004's "Docker Absent"
 # rules) - this second, independent check (docker --version, right here

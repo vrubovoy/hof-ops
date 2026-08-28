@@ -147,7 +147,12 @@ before(async () => {
   await writeFile(path.join(workDir, "authorized_keys"), publicKey, { mode: 0o644 });
 
   await exec("docker", [
-    "run", "--detach", "--rm", "--name", containerName,
+    // No --rm here (unlike the target-less ssh-acceptance fixture) -
+    // if systemd crashes on boot, `after()`'s own `docker rm --force`
+    // still cleans it up, but --rm would otherwise auto-remove a
+    // crashed container before waitForSsh()'s own diagnostic `docker
+    // logs` call ever got to read its boot log.
+    "run", "--detach", "--name", containerName,
     "--network", networkName,
     // The target fixture runs real systemd as PID 1 (see its own
     // Dockerfile comment on why). Deliberately NOT --privileged and NOT

@@ -40,6 +40,26 @@ RUN { \
 COPY entrypoint.sh /usr/local/bin/hof-probe-entrypoint.sh
 RUN chmod +x /usr/local/bin/hof-probe-entrypoint.sh
 
+# host.prepare (item 8's own real role) installs Docker Engine fresh
+# inside this container at apply time - a real, confirmed CI failure
+# found its default overlay2 storage driver genuinely fails here with
+# "failed to mount ... fstype: overlay ... err: invalid argument": this
+# container's own root filesystem is ALREADY overlayfs (the GH Actions
+# runner's own outer Docker daemon is overlay2-backed), and the kernel
+# refuses overlayfs nested directly on top of another overlayfs mount -
+# a real, documented Docker-in-Docker limitation, not anything specific
+# to hof-ops's own roles. `vfs` (a plain recursive copy per layer, no
+# overlay mount of any kind) is the slowest storage driver Docker has,
+# but the only one guaranteed to work regardless of how many overlayfs
+# layers this container itself is already nested inside - acceptable
+# here since this fixture only ever builds/runs a handful of small
+# containers once. A REAL target is a genuine VM or bare-metal host, not
+# a container nested inside another container's own overlayfs - it never
+# hits this, and host.prepare's own real defaults (never overridden by
+# this file) stay overlay2 there. Created at image-build time, well
+# before host.prepare's own first `docker.service` start ever reads it.
+RUN mkdir -p /etc/docker && printf '{"storage-driver": "vfs"}' > /etc/docker/daemon.json
+
 # The standard signal every systemd-in-Docker image sets - without it,
 # systemd doesn't reliably detect it's running inside a container and
 # can behave unpredictably (including, in practice, never actually

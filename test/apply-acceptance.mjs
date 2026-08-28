@@ -161,26 +161,29 @@ before(async () => {
     "run", "--detach", "--name", containerName,
     "--network", networkName,
     // The target fixture runs real systemd as PID 1 (see its own
-    // Dockerfile comment on why). Deliberately NOT --privileged and NOT
-    // --cgroupns=host - both were tried during this PR's own
-    // development and caused a real, serious incident (a privileged,
-    // host-cgroup-namespace-sharing systemd container reached real host
-    // tty devices and interfered with real host services/cgroups on the
-    // machine it was run on). This is the documented, narrower,
-    // non-privileged recipe instead (confirmed against Docker/systemd's
-    // own guidance on cgroup v2 hosts - see this PR's own history for
-    // the sources): --cgroupns=private (the default, left unspecified)
-    // keeps the container's own cgroup namespace fully isolated from
-    // the host's, and Docker itself automatically delegates a private,
-    // writable cgroup2 mount for it - manually bind-mounting the host's
-    // own /sys/fs/cgroup (an earlier version of this recipe did) is
-    // explicitly the WRONG thing to do here, since it fights Docker's
-    // own delegation instead of using it. --cap-add SYS_ADMIN is the
-    // one real capability systemd needs to manage its own mounts inside
-    // that isolated namespace - a real, narrow grant, nowhere near
-    // `--privileged`'s full capability set plus host device access.
+    // Dockerfile comment on why). A real, serious incident happened
+    // during this PR's own LOCAL development: `--privileged
+    // --cgroupns=host`, run on what turned out to be a real desktop (not
+    // an isolated sandbox), gave a test container real host tty/cgroup
+    // access and disrupted a real login session. The narrower,
+    // non-privileged alternative tried afterward (--cap-add SYS_ADMIN,
+    // no --privileged, no --cgroupns=host) is the documented way to run
+    // systemd in Docker without full privilege - but it did not
+    // actually work here: systemd itself exited silently (code 255,
+    // no output even with --log-target=console --log-level=debug)
+    // within ~100ms on this specific runner/kernel/Docker combination,
+    // confirmed by CI, not guessed at. `--privileged` is used here
+    // instead, deliberately scoped to ONLY this CI-run acceptance test
+    // (pnpm test:apply-ssh, never run locally in this session again,
+    // by the same standing decision the earlier incident produced) -
+    // a GitHub Actions runner is a genuinely disposable, single-purpose
+    // VM with nothing else on it a stray device/tty access could ever
+    // disrupt, unlike a developer's own real desktop. --cgroupns=host
+    // is still deliberately NOT added - --privileged alone is
+    // sufficient and keeps this from being the exact flag combination
+    // that caused the original incident.
+    "--privileged",
     "--tmpfs", "/run", "--tmpfs", "/run/lock",
-    "--cap-add", "SYS_ADMIN",
     "--volume", `${workDir}/host_key:/hof-keys/host_key:ro`,
     "--volume", `${workDir}/authorized_keys:/hof-keys/authorized_keys:ro`,
     targetImageTag,

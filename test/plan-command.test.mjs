@@ -23,6 +23,7 @@ import addFormats from "ajv-formats";
 
 import { loadContracts } from "../scripts/contracts.mjs";
 import { BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER, runPlan } from "../scripts/plan-command.mjs";
+import { planV2Validator } from "../scripts/plan-v2.mjs";
 import { renderTopology } from "../scripts/render-topology.mjs";
 import { topologyToServiceState } from "../scripts/state.mjs";
 
@@ -161,19 +162,29 @@ test("state blocked: corrupt managed state (topology.json without current.json) 
   assert.ok(result.diagnostics[0].includes("topology.json but no current.json"));
 });
 
-test("a genuine, signed, real-cosign-verified bootstrap plan is schema-valid and executable, with the deterministic bootstrap installationId placeholder", async () => {
-  const validate = await planValidator();
-  const result = await withFakeCosign("success", () => runPlan(basePlanOptions({ inspect: async () => cleanSnapshot() })));
+test("a bootstrap target now prints a real plan-v2 document (PR #31 fix) - the exact shape hofctl apply requires --approve-plan-id/--plan to match", async () => {
+  const validate = await planV2Validator();
+  const result = await withFakeCosign("success", () =>
+    runPlan(basePlanOptions({ inspect: async () => cleanSnapshot(), recoveryAgeRecipient: "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq" })));
 
   assert.equal(result.blocked, false);
+  assert.equal(result.plan.apiVersion, "hof.dev/plan/v2");
   assert.equal(result.plan.mode, "bootstrap");
   assert.equal(result.plan.executable, true);
   assert.ok(result.plan.summary.create > 0);
+  assert.match(result.plan.planId, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(result.plan.target.mode, "local");
   assert.ok(validate(result.plan), JSON.stringify(validate.errors));
   // installationId itself never appears literally in the plan's own
   // fields (it's excluded from configFingerprint, see state.mjs) - the
   // constant is exported and checked for its own value/shape instead.
   assert.match(BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER, /^[0-9a-f-]+$/);
+});
+
+test("a bootstrap plan without --recovery-age-recipient is blocked, not silently planned with none", async () => {
+  const result = await withFakeCosign("success", () => runPlan(basePlanOptions({ inspect: async () => cleanSnapshot() })));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "recovery");
 });
 
 test("deployment blocked: a real cosign signature failure (fake cosign scripted to fail) is reported, not silently ignored", async () => {

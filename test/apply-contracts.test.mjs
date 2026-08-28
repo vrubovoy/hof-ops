@@ -101,6 +101,11 @@ function journalFixture(overrides = {}) {
     operationId: OPERATION_ID,
     approvedPlanId: PLAN_ID,
     target: targetBinding(),
+    // The full approved plan-v2 document (PR #31 fix) - loosely typed at
+    // the journal-schema level (see the schema's own comment on why),
+    // so a minimal placeholder object is enough here; real content is
+    // covered by operation-journal.test.mjs and apply.test.mjs instead.
+    plan: { apiVersion: "hof.dev/plan/v2", planId: PLAN_ID },
     inputDigests: {
       manifestDigest: "sha256:" + "1".repeat(64), releaseLockDigest: "sha256:" + "2".repeat(64),
       catalogDigest: "sha256:" + "3".repeat(64), composeTemplateDigest: "sha256:" + "4".repeat(64),

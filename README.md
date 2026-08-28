@@ -55,14 +55,23 @@ Cosign signature; `hofctl preflight` inspects the actual target host over a
 hardened SSH transport (disk/RAM/CPU/clock/DNS/ports/Docker); `hofctl plan`
 chains both, resolves the last-applied state (or a synthetic bootstrap
 baseline on a genuinely clean host), computes drift against what's actually
-running, and prints one typed, ordered `plan-v1` operation list to stdout -
-never writing anything, anywhere.
+running, and prints one typed, ordered operation list to stdout - never
+writing anything, anywhere. Against a genuinely clean (bootstrap) target it
+prints the real `plan-v2` document `hofctl apply` itself requires
+`--approve-plan-id`/`--plan` to match byte for byte (the exact target
+binding, recovery recipient, and supplied-TLS fingerprint `apply` will
+recompute and check under the lock - see ADR 0004's own errata note); an
+already-applied target (item 9, not yet implemented) still prints the
+historical `plan-v1` shape, informational only.
 
 `hofctl apply` is implemented for delivery item 8's own scope - a bootstrap
 onto a genuinely clean host (see ADR 0004): exact SSH target binding,
-`--approve-plan-id` (approving a plan approves those exact bytes, never "the
-latest one"), an exclusive durable target lock, a durable operation journal
-(bounded NDJSON progress on stdout), a stale-plan recheck under the lock,
+`--plan`/`--approve-plan-id` (approving a plan approves those exact bytes,
+matched against the file you actually reviewed, never "whatever recomputes
+to the same short ID"), an exclusive durable target lock, a durable
+operation journal (bounded NDJSON progress on stdout) that embeds the full
+approved plan itself, a full canonical-document stale-plan recheck under
+the lock (not just the target's own identity fields),
 Cosign verification of the pinned Ansible Execution Environment image before
 it ever runs, a fixed bootstrap-only action whitelist dispatched into that
 image (never local Ansible, never a generic command), and safe, bounded
@@ -161,8 +170,8 @@ plain `age1...` public keys and `age-keygen`-produced identity files -
 `hofctl` itself never generates an age keypair, only secret values).
 Prints only the names of any newly-generated secrets as NDJSON - a real
 value never reaches stdout, a log, or any generated file. `hofctl apply`
-(not yet implemented) is the only thing that ever reads the store's real
-values, to deliver them to the target's own fixed secret file paths.
+is the only thing that ever reads the store's real values, to deliver
+them to the target's own fixed secret file paths.
 
 ## Planning a deployment
 
@@ -174,15 +183,20 @@ refuses to proceed against an incomplete observation (a partial Docker
 listing, an unreadable state file, missing generated-artifact checksums),
 resolves the last-applied state (or a synthetic bootstrap baseline on a
 genuinely clean host), and prints one typed, ordered operation list to
-stdout as a single `plan-v1` JSON document — nothing else ever reaches
-stdout, so it composes cleanly with `jq` or any other tool.
+stdout as a single JSON document — nothing else ever reaches stdout, so it
+composes cleanly with `jq` or any other tool. Against a genuinely clean
+host it's `plan-v2` (the exact document `hofctl apply` will need
+`--plan`/`--approve-plan-id` to match, so `--recovery-age-recipient` is
+required there too); against an already-applied host (item 9, not yet
+implemented) it's still the historical `plan-v1`.
 
 ```sh
 node scripts/hofctl.mjs plan \
   --services examples/services.yml \
   --release-lock examples/release-lock.json \
   --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/tags/v1.0.0" \
-  --known-hosts ~/.ssh/known_hosts
+  --known-hosts ~/.ssh/known_hosts \
+  --recovery-age-recipient age1...
 ```
 
 Exit code `0` means the plan is executable as-is; `1` means it's blocked
@@ -198,12 +212,25 @@ or auto-recreated, `--repair-drift` or not).
 ## Applying a deployment
 
 `hofctl apply` runs a bootstrap plan for real, onto a genuinely clean host
-(see ADR 0004 - applied-mode reconciliation is a later delivery item). It
-recomputes the plan itself from the given inputs (never trusts a plan
-handed to it on disk), so `--approve-plan-id` must match that
-recomputation's own `planId` byte for byte:
+(see ADR 0004 - applied-mode reconciliation is a later delivery item). The
+plan you approve is the exact document `hofctl plan` printed against a
+bootstrap target (a real `plan-v2` document there too, not `plan-v1` -
+see ADR 0004's own errata note): save it, review it, then hand both its
+own file and its `planId` to `apply` - `--approve-plan-id` must match
+`--plan`'s own `planId` byte for byte, and `apply` then recomputes the
+plan itself (once before ever touching the lock, once again after
+acquiring it) and refuses to proceed unless that live recomputation
+still matches the exact bytes you approved:
 
 ```sh
+node scripts/hofctl.mjs plan \
+  --services examples/services.yml \
+  --release-lock examples/release-lock.json \
+  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/tags/v1.0.0" \
+  --known-hosts ~/.ssh/known_hosts \
+  --recovery-age-recipient age1... \
+  > plan.json
+
 node scripts/hofctl.mjs apply \
   --services examples/services.yml \
   --release-lock examples/release-lock.json \
@@ -211,27 +238,31 @@ node scripts/hofctl.mjs apply \
   --known-hosts ~/.ssh/known_hosts \
   --identity-file ~/.ssh/id_ed25519 \
   --recovery-age-recipient age1... \
-  --approve-plan-id sha256:...
+  --plan plan.json \
+  --approve-plan-id "$(node -e "console.log(require('./plan.json').planId)")"
 ```
 
 Every operation the plan contains runs inside the pinned, Cosign-signed
 Ansible Execution Environment (`ansible/`) - never the operator's own local
 Ansible installation - and is recorded, before and after it runs, in a
 durable on-target journal (`/var/lib/hof/state/journal/`) that never holds a
-secret value, decrypted content, or an SSH private-key path. Progress
-streams to stdout as bounded NDJSON, one `operation-event-v1` record per
-line, nothing else interleaved. An apply interrupted mid-run (a crashed
-workstation, a dropped network) resumes with `--resume` instead of
-`--approve-plan-id` - it reclaims the same target lock and journal, skips
+secret value, decrypted content, or an SSH private-key path (the journal
+does embed the full approved plan-v2 document itself, which is exactly as
+sensitive as `plan.json` already is - never more). Progress streams to
+stdout as bounded NDJSON, one `operation-event-v1` record per line, nothing
+else interleaved. An apply interrupted mid-run (a crashed workstation, a
+dropped network) resumes with `--resume` instead of `--approve-plan-id`/
+`--plan` (no new approval - a resume never re-derives a live baseline, only
+the journal's own embedded plan and a check that the manifest/release-lock/
+catalog/renderer/Execution-Environment digests it was journaled against
+haven't changed) - it reclaims the same target lock and journal, skips
 every step that already recorded a real `succeeded` event, and refuses
 outright (never guesses) if a step's own outcome can't be determined from
-the journal, or if the plan recomputed from the current inputs no longer
-matches what was originally approved. `--target-mode local` is not
-supported for `apply` (unlike `plan`/`preflight`) - the Execution
-Environment runs as a container, and a local Ansible connection inside it
-would mutate that container's own filesystem, never the real host's; a
-loopback SSH target is the way to exercise `apply` locally (see
-`test/apply-acceptance.mjs`).
+the journal. `--target-mode local` is not supported for `apply` (unlike
+`plan`/`preflight`) - the Execution Environment runs as a container, and a
+local Ansible connection inside it would mutate that container's own
+filesystem, never the real host's; a loopback SSH target is the way to
+exercise `apply` locally (see `test/apply-acceptance.mjs`).
 
 ## Cutting a release
 

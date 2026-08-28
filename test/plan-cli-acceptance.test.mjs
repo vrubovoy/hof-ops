@@ -110,29 +110,47 @@ test("blocked: missing signature sidecars exits 1, nothing on stdout, a real dia
   assert.match(stderr, /no signature found/);
 });
 
-test("a genuine end-to-end bootstrap plan through the real CLI: exactly one plan-v1 JSON document on stdout, exit 0", async () => {
+const RECOVERY_AGE_RECIPIENT = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+
+test("a genuine end-to-end bootstrap plan through the real CLI: exactly one plan-v2 JSON document on stdout, exit 0", async () => {
   const { stdout, stderr } = await run([
     "plan", "--services", examplesServices, "--release-lock", signedReleaseLockPath,
     "--release-lock-identity", "test@example.com", "--target-mode", "local",
+    "--recovery-age-recipient", RECOVERY_AGE_RECIPIENT,
   ], { env: { HOF_TEST_COSIGN_OUTCOME: "success" } });
 
   const lines = stdout.split("\n").filter((line) => line.length > 0);
   assert.equal(lines.length, 1, `stdout must contain exactly one line, got:\n${stdout}`);
   const plan = JSON.parse(lines[0]);
-  assert.equal(plan.apiVersion, "hof.dev/plan/v1");
+  // A bootstrap target now prints the same plan-v2 document hofctl
+  // apply itself requires --approve-plan-id/--plan to match (PR #31
+  // fix) - see PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry.
+  assert.equal(plan.apiVersion, "hof.dev/plan/v2");
   assert.equal(plan.mode, "bootstrap");
   assert.equal(plan.executable, true);
   assert.ok(plan.summary.create > 0);
+  assert.match(plan.planId, /^sha256:[0-9a-f]{64}$/);
   // Diagnostics (if any) stay on stderr, never mixed into stdout - this
   // run may still print nothing at all to stderr, which is fine too.
-  assert.doesNotMatch(stderr, /hof\.dev\/plan\/v1/);
+  assert.doesNotMatch(stderr, /hof\.dev\/plan\/v2/);
 });
 
 test("--repair-drift is accepted as a bare boolean flag (no value consumed after it)", async () => {
   const { stdout } = await run([
     "plan", "--services", examplesServices, "--release-lock", signedReleaseLockPath,
     "--release-lock-identity", "test@example.com", "--target-mode", "local", "--repair-drift",
+    "--recovery-age-recipient", RECOVERY_AGE_RECIPIENT,
   ], { env: { HOF_TEST_COSIGN_OUTCOME: "success" } });
   const plan = JSON.parse(stdout.trim());
-  assert.equal(plan.apiVersion, "hof.dev/plan/v1");
+  assert.equal(plan.apiVersion, "hof.dev/plan/v2");
+});
+
+test("a bootstrap plan through the real CLI without --recovery-age-recipient is blocked (exit 1), not silently planned with none", async () => {
+  const { code, stdout, stderr } = await expectFailure([
+    "plan", "--services", examplesServices, "--release-lock", signedReleaseLockPath,
+    "--release-lock-identity", "test@example.com", "--target-mode", "local",
+  ], { HOF_TEST_COSIGN_OUTCOME: "success" });
+  assert.equal(code, 1);
+  assert.equal(stdout, "");
+  assert.match(stderr, /--recovery-age-recipient is required/);
 });

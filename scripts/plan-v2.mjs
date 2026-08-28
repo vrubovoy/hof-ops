@@ -9,8 +9,35 @@
 // whole v2 document. plan-v1 itself is untouched and stays the
 // historical contract.
 
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
+
 import { sha256 } from "./digest.mjs";
 import { buildPlan } from "./plan.mjs";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+// One shared compiled validator for the whole plan-v2 document - both
+// hofctl plan (which now produces this shape for a bootstrap target,
+// see plan-command.mjs) and hofctl apply (which both validates a loaded
+// --plan file against it and re-validates its own live recompute
+// against it) must judge the exact same schema the exact same way; two
+// independently-instantiated Ajv compilations of the same file is a
+// real, if unlikely, way for the two to quietly drift.
+let compiledValidator;
+export async function planV2Validator() {
+  compiledValidator ??= await (async () => {
+    const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false });
+    addFormats(ajv);
+    const schema = JSON.parse(await readFile(path.join(root, "schemas/plan-v2.schema.json"), "utf8"));
+    return ajv.compile(schema);
+  })();
+  return compiledValidator;
+}
 
 // The release lock's own per-artifact trust info, translated into the
 // operation-carried shape apply will need (see plan-v2.schema.json's

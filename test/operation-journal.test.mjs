@@ -11,6 +11,7 @@ const TARGET = {
   hostKeySha256: "SHA256:" + "a".repeat(43), installationId: "00000000-0000-0000-0000-000000000000", baselineGeneration: 0,
 };
 const PLAN_ID = "sha256:" + "b".repeat(64);
+const PLAN = { apiVersion: "hof.dev/plan/v2", planId: PLAN_ID };
 
 test("newOperationId produces a real, distinct UUID every call", () => {
   const a = newOperationId();
@@ -44,11 +45,25 @@ test("buildJournalDocument starts in-progress with a null committedGeneration", 
     catalogDigest: "sha256:" + "3".repeat(64), composeTemplateDigest: "sha256:" + "4".repeat(64),
     executionEnvironmentDigest: "sha256:" + "5".repeat(64),
   };
-  const journal = await buildJournalDocument({ operationId, approvedPlanId: PLAN_ID, target: TARGET, inputDigests });
+  const journal = await buildJournalDocument({ operationId, approvedPlanId: PLAN_ID, target: TARGET, plan: PLAN, inputDigests });
   assert.equal(journal.apiVersion, "hof.dev/operation-journal/v1");
   assert.equal(journal.status, "in-progress");
   assert.equal(journal.committedGeneration, null);
   assert.deepEqual(journal.inputDigests, inputDigests);
+  assert.deepEqual(journal.plan, PLAN);
+});
+
+test("buildJournalDocument refuses when approvedPlanId disagrees with plan.planId - the two must never be able to drift apart", async () => {
+  const operationId = newOperationId();
+  const inputDigests = {
+    manifestDigest: "sha256:" + "1".repeat(64), releaseLockDigest: "sha256:" + "2".repeat(64),
+    catalogDigest: "sha256:" + "3".repeat(64), composeTemplateDigest: "sha256:" + "4".repeat(64),
+    executionEnvironmentDigest: "sha256:" + "5".repeat(64),
+  };
+  await assert.rejects(
+    () => buildJournalDocument({ operationId, approvedPlanId: "sha256:" + "c".repeat(64), target: TARGET, plan: PLAN, inputDigests }),
+    /these must always be the same value/,
+  );
 });
 
 test("withJournalStatus produces a fresh document without mutating the original", async () => {
@@ -58,7 +73,7 @@ test("withJournalStatus produces a fresh document without mutating the original"
     catalogDigest: "sha256:" + "3".repeat(64), composeTemplateDigest: "sha256:" + "4".repeat(64),
     executionEnvironmentDigest: "sha256:" + "5".repeat(64),
   };
-  const journal = await buildJournalDocument({ operationId, approvedPlanId: PLAN_ID, target: TARGET, inputDigests });
+  const journal = await buildJournalDocument({ operationId, approvedPlanId: PLAN_ID, target: TARGET, plan: PLAN, inputDigests });
   const committed = await withJournalStatus(journal, { status: "succeeded", committedGeneration: 1 });
   assert.equal(journal.status, "in-progress", "original document must be untouched");
   assert.equal(committed.status, "succeeded");

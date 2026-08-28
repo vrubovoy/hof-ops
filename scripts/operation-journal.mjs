@@ -64,10 +64,18 @@ export async function buildLockDocument({ operationId, approvedPlanId, target, a
   });
 }
 
-export async function buildJournalDocument({ operationId, approvedPlanId, target, inputDigests }) {
+// plan is the FULL approved plan-v2 document (not just its planId) - see
+// operation-journal-v1.schema.json's own comment on why: --resume reads
+// operations[] straight from here, never re-derives a live baseline.
+// approvedPlanId is asserted to equal plan.planId rather than trusted
+// separately from the caller - the two must never be able to disagree.
+export async function buildJournalDocument({ operationId, approvedPlanId, target, plan, inputDigests }) {
+  if (plan.planId !== approvedPlanId) {
+    throw new Error(`internal error: buildJournalDocument called with approvedPlanId ${approvedPlanId} but plan.planId ${plan.planId} - these must always be the same value`);
+  }
   return assertValid("journal", {
     apiVersion: "hof.dev/operation-journal/v1",
-    operationId, approvedPlanId, target, inputDigests,
+    operationId, approvedPlanId, target, plan, inputDigests,
     startedAt: new Date().toISOString(),
     status: "in-progress",
     committedGeneration: null,

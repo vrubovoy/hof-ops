@@ -16,9 +16,9 @@ function usage(message) {
   console.error("usage: hofctl render --services <services.yml> --release-lock <release-lock.json> --catalog <catalog.yaml> --out <directory>");
   console.error("       hofctl validate --services <services.yml> --release-lock <release-lock.json> [--catalog <catalog.yaml>] [--release-selection <file>] [--stable-channel <file>] [--release-lock-signature <file>] [--release-lock-certificate <file>] [--release-lock-identity <identity>] [--release-lock-oidc-issuer <issuer>] [--skip-signature]");
   console.error("       hofctl preflight --services <services.yml> [--catalog <catalog.yaml>] [--target-mode ssh|local] [--known-hosts <file> | --host-key-sha256 <sha>] [--identity-file <path>] [--connect-timeout-seconds <n>] [--min-free-disk-gb <n>] [--min-memory-gb <n>] [--min-cpu-cores <n>]");
-  console.error("       hofctl plan --services <services.yml> --release-lock <release-lock.json> --release-lock-identity <identity> (--known-hosts <file> | --host-key-sha256 <sha>) [--catalog <catalog.yaml>] [--identity-file <path>] [--target-mode ssh|local] [--connect-timeout-seconds <n>] [--repair-drift]");
+  console.error("       hofctl plan --services <services.yml> --release-lock <release-lock.json> --release-lock-identity <identity> (--known-hosts <file> | --host-key-sha256 <sha>) [--catalog <catalog.yaml>] [--identity-file <path>] [--target-mode ssh|local] [--connect-timeout-seconds <n>] [--repair-drift] [--recovery-age-recipient <age1...>]");
   console.error("       hofctl secrets ensure --services <services.yml> --store <secrets.sops.yaml> --operator-age-recipient <age1...> --recovery-age-recipient <age1...> [--catalog <catalog.yaml>] [--identity-file <path>]");
-  console.error("       hofctl apply --services <services.yml> --release-lock <release-lock.json> --release-lock-identity <identity> (--known-hosts <file> | --host-key-sha256 <sha>) --identity-file <path> --recovery-age-recipient <age1...> (--approve-plan-id <exact-plan-id> | --resume) [--catalog <catalog.yaml>] [--connect-timeout-seconds <n>] [--repair-drift] [--secrets-store <secrets.sops.yaml>] [--secrets-age-identity-file <path>]");
+  console.error("       hofctl apply --services <services.yml> --release-lock <release-lock.json> --release-lock-identity <identity> (--known-hosts <file> | --host-key-sha256 <sha>) --identity-file <path> --recovery-age-recipient <age1...> (--approve-plan-id <exact-plan-id> --plan <plan-v2.json> | --resume) [--catalog <catalog.yaml>] [--connect-timeout-seconds <n>] [--repair-drift] [--secrets-store <secrets.sops.yaml>] [--secrets-age-identity-file <path>]");
   process.exitCode = 2;
 }
 
@@ -85,6 +85,7 @@ function parsePositiveInteger(rawValue, flagName) {
 const PLAN_FLAGS = new Set([
   "--services", "--release-lock", "--release-lock-identity", "--known-hosts", "--host-key-sha256",
   "--catalog", "--identity-file", "--target-mode", "--connect-timeout-seconds", "--repair-drift",
+  "--recovery-age-recipient",
 ]);
 const PLAN_BOOLEAN_FLAGS = new Set(["--repair-drift"]);
 
@@ -98,7 +99,7 @@ const PLAN_BOOLEAN_FLAGS = new Set(["--repair-drift"]);
 const APPLY_FLAGS = new Set([
   "--services", "--release-lock", "--release-lock-identity", "--known-hosts", "--host-key-sha256",
   "--catalog", "--identity-file", "--connect-timeout-seconds", "--repair-drift",
-  "--recovery-age-recipient", "--approve-plan-id", "--resume",
+  "--recovery-age-recipient", "--approve-plan-id", "--plan", "--resume",
   "--secrets-store", "--secrets-age-identity-file",
 ]);
 const APPLY_BOOLEAN_FLAGS = new Set(["--repair-drift", "--resume"]);
@@ -267,6 +268,7 @@ if (command === "render") {
           identityFile: options.identityFile,
           connectTimeoutSeconds,
           repairDrift: options.repairDrift === true,
+          recoveryAgeRecipient: options.recoveryAgeRecipient,
         });
         if (blocked) {
           // Diagnostics only - stdout must stay reserved for exactly
@@ -318,13 +320,14 @@ if (command === "render") {
 } else if (command === "apply") {
   const options = parseApplyFlags(args);
   if (options) {
-    resolvePaths(options, ["services", "releaseLock", "catalog", "knownHosts", "identityFile", "secretsStore", "secretsAgeIdentityFile"]);
+    resolvePaths(options, ["services", "releaseLock", "catalog", "knownHosts", "identityFile", "secretsStore", "secretsAgeIdentityFile", "plan"]);
+    const hasResume = options.resume === true;
     if (!options.services || !options.releaseLock || !options.releaseLockIdentity || !options.identityFile || !options.recoveryAgeRecipient) {
       usage("apply requires --services, --release-lock, --release-lock-identity, --identity-file, and --recovery-age-recipient");
     } else if (Boolean(options.knownHosts) === Boolean(options.hostKeySha256)) {
       usage("apply requires exactly one of --known-hosts or --host-key-sha256");
-    } else if (Boolean(options.approvePlanId) === Boolean(options.resume)) {
-      usage("apply requires exactly one of --approve-plan-id or --resume - approving a plan approves those exact bytes, a resume never takes a new approval (see ADR 0004)");
+    } else if (hasResume ? (options.approvePlanId || options.plan) : (!options.approvePlanId || !options.plan)) {
+      usage("apply requires --resume alone, or both --approve-plan-id and --plan together (never a mix) - approving a plan approves those exact bytes, a resume never takes a new approval (see ADR 0004)");
     } else {
       try {
         const connectTimeoutSeconds = parsePositiveInteger(options.connectTimeoutSeconds, "--connect-timeout-seconds");
@@ -341,8 +344,9 @@ if (command === "render") {
           recoveryAgeRecipient: options.recoveryAgeRecipient,
           secretsStorePath: options.secretsStore,
           secretsAgeIdentityFile: options.secretsAgeIdentityFile,
+          planPath: options.plan,
           approvePlanId: options.approvePlanId,
-          resume: options.resume === true,
+          resume: hasResume,
           // Bounded NDJSON on stdout, one line per event - nothing else
           // is ever printed there (see operation-event-v1.schema.json's
           // own comment on this exact contract).

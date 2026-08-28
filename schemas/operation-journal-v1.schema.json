@@ -5,15 +5,19 @@
   "description": "/var/lib/hof/state/journal/<operationId>.json - the durable, per-apply-run header record on the target. Written once at apply start (immutable except `status`/`committedGeneration`, updated only by the same operationId that created it); individual operation attempts are recorded separately as an append-only operation-event-v1 log this journal's own operationId ties them to. Never holds a secret value, decrypted content, an environment dump, or an SSH private-key path - safe to read, copy, or attach to a bug report without a second sanitization pass.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["apiVersion", "operationId", "approvedPlanId", "target", "inputDigests", "startedAt", "status", "committedGeneration"],
+  "required": ["apiVersion", "operationId", "approvedPlanId", "target", "plan", "inputDigests", "startedAt", "status", "committedGeneration"],
   "properties": {
     "apiVersion": { "const": "hof.dev/operation-journal/v1" },
     "operationId": { "$ref": "#/$defs/operationId" },
     "approvedPlanId": {
-      "description": "The exact plan-v2 planId this run was approved against (--approve-plan-id) - apply's own stale-plan recheck re-derives a fresh plan under the lock and refuses to proceed if it no longer matches this value.",
+      "description": "The exact plan-v2 planId this run was approved against (--approve-plan-id) - equal to plan.planId below by construction (buildJournalDocument never accepts the two disagreeing).",
       "$ref": "#/$defs/planId"
     },
     "target": { "$ref": "#/$defs/targetBinding" },
+    "plan": {
+      "description": "The full, exact plan-v2 document this operation was approved against - not just its planId. --resume reads operations[] directly from here rather than re-deriving a live baseline/diff (which is meaningless mid-bootstrap: managed resources the earlier, interrupted attempt already created would make a fresh resolveBaseline() see an already-applied host and wrongly refuse to resume at all - see PLATFORM-OPS-PLAN.md's \"Item 8 reopened\" entry). No schema in this repo cross-references another by $id (see this repo's own convention) - loosely typed here on purpose; the document was already validated against schemas/plan-v2.schema.json before ever being embedded (see plan-v2.mjs's own planV2Validator()).",
+      "type": "object"
+    },
     "inputDigests": {
       "description": "Every input this specific run is bound to, fixed at journal creation and never recomputed from a live file again mid-run - a manifest/release-lock/catalog/renderer/Execution-Environment edited out from under an in-progress apply must never silently change what a resumed operation does.",
       "type": "object",

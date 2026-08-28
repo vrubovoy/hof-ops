@@ -70,9 +70,12 @@ import { promisify } from "node:util";
 import YAML from "yaml";
 
 import { runApply } from "../scripts/apply.mjs";
+import { runPlan } from "../scripts/plan-command.mjs";
 import { enabledServiceIds } from "../scripts/render-topology.mjs";
 import { requiredSecrets } from "../scripts/secrets.mjs";
 import { loadContracts } from "../scripts/contracts.mjs";
+
+const RECOVERY_AGE_RECIPIENT = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -254,7 +257,7 @@ function baseOptions() {
   return {
     manifestPath: servicesPath, releaseLockPath, releaseLockIdentity: "test@example.com",
     hostKeySha256: hostKeyFingerprint, identityFile: userKeyPath, connectTimeoutSeconds: 15,
-    recoveryAgeRecipient: "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+    recoveryAgeRecipient: RECOVERY_AGE_RECIPIENT,
     verifyEeSignature: async () => {},
     dockerRun: loggingDockerRun,
     executionEnvironmentImageOverride: eeImageReference,
@@ -270,15 +273,23 @@ function baseOptions() {
 }
 
 test("a real bootstrap apply: real Docker install, real secret delivery, real volume creation, then a real, expected image failure", async () => {
-  // Discover the real planId the same way the CLI's own operator
-  // workflow does: run once with an intentionally wrong id, read the
-  // real one back out of the refusal.
-  const probe = await withFakeCosign(() => runApply({ ...baseOptions(), approvePlanId: "sha256:" + "0".repeat(64) }));
-  assert.equal(probe.reason, "approval", JSON.stringify(probe));
-  const planId = /own planId (sha256:[0-9a-f]{64})/.exec(probe.diagnostics[0])[1];
+  // The real operator workflow, exercised for real: a genuine `hofctl
+  // plan` run (real inspectTarget() over the real SSH transport this
+  // whole fixture already sets up, not a mocked seam) produces the exact
+  // plan-v2 document `hofctl apply` itself will be asked to approve (see
+  // PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry, finding #1) - written
+  // to a real file, exactly like `hofctl plan > plan.json` would.
+  const { blocked, plan, diagnostics } = await withFakeCosign(() => runPlan({
+    manifestPath: servicesPath, releaseLockPath, releaseLockIdentity: "test@example.com",
+    hostKeySha256: hostKeyFingerprint, identityFile: userKeyPath, connectTimeoutSeconds: 15,
+    recoveryAgeRecipient: RECOVERY_AGE_RECIPIENT,
+  }));
+  assert.ok(!blocked, `hofctl plan itself was blocked: ${JSON.stringify(diagnostics)}`);
+  const planPath = path.join(workDir, "plan.json");
+  await writeFile(planPath, JSON.stringify(plan));
 
   const events = [];
-  const result = await withFakeCosign(() => runApply({ ...baseOptions(), approvePlanId: planId, emit: (event) => events.push(event) }));
+  const result = await withFakeCosign(() => runApply({ ...baseOptions(), approvePlanId: plan.planId, planPath, emit: (event) => events.push(event) }));
 
   // examples/release-lock.json's own images/signing identities are
   // illustrative (fake digests/identities - see this file's own top
@@ -320,7 +331,8 @@ test("a real bootstrap apply: real Docker install, real secret delivery, real vo
   const { stdout: journalRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${operationId}.json`]);
   const journal = JSON.parse(journalRaw);
   assert.equal(journal.status, "failed");
-  assert.equal(journal.approvedPlanId, planId);
+  assert.equal(journal.approvedPlanId, plan.planId);
+  assert.equal(journal.plan.planId, plan.planId, "the journal embeds the full approved plan-v2 document, not just its planId");
 
   const { stdout: eventsRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${operationId}.events.ndjson`]);
   const durableEvents = eventsRaw.trim().split("\n").map((line) => JSON.parse(line));

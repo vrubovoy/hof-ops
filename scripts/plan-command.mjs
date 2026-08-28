@@ -7,9 +7,21 @@
 // skippable here, unlike validate), inspect the target exactly once,
 // refuse to plan against an incomplete observation, resolve the
 // baseline, render the desired topology in-memory with the correct
-// installation/generation semantics, and print exactly one plan-v1
-// JSON document to stdout. Never writes anything, anywhere - `apply` is
-// a separate, future delivery item.
+// installation/generation semantics, and print exactly one plan
+// document to stdout. Never writes anything, anywhere.
+//
+// A BOOTSTRAP target prints a real plan-v2 document (item 8, PR #31
+// fix) - the exact same buildPlanV2() `hofctl apply` itself recomputes
+// and requires --approve-plan-id/--plan to match byte-for-byte; before
+// this fix, plan printed plan-v1 while apply independently required
+// approval of a structurally different plan-v2 document, so a real
+// `hofctl plan` run's own planId could never be the ID apply actually
+// needed (see PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry). An
+// APPLIED target (item 9, applied-mode reconciliation, doesn't exist
+// yet - hofctl apply only ever supports a bootstrap plan, see ADR 0004)
+// still prints the historical plan-v1 shape, informational only - there
+// is nothing for a v2 plan to be approved for yet on an already-applied
+// host.
 //
 // Deliberately its own module, not folded into hofctl.mjs, matching
 // every other subcommand's own file (render-topology.mjs, preflight.mjs,
@@ -23,9 +35,11 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 
 import { buildPlan } from "./plan.mjs";
+import { buildPlanV2, planV2Validator } from "./plan-v2.mjs";
 import { checkManagedStateReadable, observationFromSnapshot } from "./preflight.mjs";
 import { renderTopology } from "./render-topology.mjs";
 import { resolveBaseline } from "./state.mjs";
+import { suppliedTlsCertificateFingerprint } from "./supplied-tls.mjs";
 import { inspectTarget } from "./target-inspector.mjs";
 import { loadAndValidateDeployment } from "./validate-deployment.mjs";
 
@@ -61,7 +75,12 @@ function blocked(reason, message) {
 
 // options: { manifestPath, catalogPath?, releaseLockPath, releaseLockIdentity,
 //   releaseLockOidcIssuer?, targetMode?, knownHostsFile?, hostKeySha256?,
-//   identityFile?, connectTimeoutSeconds?, repairDrift?, inspect? }
+//   identityFile?, connectTimeoutSeconds?, repairDrift?, inspect?,
+//   recoveryAgeRecipient? }
+// recoveryAgeRecipient is required only when the target turns out to be
+// a genuine bootstrap candidate (see buildPlanV2's own contract) - it's
+// impossible to know that before inspecting the target, so this can't
+// be validated any earlier than apply.mjs's own identical check is.
 // inspect is a testing seam only (see plan-command.test.mjs) - the real
 // CLI always gets the genuine inspectTarget.
 export async function runPlan(options) {
@@ -138,12 +157,58 @@ export async function runPlan(options) {
     return blocked("state", error instanceof Error ? error.message : String(error));
   }
 
-  // Step 5 (render desired in-memory): an applied host's next plan is
-  // always this installation's own real id, one generation ahead of
-  // what's actually on disk; a bootstrap has no real installation yet
-  // at all - see BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER above.
-  const installationId = baseline.mode === "applied" ? baseline.installationId : BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER;
-  const generation = baseline.mode === "applied" ? baseline.generation + 1 : 1;
+  if (baseline.mode === "bootstrap") {
+    // Step 5v2: the exact same plan-v2 document `hofctl apply` itself
+    // recomputes and requires --approve-plan-id/--plan to match. Target
+    // binding, recovery recipient, and supplied-TLS fingerprint mirror
+    // apply.mjs's own identical derivation exactly - a real value here,
+    // not a caller-suppliable override, is what makes an operator-
+    // approved planId actually mean something (see ADR 0004).
+    let suppliedTls;
+    try {
+      suppliedTls = await suppliedTlsCertificateFingerprint(manifest);
+    } catch (error) {
+      return blocked("tls", error instanceof Error ? error.message : String(error));
+    }
+    if (!options.recoveryAgeRecipient) {
+      return blocked("recovery", "--recovery-age-recipient is required (a bootstrap plan always needs one, see ADR 0004)");
+    }
+
+    const generation = 1;
+    let desiredRendered;
+    try {
+      desiredRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId: BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER, generation });
+    } catch (error) {
+      return blocked("render", error instanceof Error ? error.message : String(error));
+    }
+
+    let plan;
+    try {
+      plan = buildPlanV2({
+        baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift: options.repairDrift ?? false,
+        target: { mode: targetMode, host, port, user, hostKeySha256: snapshot.transport.trustDigest },
+        recoveryAgeRecipient: options.recoveryAgeRecipient,
+        suppliedTlsCertificateFingerprint: suppliedTls,
+      });
+    } catch (error) {
+      return blocked("plan", error instanceof Error ? error.message : String(error));
+    }
+
+    const validatePlanV2 = await planV2Validator();
+    if (!validatePlanV2(plan)) {
+      return blocked("internal", `buildPlanV2 produced a result that does not satisfy schemas/plan-v2.schema.json: ${JSON.stringify(validatePlanV2.errors)}`);
+    }
+
+    return { blocked: false, plan };
+  }
+
+  // baseline.mode === "applied": item 9 (applied-mode reconciliation)
+  // doesn't exist yet, and hofctl apply only ever supports a bootstrap
+  // plan (ADR 0004) - there is nothing for a v2 plan to be approved for
+  // on an already-applied host. Stays the historical plan-v1 shape,
+  // informational only.
+  const installationId = baseline.installationId;
+  const generation = baseline.generation + 1;
   let desiredRendered;
   try {
     desiredRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId, generation });

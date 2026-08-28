@@ -117,3 +117,49 @@ a commit exists but a prior operation actually failed.
   image/config/migration/service/readiness roles, the lock and journal
   implementations) is out of scope for the contracts introduced here and
   lands in the PRs that follow.
+
+## Errata (2026-08-28, PR #31)
+
+A review after item 8's own PRs (#24-30) landed found the approval and
+resume decisions above were only partially implemented, in a way that
+made "Explicit, exact approval" not actually hold in practice - filed as
+"Item 8 reopened" in `PLATFORM-OPS-PLAN.md`. Both corrected here, without
+revisiting the design itself:
+
+- **"`hofctl plan` continues emitting `plan-v1` unchanged" was wrong in
+  practice, not just imprecise.** `hofctl apply` requires approval of a
+  `plan-v2` document (this ADR's own decision above), but `hofctl plan`
+  never printed one - it always printed `plan-v1`, a structurally
+  different document with a different `planId`. An operator's real
+  `hofctl plan` output could therefore never be the exact bytes
+  `--approve-plan-id` needed, defeating "approving a plan approves those
+  exact bytes" at the one point a human is actually supposed to look at
+  them. Fixed: `hofctl plan` against a bootstrap target now prints the
+  real `plan-v2` document (requiring `--recovery-age-recipient`, and a
+  supplied-TLS certificate fingerprint when `manifest.tls.mode` is
+  `supplied`, exactly like `apply` itself needs); against an
+  already-applied target it still prints `plan-v1` (item 9 doesn't exist
+  yet to define what a `plan-v2` there would even mean). `apply` also
+  gained an explicit `--plan <file>` flag - `--approve-plan-id` is
+  checked against that file's own `planId`, and apply's live recompute
+  (both before and, again, under the lock) is compared against the full
+  file, not reconstructed from scratch with no record of what was
+  actually reviewed.
+- **"Safe, bounded resume" could not actually resume past the case it
+  exists for.** `apply --resume`'s implementation ran the ordinary
+  bootstrap-baseline check (`resolveBaseline()`) before ever reading the
+  lock or journal. Once a real mutation had already happened under the
+  lock (a created volume/network/container) but `state.commit` hadn't
+  run yet - precisely the interruption resume is meant to recover from -
+  that baseline check saw an already-partially-applied host and refused
+  outright, never reaching the per-step resumption logic at all. Fixed:
+  resume now reads the lock and journal first, always; the journal
+  itself now embeds the full approved plan document (not just its
+  `planId`), which resume reads operations from directly, and resume
+  re-verifies only the immutable input digests and target host-key
+  identity the journal was created against - it never re-derives a live
+  baseline/diff.
+
+Every other decision above (target binding, the signed Execution
+Environment, the durable lock, the whitelist, the atomic last commit)
+is unchanged.

@@ -7,9 +7,9 @@
   "ansibleEnvironment": {
     "source": "https://github.com/vrubovoy/hof-ops",
     "revision": "1111111111111111111111111111111111111111",
-    "sourceTag": "v1.0.0",
-    "image": "ghcr.io/vrubovoy/hof-ansible-ee@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "signatureIdentity": "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/tags/v1.0.0",
+    "sourceTag": "ee-v1.0.0",
+    "image": "ghcr.io/vrubovoy/hof-ops-ee@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "signatureIdentity": "https://github.com/vrubovoy/hof-ops/.github/workflows/execution-environment.yml@refs/tags/ee-v1.0.0",
     "signatureOidcIssuer": "https://token.actions.githubusercontent.com",
     "provenanceDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     "sbomDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"

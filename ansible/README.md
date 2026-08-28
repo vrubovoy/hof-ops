@@ -77,9 +77,16 @@ tag (not `ee-v0.1.0`) is what `examples/release-selection.yml`'s own
 `ansibleEnvironment.image` and `version: "0.1.0"` reference, matching
 every other component's own `:v${version}` convention.
 
-`ee-v0.1.0` has actually been cut this way, for real, closing out item 8:
-`ghcr.io/vrubovoy/hof-ops-ee@sha256:ff58ec8b377fe72f86317bad606c5412ea09e6a678f16c113b7b2be2c791b306`,
+`ee-v0.1.0` was cut this way for real, closing out item 8's own
+bootstrap/apply work initially. A 2026-08-28 review then found real
+gaps in that scope (see PLATFORM-OPS-PLAN.md's "Item 8 reopened"
+entry) - once they were fixed (PRs #31-33), `ee-v0.1.1` was cut the
+same way, baking those fixes (in particular PR #32's own `host` role
+Compose-plugin fix) into a real pinned image for the first time:
+`ghcr.io/vrubovoy/hof-ops-ee@sha256:0ada8da1a7329ac72081b82a4d38ccac08897795c95cc768d1d74de3c5a16eda`,
 independently re-verified with a real `cosign verify` against the exact
 workflow identity above (real transparency-log/certificate-authority
 checks, not skipped) and confirmed to carry both attestations
 (`https://spdx.dev/Document/v2.3` and `https://slsa.dev/provenance/v1`).
+`ee-v0.1.0`'s own image stays published, a historical artifact, not
+deleted.

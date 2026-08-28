@@ -13,6 +13,16 @@
 # after a fresh pull.
 FROM python:3.13-slim-bookworm@sha256:c45a22ea000adfd9cda29364bbe7edd23001ce5cc2ad15857cfbf7766943b9ca
 
+# A real OpenSSH client - Ansible's own default connection plugin
+# (ssh, ansible.cfg never overrides it) shells out to a real `ssh`
+# binary to reach the target at all; the base image has none. Found for
+# real via a genuine CI failure ("Unable to execute ssh command line on
+# a controller due to: [Errno 2] No such file or directory: b'ssh'"),
+# not assumed.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssh-client \
+  && rm -rf /var/lib/apt/lists/*
+
 # Ansible itself, plus the Python bindings community.docker's own
 # modules need to talk to Docker over its socket (docker>=7, the
 # maintained "docker" package - "docker-py" is its old, unmaintained

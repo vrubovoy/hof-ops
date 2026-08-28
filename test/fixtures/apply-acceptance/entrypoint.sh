@@ -23,4 +23,4 @@ chown -R hofprobe:hofprobe /home/hofprobe/.ssh
 chmod 700 /home/hofprobe/.ssh
 chmod 600 /home/hofprobe/.ssh/authorized_keys
 
-exec /lib/systemd/systemd --log-target=console --log-level=debug
+exec /lib/systemd/systemd --log-target=console

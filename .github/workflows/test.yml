@@ -22,11 +22,14 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - uses: sigstore/cosign-installer@v3
       - run: pnpm validate
       - run: pnpm test
       - name: Real SSH transport acceptance (ephemeral pinned Debian 12 sshd container)
         run: pnpm test:ssh
-      - name: Real hofctl apply acceptance (ephemeral sudo-enabled sshd container, real Execution Environment build+dispatch)
+      - name: Real hofctl apply acceptance (ephemeral sudo-enabled sshd container, real signed release, real Execution Environment)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: pnpm test:apply-ssh
 
   ansible:

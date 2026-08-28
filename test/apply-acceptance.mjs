@@ -3,41 +3,39 @@
 // (needs Docker, takes noticeably longer, same reasoning as
 // test/ssh-acceptance.mjs). Builds and starts a genuinely ephemeral,
 // sudo-enabled, pinned Debian 12 sshd container (test/fixtures/
-// apply-acceptance), builds the real pinned Execution Environment image
-// from ansible/Dockerfile, and runs a real hofctl apply bootstrap
-// through the ENTIRE real pipeline: real inspectTarget() over real SSH,
-// a real plan-v2 build, real target-mutate lock/journal/event writes
-// over real SSH (with sudo), a real `docker run` of the real EE image
-// for every operation, reaching the real target over a real SSH
-// connection FROM inside that container, running item 8's own real
-// role implementations (PR #28: host, secret, volume, network, image,
-// config).
+// apply-acceptance) and runs a real hofctl apply bootstrap through the
+// ENTIRE real pipeline, start to finish, for the first time: real
+// inspectTarget() over real SSH, a real plan-v2 build, real
+// target-mutate lock/journal/event writes over real SSH (with sudo), a
+// real `docker run` of the real, published, independently-signed
+// ee-v0.1.1 Execution Environment image for every operation (no local
+// build, no signature bypass, no image override - see baseOptions()
+// below), reaching the real target over a real SSH connection FROM
+// inside that container, running every one of item 8's ten real role
+// implementations against real application images.
 //
-// This run genuinely installs Docker on the target for real
-// (host.prepare, apt), delivers real secret files over real SSH
-// (secret.ensure) - including a genuine self-signed TLS certificate/
-// private key (manifest.tls.mode "supplied", not acme-http01 - a real
-// openssl-generated key pair with a real SAN, exercising the exact real
-// delivery path a 2026-08-28 review found completely missing, see
-// PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry) - and creates real
-// Hof-labeled Docker volumes (volume.ensure) - all the way through,
-// successfully. It then hits a REAL, EXPECTED failure at the first
-// image operation: examples/release-lock.json is illustrative (fake
-// digests/signing identities, see contracts.mjs's own comment on that
-// fixture), so a real `cosign verify`/`docker pull` against those
-// references genuinely fails - the same way it would against any
-// release lock whose images don't actually exist. This is deliberately
-// NOT patched around: it's real coverage of apply.mjs's own failure
-// path (a real operation failure marking the journal failed and
-// releasing the lock), exercised here for the first time against a
-// genuinely real failure rather than a mocked one (see
-// test/apply.test.mjs's own mocked failure test for the complementary
-// orchestration-level coverage). config.write and every role after it
-// (database/service/readiness/state - all real since PR #29) are
-// consequently never reached by THIS run - a real image pull is a real
-// prerequisite the rest of a real bootstrap must have, exactly like it
-// would in production; see ansible/README.md for exactly what those
-// four roles have instead (real local verification, not this live run).
+// This is the "full disposable-VM acceptance" PLATFORM-OPS-PLAN.md's
+// "Item 8 reopened" entry named as missing (finding #9): earlier
+// versions of this file stopped at a real, expected image-pull failure
+// (examples/release-lock.json's own images were illustrative). This one
+// uses the real, published, real-Cosign-signed v0.1.2 platform release
+// lock instead - downloaded fresh in before() via `gh release download`
+// - so every image reference in it is genuinely pullable and genuinely
+// signed. The manifest enables only the platform's own mandatory core
+// (schlussel, schloss - see catalog/services-v1.yaml's own `mandatory:
+// true` entries; every optional service disabled, matching
+// test/fixtures/topologies/core.yml's own shape) - a real, deliberate
+// scope choice: `hofctl apply`'s own correctness is what this test
+// exists to prove, not each application's own runtime behavior (already
+// proven separately and repeatedly by scripts/integration-matrix.mjs's
+// own real `docker compose up --wait` runs against the full topology).
+// A real self-signed TLS certificate/private key (manifest.tls.mode
+// "supplied", not acme-http01) is included too, exercising the real
+// delivery path a 2026-08-28 review found completely missing (see
+// render-topology.mjs's own fixed-secret-path fix and
+// scripts/supplied-tls.mjs's own real parse/key-match/validity/SAN
+// validation). With only mandatory core enabled, requiredSecrets()
+// itself is empty - no application secret store is needed at all.
 //
 // Both the ssh-fixture container and the Execution Environment
 // container run on a shared, dedicated Docker bridge network so the EE
@@ -45,27 +43,20 @@
 // exact same IP this test's own host-side SSH/target-mutate calls use,
 // no DNS or hostname resolution needed on either side.
 //
-// The release lock's OWN blob signature (release-lock.json.sig/.pem) is
-// verified with the same fake cosign already used by
-// plan-command.test.mjs/apply.test.mjs (a real Sigstore/OIDC round trip
-// isn't available outside a real GitHub Actions run) - but the
-// Execution Environment image's OWN signature check is bypassed
-// (verifyEeSignature) for the same reason: a locally-built image was
-// never actually signed by the real execution-environment.yml workflow.
-// The secrets store is a plain in-memory stub (readSecretsStore) - real
-// `sops`/`age` mechanics are already exercised for real in PR #25's own
-// secrets.test.mjs; what this test needs to prove is that apply.mjs's
-// own delivery of decrypted values into the Execution Environment and
-// through to the target (never through extra-vars/the journal) works
-// for real, not that SOPS itself works. Everything else here is
-// genuinely real, including the pinned EE image build (with its own
-// real cosign binary) and every real docker run/SSH round trip it
-// makes.
+// The release lock's own blob signature and the Execution Environment
+// image's own signature are BOTH verified for real here (a real cosign
+// binary - see .github/workflows/test.yml's own cosign-installer step
+// added alongside this test) - a real Sigstore/OIDC round trip, exactly
+// like a real operator's own `hofctl apply` run would do. Nothing about
+// verification is bypassed or stubbed in this file.
+//
+// GH_TOKEN must be set in the environment (see .github/workflows/
+// test.yml) - `gh release download` needs it to reach the GitHub API.
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { after, before } from "node:test";
@@ -76,18 +67,22 @@ import YAML from "yaml";
 
 import { runApply } from "../scripts/apply.mjs";
 import { runPlan } from "../scripts/plan-command.mjs";
-import { enabledServiceIds } from "../scripts/render-topology.mjs";
-import { requiredSecrets } from "../scripts/secrets.mjs";
-import { loadContracts } from "../scripts/contracts.mjs";
 
 const RECOVERY_AGE_RECIPIENT = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+// The real platform release this test downloads and applies - see
+// releases/0.1.2.yml (the first real release selection to carry a real
+// ansibleEnvironment). `workflow_dispatch` signs with the DISPATCHING
+// branch's own ref, never a tag (confirmed for real by inspecting the
+// v0.1.1 release's own certificate - `@refs/heads/main`, not
+// `@refs/tags/v0.1.1`), unlike execution-environment.yml's own
+// tag-triggered identity below.
+const RELEASE_VERSION = "0.1.2";
+const RELEASE_LOCK_IDENTITY = "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/heads/main";
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const fixtureDir = path.join(root, "test/fixtures/apply-acceptance");
-const fakeCosignDir = path.join(root, "test/fixtures/plan-cli");
 const targetImageTag = "hof-ops-apply-acceptance-target:test";
-const eeImageTag = "local/hof-ops-apply-acceptance-ee:test";
 const containerName = `hof-apply-acceptance-${randomUUID()}`;
 const networkName = `hof-apply-acceptance-${randomUUID()}`;
 
@@ -97,12 +92,10 @@ let userKeyPath;
 let hostKeyFingerprint;
 let servicesPath;
 let releaseLockPath;
-let eeImageReference;
 let suppliedTlsCertificatePath;
 let suppliedTlsPrivateKeyPath;
 let suppliedTlsCertificatePem;
 let suppliedTlsPrivateKeyPem;
-let fakeSecretValues;
 
 async function waitForSsh(ip, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -128,35 +121,24 @@ async function waitForSsh(ip, timeoutMs) {
   throw new Error(`sshd on ${ip}:22 never became reachable within ${timeoutMs}ms - container state: ${status} - boot log:\n${logs}`);
 }
 
-async function withFakeCosign(fn) {
-  const originalPath = process.env.PATH;
-  const originalOutcome = process.env.HOF_TEST_COSIGN_OUTCOME;
-  process.env.PATH = `${fakeCosignDir}${path.delimiter}${originalPath}`;
-  process.env.HOF_TEST_COSIGN_OUTCOME = "success";
-  try {
-    return await fn();
-  } finally {
-    process.env.PATH = originalPath;
-    if (originalOutcome === undefined) delete process.env.HOF_TEST_COSIGN_OUTCOME;
-    else process.env.HOF_TEST_COSIGN_OUTCOME = originalOutcome;
-  }
-}
-
 before(async () => {
-  await exec("docker", ["build", "--quiet", "--tag", targetImageTag, fixtureDir], { timeout: 180_000 });
-  await exec("docker", ["build", "--quiet", "--tag", eeImageTag, "--file", path.join(root, "ansible/Dockerfile"), path.join(root, "ansible")], { timeout: 180_000 });
-  // A plain local tag - passed to runApply() as
-  // executionEnvironmentImageOverride, never as the release lock's own
-  // ansibleEnvironment.image (see apply.mjs's own comment on that seam
-  // for why: a locally-built, never-pushed image has no repo@sha256:...
-  // reference every Docker storage backend resolves the same way, and
-  // the release lock's own `image` field must stay schema-valid
-  // regardless).
-  eeImageReference = eeImageTag;
+  workDir = await mkdtemp(path.join(tmpdir(), "hof-apply-acceptance-"));
 
+  // The real, published, real-Cosign-signed release lock for
+  // RELEASE_VERSION - downloaded fresh, never checked into this repo
+  // (release-lock.json is a build artifact of a real GitHub Release,
+  // not source). `--clobber` because a retried CI attempt reuses the
+  // same workDir naming pattern only per-process, but a stale local dev
+  // run's own leftover file must never silently be trusted instead.
+  await exec("gh", [
+    "release", "download", `v${RELEASE_VERSION}`, "--repo", "vrubovoy/hof-ops",
+    "--pattern", "release-lock.json*", "--dir", workDir, "--clobber",
+  ]);
+  releaseLockPath = path.join(workDir, "release-lock.json");
+
+  await exec("docker", ["build", "--quiet", "--tag", targetImageTag, fixtureDir], { timeout: 180_000 });
   await exec("docker", ["network", "create", networkName]);
 
-  workDir = await mkdtemp(path.join(tmpdir(), "hof-apply-acceptance-"));
   const hostKeyPath = path.join(workDir, "host_key");
   userKeyPath = path.join(workDir, "user_key");
   await exec("ssh-keygen", ["-t", "ed25519", "-f", hostKeyPath, "-N", "", "-q"]);
@@ -207,8 +189,18 @@ before(async () => {
   const { stdout: fingerprintLine } = await exec("ssh-keygen", ["-l", "-E", "sha256", "-f", `${hostKeyPath}.pub`]);
   hostKeyFingerprint = fingerprintLine.trim().split(/\s+/)[1];
 
-  const manifest = YAML.parse(await exec("cat", [path.join(root, "examples/services.yml")]).then((r) => r.stdout));
+  // Mandatory core only (schlussel + schloss - every optional service
+  // disabled), matching test/fixtures/topologies/core.yml's own shape -
+  // see this file's own top comment for why. requiredSecrets() against
+  // this manifest is empty, so no secrets store is needed at all.
+  const manifest = YAML.parse(await readFile(path.join(root, "test/fixtures/topologies/core.yml"), "utf8"));
   manifest.target = { host: targetIp, user: "hofprobe", port: 22 };
+  manifest.domains = { base: "example.com" };
+  // render-topology.mjs asserts manifest.release === releaseLock.release
+  // - the fixture's own placeholder ("1.0.0") must be replaced with the
+  // real downloaded lock's own release, the same way
+  // integration-matrix.mjs's own real runtime pass already does.
+  manifest.release = JSON.parse(await readFile(releaseLockPath, "utf8")).release;
 
   // Real supplied TLS material - a genuine self-signed cert/key pair
   // (openssl, real X.509 content, real SAN covering exactly the
@@ -218,10 +210,7 @@ before(async () => {
   // WORKSTATION path directly into the target-side volume definition,
   // meaningless on the actual target - see render-topology.mjs's own
   // fixed-secret-path fix, and scripts/supplied-tls.mjs's own real
-  // parse/key-match/validity/SAN validation). secret.ensure (which now
-  // also delivers this) runs and succeeds well before this run's own
-  // expected image-pull failure, so its real, on-target result is fully
-  // observable below.
+  // parse/key-match/validity/SAN validation).
   suppliedTlsCertificatePath = path.join(workDir, "tls-certificate.pem");
   suppliedTlsPrivateKeyPath = path.join(workDir, "tls-private-key.pem");
   await exec("openssl", [
@@ -236,30 +225,12 @@ before(async () => {
 
   servicesPath = path.join(workDir, "services.yml");
   await writeFile(servicesPath, YAML.stringify(manifest));
-
-  const { catalog } = await loadContracts();
-  fakeSecretValues = Object.fromEntries(
-    requiredSecrets(manifest, enabledServiceIds(manifest, catalog)).map((s) => [s.name, `fake-value-${s.name}`]),
-  );
-
-  // The release lock's own ansibleEnvironment.image stays whatever
-  // schema-valid, illustrative placeholder examples/release-lock.json
-  // already carries - real Cosign verification of it is bypassed below
-  // (verifyEeSignature) for the same reason, and the real docker run
-  // target is the local build (executionEnvironmentImageOverride), not
-  // this field.
-  const releaseLock = JSON.parse(await exec("cat", [path.join(root, "examples/release-lock.json")]).then((r) => r.stdout));
-  releaseLockPath = path.join(workDir, "release-lock.json");
-  await writeFile(releaseLockPath, JSON.stringify(releaseLock));
-  await writeFile(`${releaseLockPath}.sig`, "fake-signature\n");
-  await writeFile(`${releaseLockPath}.pem`, "fake-certificate\n");
 });
 
 after(async () => {
   await exec("docker", ["rm", "--force", containerName]).catch(() => {});
   await exec("docker", ["network", "rm", networkName]).catch(() => {});
   await exec("docker", ["rmi", "--force", targetImageTag]).catch(() => {});
-  await exec("docker", ["rmi", "--force", eeImageTag]).catch(() => {});
   if (workDir) await rm(workDir, { recursive: true, force: true });
 });
 
@@ -269,11 +240,10 @@ after(async () => {
 // hide the actually-useful failure detail (confirmed for real: an
 // unrelated trailing interpreter-discovery warning pushed the real
 // "fatal:" line out of that 8-line window during this test's own
-// development). Wraps the real dockerRun with the exact same
+// earlier development). Wraps the real dockerRun with the exact same
 // argv/behavior, logging the complete, untruncated stdout/stderr of
 // only a FAILED operation to this process's own stderr - never reaches
-// apply.mjs's own journal/NDJSON stream, and never fires for the (many,
-// expected) successful operations a real bootstrap run dispatches.
+// apply.mjs's own journal/NDJSON stream.
 function loggingDockerRun(command, args, options) {
   return new Promise((resolve, reject) => {
     execFile(command, args, { maxBuffer: 8 * 1024 * 1024, ...options }, (error, stdout, stderr) => {
@@ -289,119 +259,120 @@ function loggingDockerRun(command, args, options) {
 
 function baseOptions() {
   return {
-    manifestPath: servicesPath, releaseLockPath, releaseLockIdentity: "test@example.com",
-    hostKeySha256: hostKeyFingerprint, identityFile: userKeyPath, connectTimeoutSeconds: 15,
+    manifestPath: servicesPath, releaseLockPath, releaseLockIdentity: RELEASE_LOCK_IDENTITY,
+    hostKeySha256: hostKeyFingerprint, identityFile: userKeyPath, connectTimeoutSeconds: 30,
     recoveryAgeRecipient: RECOVERY_AGE_RECIPIENT,
-    verifyEeSignature: async () => {},
     dockerRun: loggingDockerRun,
-    executionEnvironmentImageOverride: eeImageReference,
+    // No executionEnvironmentImageOverride, no verifyEeSignature stub -
+    // the real, published ee-v0.1.1 image referenced by the real
+    // release lock above, with its real Cosign signature genuinely
+    // verified.
+    //
     // The target only exists on this test's own private Docker bridge
     // network (never a published host port) - the Execution
     // Environment container must join that same network to reach it at
     // all (confirmed for real: Docker refuses inter-network traffic
     // between two separate bridge networks by default).
     executionEnvironmentDockerNetwork: networkName,
-    secretsStorePath: "/dev/null", // never actually read - readSecretsStore is stubbed below
-    readSecretsStore: async () => fakeSecretValues,
   };
 }
 
-test("a real bootstrap apply: real Docker install, real secret delivery, real volume creation, then a real, expected image failure", async () => {
+test("a real, full bootstrap apply against the real, published, signed v0.1.2 release - every real role, start to finish, to a genuine generation-1 commit", async () => {
   // The real operator workflow, exercised for real: a genuine `hofctl
   // plan` run (real inspectTarget() over the real SSH transport this
-  // whole fixture already sets up, not a mocked seam) produces the exact
-  // plan-v2 document `hofctl apply` itself will be asked to approve (see
-  // PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry, finding #1) - written
-  // to a real file, exactly like `hofctl plan > plan.json` would.
-  const { blocked, plan, diagnostics } = await withFakeCosign(() => runPlan({
-    manifestPath: servicesPath, releaseLockPath, releaseLockIdentity: "test@example.com",
-    hostKeySha256: hostKeyFingerprint, identityFile: userKeyPath, connectTimeoutSeconds: 15,
+  // whole fixture already sets up, real cosign verification of the
+  // release lock's own blob signature) produces the exact plan-v2
+  // document `hofctl apply` itself will be asked to approve - written to
+  // a real file, exactly like `hofctl plan > plan.json` would.
+  const { blocked, plan, diagnostics } = await runPlan({
+    manifestPath: servicesPath, releaseLockPath, releaseLockIdentity: RELEASE_LOCK_IDENTITY,
+    hostKeySha256: hostKeyFingerprint, identityFile: userKeyPath, connectTimeoutSeconds: 30,
     recoveryAgeRecipient: RECOVERY_AGE_RECIPIENT,
-  }));
+  });
   assert.ok(!blocked, `hofctl plan itself was blocked: ${JSON.stringify(diagnostics)}`);
+  assert.ok(plan.executable, `the real plan against mandatory core alone was not executable: ${JSON.stringify(plan.blockers)}`);
   const planPath = path.join(workDir, "plan.json");
   await writeFile(planPath, JSON.stringify(plan));
 
   const events = [];
-  const result = await withFakeCosign(() => runApply({ ...baseOptions(), approvePlanId: plan.planId, planPath, emit: (event) => events.push(event) }));
+  const result = await runApply({ ...baseOptions(), approvePlanId: plan.planId, planPath, emit: (event) => events.push(event) });
 
-  // examples/release-lock.json's own images/signing identities are
-  // illustrative (fake digests/identities - see this file's own top
-  // comment) - a real cosign verify or docker pull against them
-  // genuinely fails. This IS the expected outcome, not a bug: it's real
-  // coverage of apply.mjs's own failure path.
-  assert.equal(result.blocked, true, JSON.stringify(result));
-  assert.equal(result.reason, "operation");
-  assert.match(result.diagnostics[0], /operation \d{3}\.image\.(verify|pull)/);
+  assert.equal(result.blocked, false, `a real bootstrap against real mandatory-core images did not succeed: ${JSON.stringify(result)}`);
+  assert.equal(result.committedGeneration, 1);
+  assert.equal(result.planId, plan.planId);
 
   const operationEvents = events.filter((event) => event.apiVersion === "hof.dev/operation-event/v1");
   const succeeded = operationEvents.filter((event) => event.phase === "succeeded").map((event) => event.step);
   const failed = operationEvents.filter((event) => event.phase === "failed");
+  assert.equal(failed.length, 0, `every operation must succeed in a real, full bootstrap: ${JSON.stringify(failed)}`);
 
-  // host.prepare (real apt-installed Docker), secret.ensure (a real
-  // secret file delivered over real SSH), and every volume.ensure (a
-  // real, Hof-labeled Docker volume) all genuinely succeeded before the
-  // run ever reached an image operation - network.ensure never appears
-  // at all in a bootstrap plan (see plan.mjs's own computeMissingResources:
-  // a synthetic empty baseline has no networks to find "missing").
-  assert.ok(succeeded.some((step) => step.endsWith(".host.prepare")), "host.prepare succeeded for real");
-  assert.ok(succeeded.some((step) => step.endsWith(".secret.ensure")), "secret.ensure succeeded for real");
+  // Every real phase actually ran, for real - not just the ones an
+  // earlier, illustrative-lock version of this test could reach.
+  for (const suffix of [".host.prepare", ".secret.ensure", ".config.write", ".database.migrate", ".state.commit"]) {
+    assert.ok(succeeded.some((step) => step.endsWith(suffix)), `${suffix} must have succeeded for real`);
+  }
   assert.ok(succeeded.some((step) => step.includes(".volume.ensure.")), "at least one volume.ensure succeeded for real");
-  assert.equal(failed.length, 1, "exactly one real, expected failure - the run stops at the first one");
-  assert.match(failed[0].step, /\.image\.(verify|pull)\./);
-
-  // blocked() results (see apply.mjs) carry no operationId of their own
-  // (only a successful {blocked: false, operationId, ...} result does) -
-  // every real operation-event-v1 already shares the one this run
-  // actually used, so read it from there instead.
-  const operationId = operationEvents[0].operationId;
-  assert.ok(operationEvents.every((event) => event.operationId === operationId));
+  assert.ok(succeeded.some((step) => step.includes(".image.verify.") && step.includes("schlussel")), "schlussel's own image.verify (real cosign, real workflow identity) succeeded for real");
+  assert.ok(succeeded.some((step) => step.includes(".service.start.")), "at least one service.start succeeded for real");
+  assert.ok(succeeded.some((step) => step.includes(".readiness.wait.")), "at least one readiness.wait (real docker inspect polling, real Health.Status) succeeded for real");
 
   // The real, durable, on-target record - read directly, over a second,
   // independent real SSH connection (docker exec into the same
   // container, bypassing this module's own transport entirely) so this
-  // assertion can't be fooled by a bug in target-mutate.mjs's own
-  // reader.
-  const { stdout: journalRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${operationId}.json`]);
+  // assertion can't be fooled by a bug in target-mutate.mjs's own reader.
+  const { stdout: journalRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${result.operationId}.json`]);
   const journal = JSON.parse(journalRaw);
-  assert.equal(journal.status, "failed");
+  assert.equal(journal.status, "succeeded");
+  assert.equal(journal.committedGeneration, 1);
   assert.equal(journal.approvedPlanId, plan.planId);
-  assert.equal(journal.plan.planId, plan.planId, "the journal embeds the full approved plan-v2 document, not just its planId");
 
-  const { stdout: eventsRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${operationId}.events.ndjson`]);
+  const { stdout: eventsRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${result.operationId}.events.ndjson`]);
   const durableEvents = eventsRaw.trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual(durableEvents, operationEvents, "the live NDJSON stream matches the durable journal exactly, event for event");
 
-  // A real secret genuinely landed on the target, root-owned, mode 0400
-  // - delivered via ansible.builtin.copy over the real SSH/SFTP
-  // connection, never through extra-vars (see the secret role's own
-  // tasks/main.yml).
-  const firstSecretName = Object.keys(fakeSecretValues)[0];
-  const { stdout: secretRaw } = await exec("docker", ["exec", containerName, "cat", `/etc/hof/secrets/${firstSecretName}`]);
-  assert.equal(secretRaw, fakeSecretValues[firstSecretName]);
-  const { stdout: secretStat } = await exec("docker", ["exec", containerName, "stat", "--format", "%a %U", `/etc/hof/secrets/${firstSecretName}`]);
-  assert.equal(secretStat.trim(), "400 root");
+  // A real, schema-shaped current.json genuinely landed on the target -
+  // generation 1, this exact operation, this exact release.
+  const { stdout: currentRaw } = await exec("docker", ["exec", containerName, "cat", "/var/lib/hof/state/current.json"]);
+  const current = JSON.parse(currentRaw);
+  assert.equal(current.generation, 1);
+  assert.equal(current.lastSuccessfulOperationId, result.operationId);
+  assert.equal(current.release, RELEASE_VERSION);
+  assert.match(current.installationId, /^[0-9a-f-]{36}$/);
 
   // The real supplied TLS certificate/private key genuinely landed on
-  // the target too, byte-for-byte, root-owned, mode 0400 - the exact
-  // real delivery a 2026-08-28 review found completely missing (see
-  // this file's own top comment on manifest.tls above).
+  // the target too, byte-for-byte, root-owned, mode 0400.
   const { stdout: deliveredCertificate } = await exec("docker", ["exec", containerName, "cat", "/etc/hof/secrets/hof.tls.certificate"]);
   assert.equal(deliveredCertificate, suppliedTlsCertificatePem);
   const { stdout: deliveredPrivateKey } = await exec("docker", ["exec", containerName, "cat", "/etc/hof/secrets/hof.tls.privateKey"]);
   assert.equal(deliveredPrivateKey, suppliedTlsPrivateKeyPem);
   const { stdout: tlsCertStat } = await exec("docker", ["exec", containerName, "stat", "--format", "%a %U", "/etc/hof/secrets/hof.tls.certificate"]);
   assert.equal(tlsCertStat.trim(), "400 root");
-  const { stdout: tlsKeyStat } = await exec("docker", ["exec", containerName, "stat", "--format", "%a %U", "/etc/hof/secrets/hof.tls.privateKey"]);
-  assert.equal(tlsKeyStat.trim(), "400 root");
 
-  // Docker itself was genuinely installed by host.prepare, not merely
-  // reported as installed.
+  // Docker itself was genuinely installed by host.prepare, and the real
+  // application containers are genuinely running under it - not just
+  // reported as such.
   const { stdout: dockerVersion } = await exec("docker", ["exec", containerName, "docker", "--version"]);
   assert.match(dockerVersion, /Docker version/);
+  const { stdout: psOutput } = await exec("docker", ["exec", containerName, "docker", "ps", "--format", "{{.Names}} {{.Status}}"]);
+  assert.match(psOutput, /schlussel/);
+  assert.match(psOutput, /schloss/);
+  assert.match(psOutput, /gateway/);
 
-  // A real, definitive operation failure releases the lock (ADR 0004) -
+  // The lock is released after a successful commit (ADR 0004) -
   // confirmed by a real, independent `test -e` on the target, not just
   // this module's own readLock().
   await assert.rejects(() => exec("docker", ["exec", containerName, "test", "-e", "/var/lib/hof/state/lock.json"]));
+
+  // A second `hofctl plan` against this now-applied host sees a real
+  // applied baseline, not a bootstrap one - the real, closed loop this
+  // whole delivery item exists to prove: a genuine generation-1 commit
+  // is genuinely observable afterward, not merely claimed.
+  const secondPlan = await runPlan({
+    manifestPath: servicesPath, releaseLockPath, releaseLockIdentity: RELEASE_LOCK_IDENTITY,
+    hostKeySha256: hostKeyFingerprint, identityFile: userKeyPath, connectTimeoutSeconds: 30,
+  });
+  assert.ok(!secondPlan.blocked, `the second plan against the now-applied host was blocked: ${JSON.stringify(secondPlan.diagnostics)}`);
+  assert.equal(secondPlan.plan.mode, "applied");
+  assert.equal(secondPlan.plan.baseline.installationId, current.installationId);
+  assert.equal(secondPlan.plan.baseline.generation, 1);
 });

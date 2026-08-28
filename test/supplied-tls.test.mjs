@@ -49,20 +49,49 @@ async function realPublicHostnames() {
   return publicHostnames(manifest, catalog);
 }
 
+// `openssl req -x509`'s own -not_before/-not_after flags only exist
+// since OpenSSL 3.2 (confirmed: absent on Ubuntu 24.04's packaged 3.0.13
+// - a real CI failure, not a guess) - an arbitrary, exact validity
+// window (including one entirely in the past or future, needed for the
+// expired/not-yet-valid tests below) instead goes through the much
+// older, universally-supported `openssl ca -selfsign -startdate
+// -enddate` path (a CSR carrying the real SAN extension, then self-
+// signed against a minimal, per-call throwaway CA database).
 async function generateKeyAndCert({ san, notBefore, notAfter } = {}) {
   fileCounter += 1;
   const keyPath = path.join(workDir, `key-${fileCounter}.pem`);
+  const csrPath = path.join(workDir, `csr-${fileCounter}.pem`);
   const certPath = path.join(workDir, `cert-${fileCounter}.pem`);
-  const args = [
-    "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-    "-keyout", keyPath, "-out", certPath,
-    "-subj", "/CN=example.com",
-    "-addext", `subjectAltName=${san ?? "DNS:example.com,DNS:*.example.com"}`,
-  ];
-  if (notBefore) args.push("-not_before", notBefore);
-  if (notAfter) args.push("-not_after", notAfter);
-  else args.push("-days", "1");
-  await exec("openssl", args);
+  const configPath = path.join(workDir, `ca-${fileCounter}.cnf`);
+  const indexPath = path.join(workDir, `index-${fileCounter}.txt`);
+  const serialPath = path.join(workDir, `serial-${fileCounter}.txt`);
+
+  await writeFile(configPath, [
+    "[ ca ]", "default_ca = CA_default", "",
+    "[ CA_default ]",
+    `database = ${indexPath}`,
+    `serial = ${serialPath}`,
+    `new_certs_dir = ${workDir}`,
+    "default_md = sha256",
+    "policy = policy_anything",
+    "copy_extensions = copy", "",
+    "[ policy_anything ]", "commonName = supplied", "",
+    "[ req ]", "distinguished_name = req_dn", "req_extensions = v3_req", "",
+    "[ req_dn ]", "",
+    "[ v3_req ]",
+    `subjectAltName = ${san ?? "DNS:example.com,DNS:*.example.com"}`, "",
+  ].join("\n"));
+  await writeFile(indexPath, "");
+  await writeFile(serialPath, "01\n");
+
+  await exec("openssl", ["genrsa", "-out", keyPath, "2048"]);
+  await exec("openssl", ["req", "-new", "-key", keyPath, "-out", csrPath, "-subj", "/CN=example.com", "-config", configPath, "-reqexts", "v3_req"]);
+  await exec("openssl", [
+    "ca", "-batch", "-selfsign", "-config", configPath,
+    "-keyfile", keyPath, "-in", csrPath, "-out", certPath,
+    "-startdate", notBefore ?? opensslTimestamp(new Date(Date.now() - 60_000)),
+    "-enddate", notAfter ?? opensslTimestamp(new Date(Date.now() + 24 * 60 * 60 * 1000)),
+  ]);
   return { keyPath, certPath };
 }
 

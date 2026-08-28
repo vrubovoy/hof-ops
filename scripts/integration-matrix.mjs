@@ -140,9 +140,28 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
         // start does. HOF_SECRETS_DIR overrides render-topology.mjs's
         // own `${HOF_SECRETS_DIR:-/etc/hof/secrets}` default, so this
         // never needs real root or `/etc` write access.
+        // render-topology.mjs's own wireSecret() uses Compose's native
+        // file-based `secrets:` provider, which docker compose (outside
+        // Swarm mode) implements as a plain bind-mount of the host file
+        // into /run/secrets/<name> - the container sees the HOST file's
+        // own uid/gid/mode exactly as-is, never normalized to a fixed
+        // in-container value the way Swarm's own tmpfs-distributed
+        // secrets are. mode 0600 (this process's own uid only) is
+        // invisible to any container process that isn't root - which
+        // most of these images' main processes are, but not all: a real
+        // CI failure found wachter-agent specifically (deliberately
+        // hardened to run as a non-root user, since it holds the Docker
+        // socket) getting a genuine EACCES reading its own token file.
+        // 0644 (world-readable) is safe here specifically because these
+        // are synthetic, throwaway fixture values on an ephemeral CI
+        // runner, never real secrets - it is NOT the mode a real target
+        // uses (ansible/roles/secret/tasks/main.yml's own real delivery
+        // stays root:root 0400, a real, separate, still-open question
+        // for whichever future service needs its own consuming
+        // container to run as non-root against a real secret).
         const secretsDirectory = path.join(temporaryDirectory, "secrets", fixtureId);
         await mkdir(secretsDirectory, { recursive: true });
-        await Promise.all(Object.entries(secretValues).map(([name, value]) => writeFile(path.join(secretsDirectory, name), value, { mode: 0o600 })));
+        await Promise.all(Object.entries(secretValues).map(([name, value]) => writeFile(path.join(secretsDirectory, name), value, { mode: 0o644 })));
         environment.HOF_SECRETS_DIR = secretsDirectory;
 
         await dockerCompose(composePath, compose.name, ["pull", "--quiet"], environment);

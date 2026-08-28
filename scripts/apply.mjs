@@ -22,9 +22,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import Ajv2020 from "ajv/dist/2020.js";
-import addFormats from "ajv-formats";
-
 import { sha256 } from "./digest.mjs";
 import { verifyExecutionEnvironmentSignature } from "./execution-environment.mjs";
 import {
@@ -33,7 +30,7 @@ import {
 } from "./operation-journal.mjs";
 import { checkManagedStateReadable, observationFromSnapshot } from "./preflight.mjs";
 import { validateBootstrapActions } from "./bootstrap-actions.mjs";
-import { buildPlanV2 } from "./plan-v2.mjs";
+import { buildPlanV2, planV2Validator } from "./plan-v2.mjs";
 import { BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER } from "./plan-command.mjs";
 import { enabledServiceIds, renderedFilesContents, renderTopology } from "./render-topology.mjs";
 import { readSecretsStore, requiredSecrets } from "./secrets.mjs";
@@ -44,17 +41,6 @@ import * as realMutate from "./target-mutate.mjs";
 import { loadAndValidateDeployment } from "./validate-deployment.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-
-let compiledPlanV2Validator;
-async function planV2Validator() {
-  compiledPlanV2Validator ??= await (async () => {
-    const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false });
-    addFormats(ajv);
-    const schema = JSON.parse(await readFile(path.join(root, "schemas/plan-v2.schema.json"), "utf8"));
-    return ajv.compile(schema);
-  })();
-  return compiledPlanV2Validator;
-}
 
 function blocked(reason, message) {
   return { blocked: true, reason, diagnostics: [message] };
@@ -240,6 +226,87 @@ function buildInventory({ host, port, user, connectTimeoutSeconds }) {
   return `target ansible_host=${host} ansible_port=${port} ansible_user=${user} ansible_ssh_private_key_file=/hof/identity ansible_ssh_common_args="${sshCommonArgs}"\n`;
 }
 
+// A shallow, top-level-key diff between two plan-v2 documents whose
+// planIds differ - purely a diagnostic aid (which section actually
+// changed: baseline? desired? operations? the recovery recipient?),
+// never itself part of the actual equality decision (planId equality
+// already is that, since planId = sha256(JSON.stringify(plan)) - see
+// plan-v2.mjs). If every top-level key looks identical despite a
+// different planId, that itself is worth surfacing (a canonicalization
+// bug, not a real content change).
+function summarizePlanDiff(approved, recomputed) {
+  const keys = new Set([...Object.keys(approved), ...Object.keys(recomputed)]);
+  const differing = [...keys].filter((key) => JSON.stringify(approved[key]) !== JSON.stringify(recomputed[key]));
+  return differing.length > 0
+    ? `differs in: ${differing.join(", ")}`
+    : "every top-level field looks identical despite a different planId - this points at a canonicalization bug, not a real content change";
+}
+
+// The one real plan-v2 computation a fresh (non-resume) apply run needs
+// twice: once before the lock is ever acquired (so a plan that's
+// already stale doesn't cost a wasted lock round trip), and once again
+// after the lock is held, against a second, genuinely fresh inspection
+// (ADR 0004's own stale-plan recheck, now a full canonical-document
+// recompute rather than a 3-field comparison - see PLATFORM-OPS-PLAN.md's
+// "Item 8 reopened" entry). Factored out once rather than duplicated so
+// the two calls can never quietly drift apart from each other.
+// Returns either a blocked() result or { plan }.
+async function computeLivePlanV2({ snapshot, manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, targetMode, host, port, user, recoveryAgeRecipient, repairDrift }) {
+  const readable = checkManagedStateReadable(snapshot);
+  if (readable.status !== "pass") return blocked("state", readable.message);
+  const observation = observationFromSnapshot(snapshot);
+  const incompleteDocker = ["containersStatus", "volumesStatus", "networksStatus"].filter((key) => observation[key] === "unavailable");
+  if (incompleteDocker.length > 0) return blocked("docker", `Docker's ${incompleteDocker.join("/")} listing could not be read - refusing to apply against an incomplete observation`);
+  if (observation.generatedArtifactsStatus !== "available") return blocked("artifacts", "generated-artifact checksums could not be read - refusing to apply against an incomplete observation");
+
+  let baseline;
+  try {
+    baseline = resolveBaseline({ managedState: snapshot.managedState, catalog, observation });
+  } catch (error) {
+    return blocked("state", error instanceof Error ? error.message : String(error));
+  }
+  if (baseline.mode !== "bootstrap") return blocked("scope", "hofctl apply only supports a bootstrap plan in this delivery item (see ADR 0004) - this target already has an applied installation");
+
+  let suppliedTls;
+  try {
+    suppliedTls = await suppliedTlsCertificateFingerprint(manifest);
+  } catch (error) {
+    return blocked("tls", error instanceof Error ? error.message : String(error));
+  }
+  if (!recoveryAgeRecipient) {
+    return blocked("recovery", "--recovery-age-recipient is required (a bootstrap plan always needs one, see ADR 0004)");
+  }
+
+  const generation = 1;
+  let desiredRendered;
+  try {
+    desiredRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId: BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER, generation });
+  } catch (error) {
+    return blocked("render", error instanceof Error ? error.message : String(error));
+  }
+
+  let plan;
+  try {
+    plan = buildPlanV2({
+      baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift: repairDrift ?? false,
+      target: { mode: targetMode, host, port, user, hostKeySha256: snapshot.transport.trustDigest },
+      recoveryAgeRecipient,
+      suppliedTlsCertificateFingerprint: suppliedTls,
+    });
+  } catch (error) {
+    return blocked("plan", error instanceof Error ? error.message : String(error));
+  }
+
+  const validatePlanV2 = await planV2Validator();
+  if (!validatePlanV2(plan)) return blocked("internal", `buildPlanV2 produced a result that does not satisfy schemas/plan-v2.schema.json: ${JSON.stringify(validatePlanV2.errors)}`);
+  if (!plan.executable) return blocked("plan", `plan has blockers, refusing to apply: ${plan.blockers.join("; ")}`);
+
+  const whitelistErrors = validateBootstrapActions(plan);
+  if (whitelistErrors.length > 0) return blocked("bootstrap-actions", whitelistErrors.join("; "));
+
+  return { plan };
+}
+
 // options: everything runPlan() itself takes (manifestPath, catalogPath?,
 //   releaseLockPath, releaseLockIdentity, releaseLockOidcIssuer?,
 //   targetMode, host, port, user, knownHostsFile?, hostKeySha256?,
@@ -252,9 +319,19 @@ function buildInventory({ host, port, user, connectTimeoutSeconds }) {
 //   secretsAgeIdentityFile - optional age identity file for decrypting
 //     secretsStorePath (SOPS_AGE_KEY_FILE); omitted, sops falls back to
 //     its own default identity resolution.
+//   planPath - path to the exact plan-v2 JSON document being approved
+//     (required unless resume: true) - `hofctl plan` against a
+//     bootstrap target now prints exactly this document (see
+//     plan-command.mjs); approvePlanId must equal ITS OWN planId, and
+//     apply's own live recompute (both before and, again, under the
+//     lock) must match it byte-for-byte, or apply refuses to proceed.
 //   approvePlanId - required unless resume: true.
 //   resume - reclaim an existing, interrupted operation instead of
-//     starting a new one; no new approval, see ADR 0004.
+//     starting a new one; no new approval, see ADR 0004. Never re-derives
+//     a live baseline/diff (see the resume branch below for why) -
+//     trusts the journal's own embedded plan document completely, after
+//     confirming the underlying inputs and target identity haven't
+//     silently changed since it was written.
 //   emit(event) - called once per operation-event-v1 (and a few
 //     apply-specific informational lines) as they happen, for bounded
 //     NDJSON streaming to stdout. Defaults to a no-op.
@@ -278,14 +355,23 @@ export async function runApply(options) {
   if (!options.identityFile) {
     return blocked("identity", "hofctl apply requires --identity-file - the Execution Environment container needs a real key file to mount, an SSH agent is not supported");
   }
-  if (!options.resume && !options.approvePlanId) {
-    return blocked("approval", "hofctl apply requires --approve-plan-id unless --resume is given");
+  if (!options.resume && (!options.approvePlanId || !options.planPath)) {
+    return blocked("approval", "hofctl apply requires both --approve-plan-id and --plan (the exact plan-v2 document being approved) unless --resume is given - approving a plan approves those exact bytes, see ADR 0004");
   }
 
   const { errors, manifest, catalog, catalogBytes, releaseLock, releaseLockBytes, servicesBytes, servicesSchema, catalogSchema, releaseLockSchema } =
     await loadAndValidateDeploymentWithBytes(options);
   if (errors.length > 0) return { blocked: true, reason: "deployment", diagnostics: errors };
   if (!releaseLock.ansibleEnvironment) return blocked("execution-environment", "release lock has no ansibleEnvironment - cannot apply");
+
+  // Fails fast, before ever touching the network: the Execution
+  // Environment's own signature doesn't depend on the target at all.
+  const verifyEeSignature = options.verifyEeSignature ?? verifyExecutionEnvironmentSignature;
+  try {
+    await verifyEeSignature(releaseLock.ansibleEnvironment);
+  } catch (error) {
+    return blocked("execution-environment", error instanceof Error ? error.message : String(error));
+  }
 
   // Fails fast, before ever touching the network, when this deployment
   // needs secrets but wasn't given a store to read them from - the same
@@ -316,6 +402,28 @@ export async function runApply(options) {
     for (const { name } of required) secretValues[name] = decrypted[name];
   }
 
+  // Fails fast, before ever touching the network: --plan is loaded and
+  // matched against --approve-plan-id up front, on a fresh (non-resume)
+  // run only - a resume never takes a new approval (see ADR 0004) and
+  // reads its own plan straight from the journal further down instead.
+  let approvedPlan;
+  if (!options.resume) {
+    let approvedPlanRaw;
+    try {
+      approvedPlanRaw = JSON.parse(await readFile(options.planPath, "utf8"));
+    } catch (error) {
+      return blocked("plan-file", `could not read/parse --plan ${options.planPath}: ${error instanceof Error ? error.message : error}`);
+    }
+    const validatePlanV2 = await planV2Validator();
+    if (!validatePlanV2(approvedPlanRaw)) {
+      return blocked("plan-file", `--plan ${options.planPath} does not satisfy schemas/plan-v2.schema.json: ${JSON.stringify(validatePlanV2.errors)}`);
+    }
+    approvedPlan = approvedPlanRaw;
+    if (options.approvePlanId !== approvedPlan.planId) {
+      return blocked("approval", `--approve-plan-id ${options.approvePlanId} does not match the plan file's own planId ${approvedPlan.planId} (${options.planPath}) - approving a plan approves those exact bytes, see ADR 0004`);
+    }
+  }
+
   const host = manifest.target?.host;
   const port = manifest.target?.port ?? 22;
   const user = manifest.target?.user;
@@ -336,160 +444,107 @@ export async function runApply(options) {
     return blocked("sudo", "passwordless sudo is required for apply (see hofctl preflight) - it was not confirmed on this target");
   }
 
-  const readable = checkManagedStateReadable(snapshot);
-  if (readable.status !== "pass") return blocked("state", readable.message);
-  const observation = observationFromSnapshot(snapshot);
-  const incompleteDocker = ["containersStatus", "volumesStatus", "networksStatus"].filter((key) => observation[key] === "unavailable");
-  if (incompleteDocker.length > 0) return blocked("docker", `Docker's ${incompleteDocker.join("/")} listing could not be read - refusing to apply against an incomplete observation`);
-  if (observation.generatedArtifactsStatus !== "available") return blocked("artifacts", "generated-artifact checksums could not be read - refusing to apply against an incomplete observation");
-
-  let baseline;
-  try {
-    baseline = resolveBaseline({ managedState: snapshot.managedState, catalog, observation });
-  } catch (error) {
-    return blocked("state", error instanceof Error ? error.message : String(error));
-  }
-  if (baseline.mode !== "bootstrap") return blocked("scope", "hofctl apply only supports a bootstrap plan in this delivery item (see ADR 0004) - this target already has an applied installation");
-
-  let suppliedTls;
-  try {
-    // Reads manifest.tls.certificatePath itself (already declared in
-    // services.yml, on the operator's own workstation per ADR 0001) -
-    // no separate CLI flag needed; returns undefined for every mode but
-    // "supplied".
-    suppliedTls = await suppliedTlsCertificateFingerprint(manifest);
-  } catch (error) {
-    return blocked("tls", error instanceof Error ? error.message : String(error));
-  }
-  // Required on resume too, not just a fresh apply: buildPlanV2 below
-  // needs the exact same recipient again to reproduce the identical
-  // planId - a resume that omitted it (or supplied a different one)
-  // would recompute a different plan and correctly be refused by the
-  // approvedPlanId comparison further down, but this fails faster, with
-  // a clearer message.
-  if (!options.recoveryAgeRecipient) {
-    return blocked("recovery", "--recovery-age-recipient is required (a bootstrap plan always needs one, see ADR 0004)");
-  }
-
-  // The fixed placeholder here (never a real id) is deliberate and load-
-  // bearing: this exact render is only ever used to compute planId, and
-  // `hofctl plan` computes its own planId the same way, against the
-  // same placeholder - an operator's pre-approved plan (from a separate
-  // `hofctl plan` run) must byte-for-byte match what apply recomputes
-  // here, which only holds if both sides render with the identical,
-  // deterministic placeholder. The REAL installation id (a fresh,
-  // genuinely unique value, never this placeholder) is decided further
-  // down, once this operation actually holds the lock - see
-  // realInstallationId below, and its own comment on why reusing it for
-  // real dispatch/delivery (never this placeholder) matters.
-  const generation = 1;
-  let desiredRendered;
-  try {
-    desiredRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId: BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER, generation });
-  } catch (error) {
-    return blocked("render", error instanceof Error ? error.message : String(error));
-  }
-
-  let plan;
-  try {
-    plan = buildPlanV2({
-      baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift: options.repairDrift ?? false,
-      target: { mode: targetMode, host, port, user, hostKeySha256: snapshot.transport.trustDigest },
-      recoveryAgeRecipient: options.recoveryAgeRecipient,
-      suppliedTlsCertificateFingerprint: suppliedTls,
-    });
-  } catch (error) {
-    return blocked("plan", error instanceof Error ? error.message : String(error));
-  }
-  const validatePlan = await planV2Validator();
-  if (!validatePlan(plan)) return blocked("internal", `buildPlanV2 produced a result that does not satisfy schemas/plan-v2.schema.json: ${JSON.stringify(validatePlan.errors)}`);
-  if (!plan.executable) return blocked("plan", `plan has blockers, refusing to apply: ${plan.blockers.join("; ")}`);
-
-  const whitelistErrors = validateBootstrapActions(plan);
-  if (whitelistErrors.length > 0) return blocked("bootstrap-actions", whitelistErrors.join("; "));
-
-  if (!options.resume && options.approvePlanId !== plan.planId) {
-    return blocked("approval", `--approve-plan-id ${options.approvePlanId} does not match the freshly computed plan's own planId ${plan.planId} - approving a plan approves those exact bytes, see ADR 0004`);
-  }
-
-  const verifyEeSignature = options.verifyEeSignature ?? verifyExecutionEnvironmentSignature;
-  try {
-    await verifyEeSignature(releaseLock.ansibleEnvironment);
-  } catch (error) {
-    return blocked("execution-environment", error instanceof Error ? error.message : String(error));
-  }
-
   const mutateRun = options.run;
-  const mutateConn = { mode: "ssh", host, port, user, hostKeySha256: plan.target.hostKeySha256, identityFile: options.identityFile, connectTimeoutSeconds, run: mutateRun };
+  const mutateConn = { mode: "ssh", host, port, user, hostKeySha256: snapshot.transport.trustDigest, identityFile: options.identityFile, connectTimeoutSeconds, run: mutateRun };
+
+  const generation = 1; // apply only ever supports a bootstrap plan (ADR 0004) - a bootstrap always commits generation 1.
 
   let operationId;
+  let plan;
+  let journal;
+  let inputDigests;
+
   if (options.resume) {
+    // Deliberately never re-derives a live baseline/diff here (unlike
+    // the fresh path below) - once any real mutation has already
+    // happened (a created volume/network/container, before
+    // state.commit), a fresh resolveBaseline() would see an
+    // already-applied host and wrongly refuse to resume at all, which
+    // is exactly the case resume exists for (see PLATFORM-OPS-PLAN.md's
+    // "Item 8 reopened" entry, finding #2). Trusts the journal's own
+    // embedded plan document completely instead, after confirming the
+    // inputs it was journaled against haven't silently changed.
     const { status, lock } = await m.readLock(mutateConn);
     if (status !== "present") return blocked("resume", "no lock found on this target - there is nothing to resume");
     operationId = lock.operationId;
+
+    const { status: journalStatus, journal: existing } = await m.readJournal(mutateConn, operationId);
+    if (journalStatus !== "present") return blocked("resume", `lock references operation ${operationId} but its journal could not be read (status: ${journalStatus})`);
+    assertJournalResumable(existing);
+
+    const currentDigests = {
+      manifestDigest: sha256(servicesBytes),
+      releaseLockDigest: sha256(releaseLockBytes),
+      catalogDigest: sha256(catalogBytes),
+      composeTemplateDigest: sha256(await readFile(path.join(root, "scripts/render-topology.mjs"))),
+      executionEnvironmentDigest: releaseLock.ansibleEnvironment.image.slice(releaseLock.ansibleEnvironment.image.indexOf("@") + 1),
+    };
+    const changedDigest = Object.keys(currentDigests).find((key) => currentDigests[key] !== existing.inputDigests[key]);
+    if (changedDigest) {
+      return blocked("resume", `${changedDigest} has changed since operation ${operationId} was journaled (was ${existing.inputDigests[changedDigest]}, now ${currentDigests[changedDigest]}) - refusing to resume against changed inputs, see ADR 0004`);
+    }
+    if (snapshot.transport.trustDigest !== existing.target.hostKeySha256) {
+      return blocked("stale-plan", `host key changed since operation ${operationId} was journaled (was ${existing.target.hostKeySha256}, now ${snapshot.transport.trustDigest}) - refusing to resume`);
+    }
+
+    plan = existing.plan;
+    journal = existing;
+    inputDigests = currentDigests; // already proven identical to existing.inputDigests above
   } else {
     operationId = newOperationId();
+
+    // Pre-lock: a plan that's already stale doesn't cost a wasted lock
+    // round trip.
+    const firstResult = await computeLivePlanV2({ snapshot, manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, targetMode, host, port, user, recoveryAgeRecipient: options.recoveryAgeRecipient, repairDrift: options.repairDrift });
+    if (firstResult.blocked) return firstResult;
+    if (firstResult.plan.planId !== approvedPlan.planId) {
+      return blocked("stale-plan", `the plan recomputed from the target's current live state (${firstResult.plan.planId}) does not match the approved plan (${approvedPlan.planId}, ${options.planPath}) - refusing to apply: ${summarizePlanDiff(approvedPlan, firstResult.plan)}`);
+    }
+    plan = firstResult.plan;
+
     const lockDoc = await buildLockDocument({ operationId, approvedPlanId: plan.planId, target: plan.target, acquiredBy: currentOperator() });
     const { acquired, lock: held } = await m.acquireLock(mutateConn, lockDoc);
     if (!acquired) {
       return blocked("lock", `target is already locked by operation ${held.operationId} (started ${held.acquiredAt} by ${held.acquiredBy?.user}@${held.acquiredBy?.workstation}) - use --resume to continue it, or investigate why it's stuck`);
     }
-  }
 
-  // ADR 0004: "Once the lock is held, apply re-verifies the plan's own
-  // target binding... against a fresh, real inspection of the target
-  // before running a single operation." A second, genuinely fresh
-  // inspectTarget() call - never reusing the snapshot the plan above was
-  // computed from.
-  let recheckSnapshot;
-  try {
-    recheckSnapshot = await inspect({
-      targetMode, host, port, user,
-      knownHostsFile: options.knownHostsFile, hostKeySha256: options.hostKeySha256,
-      identityFile: options.identityFile, connectTimeoutSeconds,
-    });
-  } catch (error) {
-    if (!options.resume) await m.releaseLock(mutateConn, operationId).catch(() => {});
-    return blocked("stale-plan", `could not re-inspect the target under the lock: ${error instanceof Error ? error.message : error}`);
-  }
-  const recheckObservation = observationFromSnapshot(recheckSnapshot);
-  let recheckBaseline;
-  try {
-    recheckBaseline = resolveBaseline({ managedState: recheckSnapshot.managedState, catalog, observation: recheckObservation });
-  } catch (error) {
-    if (!options.resume) await m.releaseLock(mutateConn, operationId).catch(() => {});
-    return blocked("stale-plan", `could not re-resolve the baseline under the lock: ${error instanceof Error ? error.message : error}`);
-  }
-  const staleReasons = [];
-  if (recheckSnapshot.transport.trustDigest !== plan.target.hostKeySha256) staleReasons.push(`host key changed (was ${plan.target.hostKeySha256}, now ${recheckSnapshot.transport.trustDigest})`);
-  if (recheckBaseline.installationId !== plan.target.installationId) staleReasons.push(`installation id changed (was ${plan.target.installationId}, now ${recheckBaseline.installationId})`);
-  if (recheckBaseline.generation !== plan.target.baselineGeneration) staleReasons.push(`baseline generation changed (was ${plan.target.baselineGeneration}, now ${recheckBaseline.generation})`);
-  if (staleReasons.length > 0) {
-    if (!options.resume) await m.releaseLock(mutateConn, operationId).catch(() => {});
-    return blocked("stale-plan", `the target changed underneath this plan since it was computed - refusing to apply: ${staleReasons.join("; ")}`);
-  }
-
-  const inputDigests = {
-    manifestDigest: sha256(servicesBytes),
-    releaseLockDigest: sha256(releaseLockBytes),
-    catalogDigest: sha256(catalogBytes),
-    composeTemplateDigest: sha256(await readFile(path.join(root, "scripts/render-topology.mjs"))),
-    // Same slice build-release-lock.mjs's own verifySupplyChain already
-    // uses to pull a digest back out of a repo@sha256:... reference.
-    executionEnvironmentDigest: releaseLock.ansibleEnvironment.image.slice(releaseLock.ansibleEnvironment.image.indexOf("@") + 1),
-  };
-
-  let journal;
-  if (options.resume) {
-    const { status, journal: existing } = await m.readJournal(mutateConn, operationId);
-    if (status !== "present") return blocked("resume", `lock references operation ${operationId} but its journal could not be read (status: ${status})`);
-    assertJournalResumable(existing);
-    if (existing.approvedPlanId !== plan.planId) {
-      return blocked("resume", `the plan recomputed from the current inputs (${plan.planId}) no longer matches the approved plan this operation was locked against (${existing.approvedPlanId}) - refusing to resume against changed inputs`);
+    // ADR 0004: "Once the lock is held, apply re-verifies the plan's own
+    // target binding... against a fresh, real inspection of the target
+    // before running a single operation." A second, genuinely fresh
+    // inspectTarget() call plus a full canonical-document recompute -
+    // never just the 3 scalar fields this used to compare (see
+    // PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry).
+    let recheckSnapshot;
+    try {
+      recheckSnapshot = await inspect({
+        targetMode, host, port, user,
+        knownHostsFile: options.knownHostsFile, hostKeySha256: options.hostKeySha256,
+        identityFile: options.identityFile, connectTimeoutSeconds,
+      });
+    } catch (error) {
+      await m.releaseLock(mutateConn, operationId).catch(() => {});
+      return blocked("stale-plan", `could not re-inspect the target under the lock: ${error instanceof Error ? error.message : error}`);
     }
-    journal = existing;
-  } else {
-    journal = await buildJournalDocument({ operationId, approvedPlanId: plan.planId, target: plan.target, inputDigests });
+    const recheckResult = await computeLivePlanV2({ snapshot: recheckSnapshot, manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, targetMode, host, port, user, recoveryAgeRecipient: options.recoveryAgeRecipient, repairDrift: options.repairDrift });
+    if (recheckResult.blocked) {
+      await m.releaseLock(mutateConn, operationId).catch(() => {});
+      return recheckResult;
+    }
+    if (recheckResult.plan.planId !== plan.planId) {
+      await m.releaseLock(mutateConn, operationId).catch(() => {});
+      return blocked("stale-plan", `the target changed underneath this plan since it was locked - refusing to apply: ${summarizePlanDiff(plan, recheckResult.plan)}`);
+    }
+
+    inputDigests = {
+      manifestDigest: sha256(servicesBytes),
+      releaseLockDigest: sha256(releaseLockBytes),
+      catalogDigest: sha256(catalogBytes),
+      composeTemplateDigest: sha256(await readFile(path.join(root, "scripts/render-topology.mjs"))),
+      // Same slice build-release-lock.mjs's own verifySupplyChain already
+      // uses to pull a digest back out of a repo@sha256:... reference.
+      executionEnvironmentDigest: releaseLock.ansibleEnvironment.image.slice(releaseLock.ansibleEnvironment.image.indexOf("@") + 1),
+    };
+    journal = await buildJournalDocument({ operationId, approvedPlanId: plan.planId, target: plan.target, plan, inputDigests });
     await m.writeJournal(mutateConn, journal);
   }
 

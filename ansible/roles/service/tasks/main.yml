@@ -1,10 +1,4 @@
 ---
-# Skeleton only (item 8, PR #26) - real service implementation lands in
-# a later item-8 PR (see defaults/main.yml). Every role in this
-# Execution Environment enforces its own operation's variable contract
-# even before it does real work, so a caller (hofctl apply's own
-# dispatcher, PR #27) that got the typed operation-to-role mapping
-# wrong fails loudly here, not deep inside a half-applied task.
 - name: Assert this operation's own required variables are present
   ansible.builtin.assert:
     that:
@@ -13,8 +7,24 @@
       - hof_service_image is not none
     fail_msg: "service role requires hof_operation_id, hof_service_unit, hof_service_image - never invoked without them"
 
-- name: service is not yet implemented
-  ansible.builtin.debug:
-    msg: >-
-      service skeleton reached for operation {{ hof_operation_id }} -
-      real implementation lands in a later item-8 PR.
+# --no-deps: scoped strictly to this one unit, exactly like this role's
+# own defaults/main.yml comment promises - every OTHER unit that needs
+# starting gets its own separate service.start operation from plan.mjs,
+# never implicitly pulled in as a Compose dependency here.
+# --pull never: image.pull already pulled the exact digest-pinned image
+# an earlier operation in this same plan - Compose must use exactly
+# that, never silently fetch something else at this stage.
+- name: Start this one Compose unit
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - --file
+      - /etc/hof/generated/compose.yml
+      - up
+      - --detach
+      - --no-deps
+      - --pull
+      - "never"
+      - "{{ hof_service_unit }}"
+  changed_when: true

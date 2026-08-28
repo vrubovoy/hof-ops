@@ -1,20 +1,54 @@
 ---
-# Skeleton only (item 8, PR #26) - real readiness implementation lands in
-# a later item-8 PR (see defaults/main.yml). Every role in this
-# Execution Environment enforces its own operation's variable contract
-# even before it does real work, so a caller (hofctl apply's own
-# dispatcher, PR #27) that got the typed operation-to-role mapping
-# wrong fails loudly here, not deep inside a half-applied task.
 - name: Assert this operation's own required variables are present
   ansible.builtin.assert:
     that:
       - hof_operation_id is not none
       - hof_readiness_unit is not none
-      - hof_readiness_condition is not none
-    fail_msg: "readiness role requires hof_operation_id, hof_readiness_unit, hof_readiness_condition - never invoked without them"
+      - hof_readiness_condition in ["running", "healthy"]
+    fail_msg: "readiness role requires hof_operation_id, hof_readiness_unit, hof_readiness_condition (running|healthy) - never invoked without them"
 
-- name: readiness is not yet implemented
-  ansible.builtin.debug:
-    msg: >-
-      readiness skeleton reached for operation {{ hof_operation_id }} -
-      real implementation lands in a later item-8 PR.
+# Discovers the container by its own real Compose ownership labels
+# (the same ones target-probe.sh's own real inspection already keys
+# on), never by guessing Compose's own container-naming convention -
+# service.start's own operation, immediately before this one, is what
+# actually created it.
+- name: Discover this unit's own container id
+  ansible.builtin.command:
+    argv:
+      - docker
+      - ps
+      - --all
+      - -q
+      - --filter
+      - "label=com.docker.compose.project=hof"
+      - --filter
+      - "label=com.docker.compose.service={{ hof_readiness_unit }}"
+  register: hof_readiness_container_id
+  changed_when: false
+  until: hof_readiness_container_id.stdout | trim | length > 0
+  retries: 30
+  delay: 2
+
+- name: Assert the container was actually found before waiting on its condition
+  ansible.builtin.assert:
+    that:
+      - hof_readiness_container_id.stdout | trim | length > 0
+    fail_msg: "no container found for compose service {{ hof_readiness_unit }} in project hof - service.start should have created it"
+
+# docker inspect's own JSON output, parsed in Jinja (from_json) - never
+# Go template syntax (`--format '{{.State.Status}}'`), which would
+# collide with Ansible's own Jinja templating of this same string.
+- name: "Wait for the container to report: {{ hof_readiness_condition }}"
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - "{{ hof_readiness_container_id.stdout | trim }}"
+  register: hof_readiness_state
+  changed_when: false
+  until: >-
+    (hof_readiness_condition == "running" and (hof_readiness_state.stdout | from_json)[0].State.Status == "running")
+    or
+    (hof_readiness_condition == "healthy" and (((hof_readiness_state.stdout | from_json)[0].State.Health.Status) | default('')) == "healthy")
+  retries: 60
+  delay: 2

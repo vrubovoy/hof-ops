@@ -1,21 +1,32 @@
 ---
-# Skeleton only (item 8, PR #26) - real database implementation lands in
-# a later item-8 PR (see defaults/main.yml). Every role in this
-# Execution Environment enforces its own operation's variable contract
-# even before it does real work, so a caller (hofctl apply's own
-# dispatcher, PR #27) that got the typed operation-to-role mapping
-# wrong fails loudly here, not deep inside a half-applied task.
 - name: Assert this operation's own required variables are present
   ansible.builtin.assert:
     that:
       - hof_operation_id is not none
+      - hof_migrate_service is not none
       - hof_migrate_argv is not none
       - hof_migrate_volume is not none
       - hof_migrate_schema is not none
-    fail_msg: "database role requires hof_operation_id, hof_migrate_argv, hof_migrate_volume, hof_migrate_schema - never invoked without them"
+    fail_msg: >-
+      database role requires hof_operation_id, hof_migrate_service, hof_migrate_argv,
+      hof_migrate_volume, hof_migrate_schema - never invoked without them
+  # hof_migrate_image is deliberately NOT required here - plan-v2.schema.json's
+  # own operation.image is optional (present only when the unit's own
+  # image was resolvable at plan time), and this role never consumes it
+  # directly anyway (see defaults/main.yml's own comment) - audit value
+  # only, when present.
 
-- name: database is not yet implemented
-  ansible.builtin.debug:
-    msg: >-
-      database skeleton reached for operation {{ hof_operation_id }} -
-      real implementation lands in a later item-8 PR.
+# `docker compose run` (never a bare `docker run`) - reuses this
+# service's own already-rendered image/volume/environment/network
+# definition from compose.yml exactly as service.start would, just with
+# a different command appended, so this role never has to reconstruct
+# any of that configuration itself. --no-deps: a migration only ever
+# touches its own mounted volume, never another service.
+- name: "Run {{ hof_migrate_service }}'s own migration command (schema {{ hof_migrate_schema.from }} -> {{ hof_migrate_schema.to }})"
+  ansible.builtin.command:
+    argv: >-
+      {{
+        ['docker', 'compose', '--file', '/etc/hof/generated/compose.yml', 'run', '--rm', '--no-deps', hof_migrate_service]
+        + hof_migrate_argv
+      }}
+  changed_when: true

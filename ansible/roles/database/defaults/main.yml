@@ -1,7 +1,21 @@
 ---
-# database.migrate - hof_migrate_argv is the plan's own carried argv (the catalog's database.command, see plan-v1.schema.json's operation.argv) - never re-read from the catalog on the target.
-# Real implementation (PR #28/#29): runs argv inside a one-shot container against hof_migrate_volume, exactly like integration-matrix.mjs's own real `docker compose run --rm --no-deps` verification already does.
+# database.migrate - hof_migrate_argv is the plan's own carried argv
+# (the catalog's own database.command, see plan-v1.schema.json's
+# operation.argv) - never re-read from the catalog on the target.
+# hof_migrate_service is the operation's own `resource` (the catalog's
+# database.component, e.g. "schlussel") - the exact Compose service
+# name to run the migration against, via `docker compose run`, so it
+# reuses that service's own already-rendered image/volume/environment
+# definition from compose.yml rather than this role needing to
+# reconstruct any of that itself. hof_migrate_image/hof_migrate_schema
+# are carried for audit/journal purposes (the schema version this
+# migration moves between, and the exact pinned image this plan
+# approved) - not directly consumed by the migration command itself,
+# which is the catalog's own fixed argv, not something this role
+# constructs from the schema version.
 hof_operation_id: null
+hof_migrate_service: null
+hof_migrate_image: null
 hof_migrate_argv: null
 hof_migrate_volume: null
 hof_migrate_schema: null

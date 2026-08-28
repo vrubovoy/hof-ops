@@ -307,10 +307,18 @@ test("a real, full bootstrap apply against the real, published, signed v0.1.2 re
   assert.equal(failed.length, 0, `every operation must succeed in a real, full bootstrap: ${JSON.stringify(failed)}`);
 
   // Every real phase actually ran, for real - not just the ones an
-  // earlier, illustrative-lock version of this test could reach.
-  for (const suffix of [".host.prepare", ".secret.ensure", ".config.write", ".database.migrate", ".state.commit"]) {
+  // earlier, illustrative-lock version of this test could reach. Each
+  // step id is `NNN.<action>` with no resource suffix when there is
+  // only ever one instance in a bootstrap plan (host.prepare,
+  // secret.ensure, config.write, state.commit) - `.endsWith` is exact
+  // there - but `NNN.<action>.<resource...>` when plan.mjs emits one
+  // per resource (database.migrate, volume.ensure, image.verify,
+  // service.start, readiness.wait all included below via `.includes`,
+  // never `.endsWith`, since a real resource name always follows).
+  for (const suffix of [".host.prepare", ".secret.ensure", ".config.write", ".state.commit"]) {
     assert.ok(succeeded.some((step) => step.endsWith(suffix)), `${suffix} must have succeeded for real`);
   }
+  assert.ok(succeeded.some((step) => step.includes(".database.migrate.")), "schlussel's own database.migrate must have succeeded for real");
   assert.ok(succeeded.some((step) => step.includes(".volume.ensure.")), "at least one volume.ensure succeeded for real");
   assert.ok(succeeded.some((step) => step.includes(".image.verify.") && step.includes("schlussel")), "schlussel's own image.verify (real cosign, real workflow identity) succeeded for real");
   assert.ok(succeeded.some((step) => step.includes(".service.start.")), "at least one service.start succeeded for real");

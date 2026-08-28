@@ -1,5 +1,16 @@
 ---
-# config.write - copies hofctl render's own output (compose.yml, Caddyfile, service.env, ...) to the target's fixed generated-artifact paths.
-# Real implementation (PR #28/#29): writes each file, verifies its digest lands where target-probe.sh's own generated-artifacts check expects it, and (only when the Caddyfile specifically changed) folds in the gateway restart plan.mjs's own foldGatewayRestartForCaddyfile already scheduled as a separate service.stop/service.start pair.
+# config.write - copies hofctl render's own output (compose.yml,
+# Caddyfile, service.env, runtime-config.json, backup-inventory.json,
+# topology.json) to the target's fixed /etc/hof/generated/ paths -
+# target-probe.sh's own generated-artifacts check reads from there.
+# (The gateway restart a changed Caddyfile needs is its own separate
+# service.stop/service.start pair plan.mjs already folds into the plan
+# - see foldGatewayRestartForCaddyfile - not this role's job.)
+#
+# hof_generated_files_dir is a path INSIDE THIS CONTAINER (never on the
+# target) to the directory apply.mjs wrote the six rendered files into,
+# from the exact same renderTopology() output the plan itself was
+# computed from - mounted read-only, once, for this operation's own
+# docker run.
 hof_operation_id: null
-hof_generated_files: null
+hof_generated_files_dir: null

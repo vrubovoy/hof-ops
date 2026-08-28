@@ -1,19 +1,36 @@
 ---
-# Skeleton only (item 8, PR #26) - real config implementation lands in
-# a later item-8 PR (see defaults/main.yml). Every role in this
-# Execution Environment enforces its own operation's variable contract
-# even before it does real work, so a caller (hofctl apply's own
-# dispatcher, PR #27) that got the typed operation-to-role mapping
-# wrong fails loudly here, not deep inside a half-applied task.
 - name: Assert this operation's own required variables are present
   ansible.builtin.assert:
     that:
       - hof_operation_id is not none
-      - hof_generated_files is not none
-    fail_msg: "config role requires hof_operation_id, hof_generated_files - never invoked without them"
+      - hof_generated_files_dir is not none
+    fail_msg: "config role requires hof_operation_id, hof_generated_files_dir - never invoked without them"
 
-- name: config is not yet implemented
-  ansible.builtin.debug:
-    msg: >-
-      config skeleton reached for operation {{ hof_operation_id }} -
-      real implementation lands in a later item-8 PR.
+- name: Ensure the target's own generated-artifact directory exists
+  ansible.builtin.file:
+    path: /etc/hof/generated
+    state: directory
+    mode: "0755"
+
+# Discovers exactly the files apply.mjs actually mounted (always the
+# same fixed six - see render-topology.mjs's own renderedFilesContents())
+# rather than a hardcoded list here, so this role never has its own,
+# independently-maintained copy of that filename set to drift out of
+# sync with the real one.
+- name: Discover which generated files were provided
+  delegate_to: localhost
+  ansible.builtin.find:
+    paths: "{{ hof_generated_files_dir }}"
+    file_type: file
+  register: hof_generated_files_found
+
+- name: Deliver each generated file to its own fixed target-side path
+  ansible.builtin.copy:
+    src: "{{ item.path }}"
+    dest: "/etc/hof/generated/{{ item.path | basename }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ hof_generated_files_found.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"

@@ -39,6 +39,14 @@ jobs:
           python-version: "3.13"
       - run: pip install ansible-core==2.17.*
       - name: Syntax-check every role against its own real variable contract
+        # --syntax-check only - the six roles PR #28 gave a real
+        # implementation to do genuine, potentially destructive things
+        # (apt-get installing Docker, writing real files, pulling real
+        # images) that this minimal, no-become, no-real-target job has
+        # no business attempting; test:apply-ssh (the "contracts" job,
+        # same workflow) is what actually executes every role for real,
+        # against a genuine ephemeral target, with become. This job's
+        # own job is a fast parse/structure check across all ten roles.
         working-directory: ansible
         run: |
           cat > /tmp/hof-role-syntax-check.yml << 'PLAYBOOK'
@@ -51,12 +59,15 @@ jobs:
                   name: "{{ item }}"
                 vars:
                   hof_operation_id: "001.ci-syntax-check"
-                  hof_secrets_store: "x"
+                  hof_secrets_file: "/dev/null"
                   hof_volume_name: "x"
                   hof_network_name: "x"
+                  hof_installation_id: "00000000-0000-0000-0000-000000000000"
+                  hof_generation: 1
+                  hof_image_action: "verify"
                   hof_image_reference: "x"
                   hof_image_trust: { policy: "digest-only" }
-                  hof_generated_files: []
+                  hof_generated_files_dir: "/dev/null"
                   hof_migrate_argv: ["true"]
                   hof_migrate_volume: "x"
                   hof_migrate_schema: { from: 1, to: 2, rollbackCompatible: true }
@@ -67,6 +78,6 @@ jobs:
                   hof_state_generation: 1
                 loop: [host, secret, volume, network, image, config, database, service, readiness, state]
           PLAYBOOK
-          ANSIBLE_CONFIG=ansible.cfg ANSIBLE_ROLES_PATH=roles ansible-playbook /tmp/hof-role-syntax-check.yml
+          ANSIBLE_CONFIG=ansible.cfg ANSIBLE_ROLES_PATH=roles ansible-playbook --syntax-check /tmp/hof-role-syntax-check.yml
       - name: Execution Environment image builds
         run: docker build --file ansible/Dockerfile ansible

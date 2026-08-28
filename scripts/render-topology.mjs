@@ -454,6 +454,21 @@ function renderEnv(topology, manifest) {
   return `${lines.join("\n")}\n`;
 }
 
+// The exact fixed six-filename map every consumer of a renderTopology()
+// output needs to agree on byte-for-byte - target-probe.sh's own
+// checksummed set (see target-inspector.mjs's GENERATED_ARTIFACT_FILENAMES),
+// `hofctl render`'s own output files below, and config.write's own real
+// delivery (apply.mjs, see ansible/roles/config) all derive from this
+// one function so none of the three can ever drift out of sync with
+// each other.
+export function renderedFilesContents(rendered) {
+  return {
+    "compose.yml": YAML.stringify(rendered.compose, { sortMapEntries: true }), "Caddyfile": rendered.caddyfile,
+    "runtime-config.json": `${JSON.stringify(rendered.runtimeConfig, null, 2)}\n`, "service.env": rendered.environment,
+    "topology.json": `${JSON.stringify(rendered.topology, null, 2)}\n`, "backup-inventory.json": `${JSON.stringify(rendered.backup, null, 2)}\n`,
+  };
+}
+
 export async function renderFiles(options) {
   const [manifestText, catalogText, lockText, servicesSchema, catalogSchema, releaseLockSchema] = await Promise.all([
     readFile(options.services, "utf8"), readFile(options.catalog, "utf8"), readFile(options.releaseLock, "utf8"),
@@ -466,11 +481,7 @@ export async function renderFiles(options) {
     servicesSchema: JSON.parse(servicesSchema), catalogSchema: JSON.parse(catalogSchema), releaseLockSchema: JSON.parse(releaseLockSchema),
   });
   await mkdir(options.out, { recursive: true });
-  const files = {
-    "compose.yml": YAML.stringify(rendered.compose, { sortMapEntries: true }), "Caddyfile": rendered.caddyfile,
-    "runtime-config.json": `${JSON.stringify(rendered.runtimeConfig, null, 2)}\n`, "service.env": rendered.environment,
-    "topology.json": `${JSON.stringify(rendered.topology, null, 2)}\n`, "backup-inventory.json": `${JSON.stringify(rendered.backup, null, 2)}\n`,
-  };
+  const files = renderedFilesContents(rendered);
   await Promise.all(Object.entries(files).map(([name, contents]) => writeFile(path.join(options.out, name), contents)));
   return Object.keys(files);
 }

@@ -1,20 +1,51 @@
 ---
-# Skeleton only (item 8, PR #26) - real image implementation lands in
-# a later item-8 PR (see defaults/main.yml). Every role in this
-# Execution Environment enforces its own operation's variable contract
-# even before it does real work, so a caller (hofctl apply's own
-# dispatcher, PR #27) that got the typed operation-to-role mapping
-# wrong fails loudly here, not deep inside a half-applied task.
 - name: Assert this operation's own required variables are present
   ansible.builtin.assert:
     that:
       - hof_operation_id is not none
+      - hof_image_action in ["verify", "pull"]
       - hof_image_reference is not none
       - hof_image_trust is not none
-    fail_msg: "image role requires hof_operation_id, hof_image_reference, hof_image_trust - never invoked without them"
+    fail_msg: "image role requires hof_operation_id, hof_image_action (verify|pull), hof_image_reference, hof_image_trust - never invoked without them"
 
-- name: image is not yet implemented
+# image.verify (policy: signed) - runs from THIS container (the
+# Ansible control node), never on the target: `cosign verify` only
+# needs network access to the image's own registry and Sigstore's own
+# Fulcio/Rekor infrastructure, nothing target-side. The real keyless
+# invocation shape scripts/execution-environment.mjs's own
+# verifyExecutionEnvironmentSignature() already uses for the Execution
+# Environment's own image, applied here to a platform component image
+# instead.
+- name: Verify this image's own Cosign signature
+  when: hof_image_action == "verify" and hof_image_trust.policy == "signed"
+  delegate_to: localhost
+  ansible.builtin.command:
+    argv:
+      - cosign
+      - verify
+      - --certificate-identity
+      - "{{ hof_image_trust.signatureIdentity }}"
+      - --certificate-oidc-issuer
+      - "{{ hof_image_trust.signatureOidcIssuer }}"
+      - "{{ hof_image_reference }}"
+  changed_when: false
+
+# image.verify (policy: digest-only) - a third-party image with no
+# Hof-controlled signing identity (see release-lock-v1.schema.json's
+# own thirdPartyTrust) - trusted by its own already-pinned registry
+# digest alone, nothing further to check here.
+- name: Trust this image by digest pin alone (third-party component, no signing identity to check)
+  when: hof_image_action == "verify" and hof_image_trust.policy == "digest-only"
   ansible.builtin.debug:
-    msg: >-
-      image skeleton reached for operation {{ hof_operation_id }} -
-      real implementation lands in a later item-8 PR.
+    msg: "{{ hof_image_reference }} is trusted by digest pin alone - no signature check for a third-party image"
+
+# image.pull - runs on the real target, unlike the verify step above -
+# this is the one action in this role that actually needs the image to
+# land where the service role (PR #29) will later start a container
+# from it.
+- name: Pull the digest-pinned image onto the target
+  when: hof_image_action == "pull"
+  community.docker.docker_image:
+    name: "{{ hof_image_reference }}"
+    source: pull
+    force_source: true

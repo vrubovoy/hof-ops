@@ -24,6 +24,20 @@ RUN pip install --no-cache-dir \
   docker==7.* \
   cryptography==43.*
 
+# Cosign - the image role's own image.verify action runs its real
+# signature check from inside this container (never on the target;
+# `cosign verify` only ever needs network access to the image's own
+# registry and Sigstore's Fulcio/Rekor infrastructure, nothing
+# target-side), the same real invocation shape scripts/build-release-
+# lock.mjs's own verifySupplyChain already uses. Pinned exact version,
+# checksum-verified against cosign's own published checksums file (see
+# https://github.com/sigstore/cosign/releases/tag/v3.1.3) - the same
+# digest-pinning discipline every other artifact this platform pulls in
+# already follows.
+ADD --checksum=sha256:4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71 \
+  https://github.com/sigstore/cosign/releases/download/v3.1.3/cosign-linux-amd64 /usr/local/bin/cosign
+RUN chmod +x /usr/local/bin/cosign
+
 # Collections are pinned in requirements.yml (real versions, resolved
 # and locked the same way `pnpm install --frozen-lockfile` locks a
 # Node dependency tree) - never floated to "whatever's latest" at

@@ -1,5 +1,11 @@
 ---
-# network.ensure - a named, Hof-labeled Docker network (also used to repair a baseline-expected network gone missing, see plan.mjs's own computeMissingResources).
-# Real implementation (PR #28/#29): community.docker.docker_network, idempotent, same label set as volume.ensure.
+# network.ensure - a named, Hof-labeled Docker network, idempotent -
+# also used to repair a baseline-expected network gone missing (see
+# plan.mjs's own computeMissingResources). Same label discipline as
+# volume.ensure - see that role's own comment for why the labels must
+# byte-for-byte match what render-topology.mjs already wrote into
+# compose.yml.
 hof_operation_id: null
 hof_network_name: null
+hof_installation_id: null
+hof_generation: null

@@ -17,7 +17,7 @@
 // read-only local mode has.
 
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,7 +35,8 @@ import { checkManagedStateReadable, observationFromSnapshot } from "./preflight.
 import { validateBootstrapActions } from "./bootstrap-actions.mjs";
 import { buildPlanV2 } from "./plan-v2.mjs";
 import { BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER } from "./plan-command.mjs";
-import { renderTopology } from "./render-topology.mjs";
+import { enabledServiceIds, renderedFilesContents, renderTopology } from "./render-topology.mjs";
+import { readSecretsStore, requiredSecrets } from "./secrets.mjs";
 import { resolveBaseline } from "./state.mjs";
 import { suppliedTlsCertificateFingerprint } from "./supplied-tls.mjs";
 import { inspectTarget } from "./target-inspector.mjs";
@@ -80,22 +81,20 @@ const ACTION_TO_ROLE = {
   "state.commit": "state",
 };
 
-// The fixed six generated-artifact filenames target-probe.sh/
-// target-inspector.mjs already track (see GENERATED_ARTIFACT_FILENAMES) -
-// the real set config.write's own real implementation (PR #28/#29)
-// writes, passed through now so the role's own skeleton assert
-// (hof_generated_files is not none) is satisfied with genuine content,
-// not a fabricated placeholder.
-const GENERATED_ARTIFACT_FILENAMES = ["compose.yml", "Caddyfile", "service.env", "runtime-config.json", "backup-inventory.json", "topology.json"];
-
 // Builds this operation's own extra-vars, matching exactly the variable
 // contract each role's own defaults/main.yml declares (see
-// ansible/roles/*/defaults/main.yml) - imageTrustByUnit carries forward
+// ansible/roles/*/defaults/main.yml). imageTrustByUnit carries forward
 // an image.verify operation's own trust policy to the image.pull
 // operation plan.mjs always emits immediately after it for the same
 // unit (image.pull itself carries no imageTrust field of its own - see
 // plan-v2.schema.json's own comment: "Only for image.verify").
-function buildExtraVars(operation, { commitGeneration, imageTrustByUnit }) {
+// installationId/generation are the exact same values renderTopology()
+// was called with - volume.ensure/network.ensure must label a resource
+// identically to how Compose would have labeled it itself. secret.ensure
+// and config.write don't carry their own real content here at all -
+// dispatchOperation() below mounts it in separately (see its own
+// comment on why: never through extra-vars/argv).
+function buildExtraVars(operation, { commitGeneration, imageTrustByUnit, installationId, generation }) {
   const role = ACTION_TO_ROLE[operation.action];
   if (!role) throw new Error(`internal error: operation ${operation.id} has action ${operation.action}, which has no known Execution Environment role - this should have been rejected by the bootstrap action whitelist before dispatch`);
   const vars = { hof_role: role, hof_operation_id: operation.id };
@@ -103,15 +102,20 @@ function buildExtraVars(operation, { commitGeneration, imageTrustByUnit }) {
     case "host.prepare":
       break;
     case "secret.ensure":
-      vars.hof_secrets_store = operation.resource;
+      vars.hof_secrets_file = "/hof/secrets.json";
       break;
     case "volume.ensure":
       vars.hof_volume_name = operation.resource;
+      vars.hof_installation_id = installationId;
+      vars.hof_generation = generation;
       break;
     case "network.ensure":
       vars.hof_network_name = operation.resource;
+      vars.hof_installation_id = installationId;
+      vars.hof_generation = generation;
       break;
     case "image.verify":
+      vars.hof_image_action = "verify";
       vars.hof_image_reference = operation.image;
       vars.hof_image_trust = operation.imageTrust;
       imageTrustByUnit.set(operation.resource, operation.imageTrust);
@@ -119,12 +123,13 @@ function buildExtraVars(operation, { commitGeneration, imageTrustByUnit }) {
     case "image.pull": {
       const trust = imageTrustByUnit.get(operation.resource);
       if (!trust) throw new Error(`internal error: image.pull for ${operation.resource} (operation ${operation.id}) has no preceding image.verify in this plan - plan.mjs's own ordering invariant was violated`);
+      vars.hof_image_action = "pull";
       vars.hof_image_reference = operation.image;
       vars.hof_image_trust = trust;
       break;
     }
     case "config.write":
-      vars.hof_generated_files = GENERATED_ARTIFACT_FILENAMES;
+      vars.hof_generated_files_dir = "/hof/generated";
       break;
     case "database.migrate":
       vars.hof_migrate_argv = operation.argv;
@@ -180,11 +185,24 @@ async function dispatchOperation(operation, context) {
     "--volume", `${context.identityFile}:/hof/identity:ro`,
     "--volume", `${context.knownHostsFile}:/hof/known_hosts:ro`,
     "--volume", `${context.inventoryFile}:/hof/inventory.ini:ro`,
+  ];
+  // secret.ensure/config.write are the only two operations that need
+  // real content mounted in beyond the fixed transport files above -
+  // never through extra-vars/argv (visible to anything that can list
+  // processes or inspect this container while it runs), and never
+  // mounted for every OTHER operation that has no use for it.
+  if (operation.action === "secret.ensure") {
+    args.push("--volume", `${context.secretsFile}:/hof/secrets.json:ro`);
+  }
+  if (operation.action === "config.write") {
+    args.push("--volume", `${context.generatedFilesDir}:/hof/generated:ro`);
+  }
+  args.push(
     context.image,
     "ansible-playbook", "/ansible/playbook.yml",
     "-i", "/hof/inventory.ini",
     "-e", JSON.stringify(extraVars),
-  ];
+  );
   await context.dockerRun("docker", args, { timeout: (context.connectTimeoutSeconds + 60) * 1000 });
 }
 
@@ -205,6 +223,12 @@ function buildInventory({ host, port, user, connectTimeoutSeconds }) {
 //   identityFile, connectTimeoutSeconds?, repairDrift?), plus:
 //   recoveryAgeRecipient - required, even on resume (buildPlanV2 needs
 //     the exact same value again to reproduce the identical planId).
+//   secretsStorePath - the operator's own secrets.sops.yaml (see
+//     scripts/secrets.mjs) - required whenever this deployment's own
+//     requiredSecrets() is non-empty, ignored otherwise.
+//   secretsAgeIdentityFile - optional age identity file for decrypting
+//     secretsStorePath (SOPS_AGE_KEY_FILE); omitted, sops falls back to
+//     its own default identity resolution.
 //   approvePlanId - required unless resume: true.
 //   resume - reclaim an existing, interrupted operation instead of
 //     starting a new one; no new approval, see ADR 0004.
@@ -212,8 +236,8 @@ function buildInventory({ host, port, user, connectTimeoutSeconds }) {
 //     apply-specific informational lines) as they happen, for bounded
 //     NDJSON streaming to stdout. Defaults to a no-op.
 //   inspect, verifyEeSignature, dockerRun, mutate, run,
-//   executionEnvironmentImageOverride - testing seams; the real CLI
-//   never passes them.
+//   executionEnvironmentImageOverride, readSecretsStore - testing seams;
+//   the real CLI never passes them.
 export async function runApply(options) {
   const emit = options.emit ?? (() => {});
   // The target-mutate layer's own transport correctness (script
@@ -239,6 +263,35 @@ export async function runApply(options) {
     await loadAndValidateDeploymentWithBytes(options);
   if (errors.length > 0) return { blocked: true, reason: "deployment", diagnostics: errors };
   if (!releaseLock.ansibleEnvironment) return blocked("execution-environment", "release lock has no ansibleEnvironment - cannot apply");
+
+  // Fails fast, before ever touching the network, when this deployment
+  // needs secrets but wasn't given a store to read them from - the same
+  // real `sops --decrypt` scripts/secrets.mjs's own hofctl secrets
+  // ensure already uses, never a second, independently-maintained
+  // decryption path.
+  const enabledIds = enabledServiceIds(manifest, catalog);
+  const required = requiredSecrets(manifest, enabledIds);
+  let secretValues = {};
+  if (required.length > 0) {
+    if (!options.secretsStorePath) {
+      return blocked("secrets", `this deployment needs ${required.length} secret(s) (${required.map((s) => s.name).join(", ")}) but --secrets-store was not given`);
+    }
+    let decrypted;
+    try {
+      const readStore = options.readSecretsStore ?? readSecretsStore;
+      decrypted = await readStore({ storePath: options.secretsStorePath, identityFile: options.secretsAgeIdentityFile });
+    } catch (error) {
+      return blocked("secrets", `could not decrypt ${options.secretsStorePath}: ${error instanceof Error ? error.message : error}`);
+    }
+    const missing = required.filter((s) => !(s.name in decrypted)).map((s) => s.name);
+    if (missing.length > 0) {
+      return blocked("secrets", `${options.secretsStorePath} is missing required secret(s): ${missing.join(", ")} - run "hofctl secrets ensure" first`);
+    }
+    // Only the subset this deployment actually needs - a store that
+    // also carries secrets for an unrelated, disabled service must
+    // never leak those into the Execution Environment container too.
+    for (const { name } of required) secretValues[name] = decrypted[name];
+  }
 
   const host = manifest.target?.host;
   const port = manifest.target?.port ?? 22;
@@ -423,6 +476,21 @@ export async function runApply(options) {
       const inventoryFile = path.join(workDir, "inventory.ini");
       await writeFile(inventoryFile, buildInventory({ host, port, user, connectTimeoutSeconds }), { mode: 0o600 });
 
+      // Written unconditionally (even when required is empty, or this
+      // plan has no config-affecting change) - plan.mjs's own
+      // buildOperations always emits secret.ensure/config.write
+      // together with host.prepare for any bootstrap with anyChange,
+      // regardless of whether this particular deployment actually
+      // needs any secrets - the secret role's own copy loop over an
+      // empty map is simply a no-op in that case, never an error.
+      const secretsFile = path.join(workDir, "secrets.json");
+      await writeFile(secretsFile, JSON.stringify(secretValues), { mode: 0o600 });
+
+      const generatedFilesDir = path.join(workDir, "generated");
+      const generatedFiles = renderedFilesContents(desiredRendered);
+      await mkdir(generatedFilesDir, { recursive: true });
+      await Promise.all(Object.entries(generatedFiles).map(([name, contents]) => writeFile(path.join(generatedFilesDir, name), contents)));
+
       // executionEnvironmentImageOverride is a narrow testing seam only
       // (see test/apply-acceptance.mjs) - a real `docker run` of the
       // release lock's own schema-required repo@sha256:... reference
@@ -437,7 +505,8 @@ export async function runApply(options) {
       // that's what a real apply run is actually bound to.
       const context = {
         image: options.executionEnvironmentImageOverride ?? releaseLock.ansibleEnvironment.image, identityFile: options.identityFile,
-        knownHostsFile, inventoryFile, connectTimeoutSeconds, dockerRun,
+        knownHostsFile, inventoryFile, connectTimeoutSeconds, dockerRun, secretsFile, generatedFilesDir,
+        installationId, generation,
       };
 
       const eventsByStep = options.resume ? groupByStep(await m.readEvents(mutateConn, operationId)) : new Map();

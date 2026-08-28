@@ -67,11 +67,14 @@ Cosign verification of the pinned Ansible Execution Environment image before
 it ever runs, a fixed bootstrap-only action whitelist dispatched into that
 image (never local Ansible, never a generic command), and safe, bounded
 resume after an interruption. The Execution Environment's own ten roles
-(`ansible/roles/`) are still a skeleton as of item 8's own PR sequence -
-each asserts its real variable contract and reports itself not yet
-implemented; real host/secret/volume/network/image/config/database/service/
-readiness/state logic is the next slice of this same delivery item. Applied-
-mode reconciliation (update/remove), backup/restore, upgrade/rollback,
+(`ansible/roles/`) all have their real implementation now - host preparation
+(python3/Docker bootstrap), secret delivery, volume/network creation, image
+verification (Cosign, delegated to the control node) and pull, generated-file
+delivery, database migration, service startup, readiness polling, and the
+final atomic state commit - see `ansible/README.md` for exactly what's
+verified for real in CI versus locally. Item 8 itself closes with this:
+a bootstrap onto a genuinely clean host, start to finish. Applied-mode
+reconciliation (update/remove), backup/restore, upgrade/rollback,
 first-admin bootstrap, and the installer UI are later delivery items - see
 the Delivery Order in the plan linked above.
 

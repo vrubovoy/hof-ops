@@ -255,7 +255,7 @@ test("image.pull inherits its own hof_image_trust from the preceding image.verif
   assert.deepEqual(actions, new Set(["verify", "pull"]));
 });
 
-test("volume.ensure/network.ensure carry the real installationId/generation, matching what the renderer already labeled Compose's own volumes/networks with", async () => {
+test("volume.ensure/network.ensure carry the real (never the planning-placeholder) installationId, and the real generation", async () => {
   const mutate = makeFakeMutate();
   const seen = [];
   const options = baseApplyOptions({
@@ -263,11 +263,18 @@ test("volume.ensure/network.ensure carry the real installationId/generation, mat
     dockerRun: async (command, args) => { seen.push(JSON.parse(args.at(-1))); return { stdout: "", stderr: "" }; },
   });
   const planId = await discoverPlanId(options);
-  await withFakeCosign("success", () => runApply({ ...options, approvePlanId: planId }));
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: planId }));
+  assert.equal(result.blocked, false, JSON.stringify(result));
   const volumeVars = seen.filter((vars) => vars.hof_role === "volume");
   assert.ok(volumeVars.length > 0, "at least one volume.ensure was dispatched for this multi-service topology");
   for (const vars of volumeVars) {
-    assert.equal(vars.hof_installation_id, "00000000-0000-0000-0000-000000000000");
+    // The real installation id this run actually used - deliberately
+    // never the fixed BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER planning
+    // uses (see apply.mjs's own comment on why those two must differ):
+    // every real resource this run labels must carry a genuinely unique
+    // id, not a value every other bootstrap run would share.
+    assert.equal(vars.hof_installation_id, result.operationId);
+    assert.notEqual(vars.hof_installation_id, "00000000-0000-0000-0000-000000000000");
     assert.equal(vars.hof_generation, 1);
   }
 });

@@ -27,12 +27,24 @@ only ever runs signed, digest-pinned artifacts.
 - `roles/` - one role per `plan-v1`/`plan-v2` operation phase
   (`host`, `secret`, `volume`, `network`, `image`, `config`, `database`,
   `service`, `readiness`, `state`) - see each role's own
-  `defaults/main.yml` for its real variable contract and what its real
-  implementation will do. **Skeleton only as of item 8's PR #26**: every
-  role asserts its own required variables are present and then reports
-  itself not yet implemented - real implementation lands in PR #28
-  (host/secret/volume/network/image/config) and PR #29
-  (database/service/readiness/state).
+  `defaults/main.yml` for its real variable contract. Every role asserts
+  its own required variables before doing anything else, so a caller
+  that got the typed operation-to-role mapping wrong fails loudly there,
+  not deep inside a half-applied task. All ten now have their real
+  implementation (item 8's PR #28: `host`/`secret`/`volume`/`network`/
+  `image`/`config`; PR #29: `database`/`service`/`readiness`/`state`).
+  `host`/`secret`/`volume`/`network`/`image`/`config` and the whole
+  apply pipeline around them (lock, journal, dispatch, a real failure
+  path) are exercised end to end for real in CI
+  (`test/apply-acceptance.mjs`, `pnpm test:apply-ssh`) against a
+  genuinely ephemeral target - that run stops at a real, expected image
+  pull failure (`examples/release-lock.json`'s own images are
+  illustrative, not real published digests), so `database`/`service`/
+  `readiness`/`state` are verified locally (real Jinja rendering, real
+  `docker compose`/`docker inspect` argv construction, real
+  `ansible.builtin.copy` byte-for-byte delivery confirmed via `--check
+  --diff`) rather than through that same live target - see PR #29's own
+  commit message for exactly what was checked.
 
 ## Versioning
 

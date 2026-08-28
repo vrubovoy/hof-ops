@@ -1,6 +1,11 @@
 ---
-# readiness.wait - hof_readiness_condition is the plan's own typed condition (running|healthy, see plan-v1.schema.json) - the gateway only ever waits for running (no Compose healthcheck by design, see render-topology.mjs), everything else waits for healthy.
-# Real implementation (PR #28/#29): polls docker inspect for the named unit's own State.Status/State.Health.Status until it matches hof_readiness_condition or a bounded timeout elapses.
+# readiness.wait - hof_readiness_condition is the plan's own typed
+# condition (running|healthy, see plan-v1.schema.json) - the gateway
+# only ever waits for running (no Compose healthcheck by design, see
+# render-topology.mjs's own comment on why), everything else waits for
+# healthy. Polls `docker inspect` for the named unit's own real
+# container state until it matches, or a bounded timeout elapses -
+# never trusts `docker compose up`'s own exit alone as "ready".
 hof_operation_id: null
 hof_readiness_unit: null
 hof_readiness_condition: null

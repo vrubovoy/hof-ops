@@ -132,6 +132,8 @@ function buildExtraVars(operation, { commitGeneration, imageTrustByUnit, install
       vars.hof_generated_files_dir = "/hof/generated";
       break;
     case "database.migrate":
+      vars.hof_migrate_service = operation.resource;
+      vars.hof_migrate_image = operation.image;
       vars.hof_migrate_argv = operation.argv;
       vars.hof_migrate_volume = operation.volume;
       vars.hof_migrate_schema = operation.schema;
@@ -146,6 +148,7 @@ function buildExtraVars(operation, { commitGeneration, imageTrustByUnit, install
       break;
     case "state.commit":
       vars.hof_state_generation = commitGeneration;
+      vars.hof_state_dir = "/hof/state";
       break;
     default:
       throw new Error(`internal error: no extra-vars mapping for action ${operation.action}`);
@@ -209,13 +212,21 @@ async function dispatchOperation(operation, context) {
   if (operation.action === "config.write") {
     args.push("--volume", `${context.generatedFilesDir}:/hof/generated:ro`);
   }
+  if (operation.action === "state.commit") {
+    args.push("--volume", `${context.stateDir}:/hof/state:ro`);
+  }
   args.push(
     context.image,
     "ansible-playbook", "/ansible/playbook.yml",
     "-i", "/hof/inventory.ini",
     "-e", JSON.stringify(extraVars),
   );
-  await context.dockerRun("docker", args, { timeout: (context.connectTimeoutSeconds + 60) * 1000 });
+  // A generous, flat budget covering every operation kind, not just a
+  // quick SSH round trip: readiness.wait's own retry budget alone can
+  // run up to 2 minutes (see ansible/roles/readiness/tasks/main.yml),
+  // and host.prepare's real apt-get install of Docker or a real
+  // database.migrate can each legitimately take a while too.
+  await context.dockerRun("docker", args, { timeout: (context.connectTimeoutSeconds + 300) * 1000 });
 }
 
 function buildInventory({ host, port, user, connectTimeoutSeconds }) {
@@ -360,11 +371,21 @@ export async function runApply(options) {
     return blocked("recovery", "--recovery-age-recipient is required (a bootstrap plan always needs one, see ADR 0004)");
   }
 
-  const installationId = BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER;
+  // The fixed placeholder here (never a real id) is deliberate and load-
+  // bearing: this exact render is only ever used to compute planId, and
+  // `hofctl plan` computes its own planId the same way, against the
+  // same placeholder - an operator's pre-approved plan (from a separate
+  // `hofctl plan` run) must byte-for-byte match what apply recomputes
+  // here, which only holds if both sides render with the identical,
+  // deterministic placeholder. The REAL installation id (a fresh,
+  // genuinely unique value, never this placeholder) is decided further
+  // down, once this operation actually holds the lock - see
+  // realInstallationId below, and its own comment on why reusing it for
+  // real dispatch/delivery (never this placeholder) matters.
   const generation = 1;
   let desiredRendered;
   try {
-    desiredRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId, generation });
+    desiredRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId: BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER, generation });
   } catch (error) {
     return blocked("render", error instanceof Error ? error.message : String(error));
   }
@@ -474,6 +495,25 @@ export async function runApply(options) {
 
   emit({ type: "apply.locked", operationId, resumed: Boolean(options.resume), planId: plan.planId });
 
+  // The REAL installation id every actually-dispatched operation labels
+  // real Docker resources with, and state.commit finally records -
+  // deliberately never the planning-time placeholder above (see its own
+  // comment on why that one is fixed and shared with `hofctl plan`).
+  // Deterministically reusing this run's own operationId (rather than a
+  // second, separately-generated random value) needs no extra durable
+  // storage at all to stay correct across a resume: a resume already
+  // recovers the exact same operationId from the target's own lock, so
+  // it recomputes the exact same real installation id too, without ever
+  // having to persist it anywhere new.
+  const realInstallationId = operationId;
+  let appliedRendered;
+  try {
+    appliedRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId: realInstallationId, generation });
+  } catch (error) {
+    if (!options.resume) await m.releaseLock(mutateConn, operationId).catch(() => {});
+    return blocked("render", error instanceof Error ? error.message : String(error));
+  }
+
   // The EE container's own network access, known_hosts, identity, and
   // inventory are all resolved ONCE per apply run (the host key is
   // pinned for the whole run - it cannot legitimately change mid-run,
@@ -499,9 +539,42 @@ export async function runApply(options) {
       await writeFile(secretsFile, JSON.stringify(secretValues), { mode: 0o600 });
 
       const generatedFilesDir = path.join(workDir, "generated");
-      const generatedFiles = renderedFilesContents(desiredRendered);
+      const generatedFiles = renderedFilesContents(appliedRendered);
       await mkdir(generatedFilesDir, { recursive: true });
       await Promise.all(Object.entries(generatedFiles).map(([name, contents]) => writeFile(path.join(generatedFilesDir, name), contents)));
+
+      // state.commit's own real content - current.json matches
+      // schemas/state-v1.schema.json; topology.json is the FULL
+      // renderTopology() wrapper ({compose, caddyfile, topology, backup,
+      // ...}), never just the inner `topology` object generatedFiles
+      // above already delivers under that same filename for a
+      // completely different purpose (see state.mjs's own
+      // assertRenderedShape comment on why those two must never be
+      // confused). topologyDigest is deliberately plan.desired's own
+      // already-computed value, not recomputed from appliedRendered -
+      // that digest's own formula excludes the installation id by
+      // design (see state.mjs's own unitConfigFingerprint comment: "a
+      // real apply changes it"), so it's identical either way, and
+      // reusing the plan's own value keeps this from ever silently
+      // drifting out of sync with what buildPlanV2 already validated.
+      const stateDir = path.join(workDir, "state");
+      await mkdir(stateDir, { recursive: true });
+      const currentState = {
+        apiVersion: "hof.dev/state/v1",
+        installationId: realInstallationId,
+        generation,
+        lastSuccessfulOperationId: operationId,
+        appliedAt: new Date().toISOString(),
+        release: releaseLock.release,
+        manifestDigest: inputDigests.manifestDigest,
+        releaseLockDigest: inputDigests.releaseLockDigest,
+        catalogDigest: inputDigests.catalogDigest,
+        composeTemplateDigest: inputDigests.composeTemplateDigest,
+        topologyDigest: plan.desired.topologyDigest,
+        generatedArtifacts: Object.fromEntries(Object.entries(generatedFiles).map(([name, contents]) => [name, sha256(Buffer.from(contents))])),
+      };
+      await writeFile(path.join(stateDir, "current.json"), JSON.stringify(currentState));
+      await writeFile(path.join(stateDir, "topology.json"), JSON.stringify(appliedRendered));
 
       // executionEnvironmentImageOverride is a narrow testing seam only
       // (see test/apply-acceptance.mjs) - a real `docker run` of the
@@ -517,8 +590,8 @@ export async function runApply(options) {
       // that's what a real apply run is actually bound to.
       const context = {
         image: options.executionEnvironmentImageOverride ?? releaseLock.ansibleEnvironment.image, identityFile: options.identityFile,
-        knownHostsFile, inventoryFile, connectTimeoutSeconds, dockerRun, secretsFile, generatedFilesDir,
-        installationId, generation, dockerNetwork: options.executionEnvironmentDockerNetwork,
+        knownHostsFile, inventoryFile, connectTimeoutSeconds, dockerRun, secretsFile, generatedFilesDir, stateDir,
+        installationId: realInstallationId, generation, dockerNetwork: options.executionEnvironmentDockerNetwork,
       };
 
       const eventsByStep = options.resume ? groupByStep(await m.readEvents(mutateConn, operationId)) : new Map();

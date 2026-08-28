@@ -1,6 +1,18 @@
 ---
-# service.start / service.stop / service.remove - one Compose unit.
-# Real implementation (PR #28/#29): community.docker.docker_compose_v2 (or docker_container directly), scoped to exactly the one unit a given operation names - never a blanket `compose up`/`compose down` for the whole stack.
+# service.start - one Compose unit, scoped strictly to it (never a
+# blanket `compose up`/`compose down` for the whole stack) - service.stop
+# and service.remove are applied-mode-only actions (item 9, not this
+# item's own bootstrap-actions.mjs whitelist), so this role only ever
+# implements service.start for real here.
+#
+# hof_service_image is carried for audit/journal purposes (the exact
+# pinned reference this operation approved) but never passed directly to
+# `docker compose up` - the compose.yml config.write already delivered
+# to /etc/hof/generated/compose.yml already declares this exact same
+# image for this unit (image.pull already pulled it in an earlier
+# operation), so Compose's own service definition is already correct;
+# passing it again here would just be a second, independently-
+# maintained copy of the same fact.
 hof_operation_id: null
 hof_service_unit: null
 hof_service_image: null

@@ -1,19 +1,57 @@
 ---
-# Skeleton only (item 8, PR #26) - real state implementation lands in
-# a later item-8 PR (see defaults/main.yml). Every role in this
-# Execution Environment enforces its own operation's variable contract
-# even before it does real work, so a caller (hofctl apply's own
-# dispatcher, PR #27) that got the typed operation-to-role mapping
-# wrong fails loudly here, not deep inside a half-applied task.
 - name: Assert this operation's own required variables are present
   ansible.builtin.assert:
     that:
       - hof_operation_id is not none
       - hof_state_generation is not none
-    fail_msg: "state role requires hof_operation_id, hof_state_generation - never invoked without them"
+      - hof_state_dir is not none
+    fail_msg: "state role requires hof_operation_id, hof_state_generation, hof_state_dir - never invoked without them"
 
-- name: state is not yet implemented
-  ansible.builtin.debug:
-    msg: >-
-      state skeleton reached for operation {{ hof_operation_id }} -
-      real implementation lands in a later item-8 PR.
+# Parsed once, used only for this one cross-check - the actual delivery
+# below reads current.json directly by its own real file bytes (via
+# copy's own src:, never routed through this parsed value or any other
+# Jinja round-trip - confirmed for real that set_fact + a templated
+# lookup() auto-coerces JSON-looking content into a native dict, which
+# would otherwise silently re-serialize the file's own exact bytes
+# rather than deliver them unchanged).
+- name: Read current.json's own generation for a cross-check
+  ansible.builtin.set_fact:
+    hof_state_current_generation: "{{ (lookup('file', hof_state_dir + '/current.json') | from_json).generation }}"
+
+- name: Cross-check the delivered current.json's own generation against this operation's own carried value
+  ansible.builtin.assert:
+    # | int on both sides - set_fact's own Jinja templating stringifies
+    # a plain numeric result (confirmed for real: both sides otherwise
+    # print identically as "1" yet still compare unequal, a real "1" ==
+    # "1" string against a genuine int 1) unless explicitly cast back.
+    that:
+      - (hof_state_current_generation | int) == (hof_state_generation | int)
+    fail_msg: >-
+      current.json's own generation ({{ hof_state_current_generation }})
+      does not match this operation's own hof_state_generation ({{ hof_state_generation }})
+
+# ansible.builtin.copy's own src: reads the file's exact bytes directly
+# (on the control node, where hof_state_dir was mounted) and writes
+# atomically (a same-filesystem temp file, then an atomic rename into
+# place) - no separate hand-rolled temp-file dance, and no Jinja
+# round-trip through the file's own content at all. Order matters:
+# topology.json first, then current.json last - state.mjs's own
+# resolveBaseline() treats current.json's mere presence as "this
+# installation is applied", so it must never appear before topology.json
+# already does (the exact corruption case resolveBaseline() itself
+# refuses to guess about: "has current.json but no topology.json").
+- name: Atomically write topology.json
+  ansible.builtin.copy:
+    src: "{{ hof_state_dir }}/topology.json"
+    dest: /var/lib/hof/state/topology.json
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Atomically write current.json (deliberately last)
+  ansible.builtin.copy:
+    src: "{{ hof_state_dir }}/current.json"
+    dest: /var/lib/hof/state/current.json
+    owner: root
+    group: root
+    mode: "0644"

@@ -29,35 +29,10 @@ const roles = [
   "state",
 ];
 
-// host/secret/volume/network/image/config landed their real
-// implementation in item 8's PR #28 - database/service/readiness/state
-// are still the PR #26 skeleton (assert + not-yet-implemented), real
-// implementation lands in PR #29. The two groups get different checks
-// below; this list is the one place that distinction is recorded.
-const SKELETON_ROLES = new Set(["database", "service", "readiness", "state"]);
-
-// Every variable a role's tasks/main.yml asserts "is not none" for must
-// also be declared (as null) in that same role's defaults/main.yml -
-// the assert is only a real contract if every variable it checks has a
-// documented default to override. Only ever applied to the skeleton
-// roles below - a real role's own assert can express a richer condition
-// than a flat "is not none" chain (see image's own hof_image_action
-// enum check), which this simple parser deliberately doesn't attempt
-// to generalize.
-function assertedVariables(tasksYaml) {
-  const doc = YAML.parseAllDocuments(tasksYaml)[0].toJSON();
-  const assertTask = doc.find(
-    (task) => task["ansible.builtin.assert"] !== undefined,
-  );
-  assert.ok(assertTask, "tasks/main.yml has no ansible.builtin.assert task");
-  const that = assertTask["ansible.builtin.assert"].that;
-  assert.ok(Array.isArray(that) && that.length > 0);
-  return that.map((expr) => {
-    const match = /^(\S+) is not none$/.exec(expr);
-    assert.ok(match, `unexpected assert expression shape: ${expr}`);
-    return match[1];
-  });
-}
+// All ten roles landed their real implementation across item 8's
+// PR #28 (host/secret/volume/network/image/config) and PR #29
+// (database/service/readiness/state) - none are still the PR #26
+// skeleton (assert + not-yet-implemented).
 
 test("ansible/roles contains exactly the 10 plan operation-phase roles, nothing else", () => {
   const entries = readdirSync(rolesDir, { withFileTypes: true })
@@ -89,30 +64,11 @@ function loadRoleFiles(role) {
 }
 
 for (const role of roles) {
-  if (SKELETON_ROLES.has(role)) {
-    test(`role ${role} (skeleton): defaults/main.yml and tasks/main.yml parse and agree on the variable contract`, () => {
-      const { defaults, tasksYaml } = loadRoleFiles(role);
-      const asserted = assertedVariables(tasksYaml);
-      assert.deepEqual(
-        [...asserted].sort(),
-        Object.keys(defaults).sort(),
-        "tasks/main.yml's own assert must check exactly the variables defaults/main.yml declares - no more, no fewer",
-      );
-      // Every skeleton reports itself not-yet-implemented rather than
-      // silently succeeding, and does so by name (never a generic
-      // "not implemented" that could mask a mis-dispatched role).
-      assert.ok(
-        tasksYaml.includes(`${role} skeleton reached`) || tasksYaml.includes(`${role}.`),
-        `tasks/main.yml for ${role} should identify itself by name in its not-yet-implemented message`,
-      );
-    });
-  } else {
-    test(`role ${role} (implemented): defaults/main.yml and tasks/main.yml parse, with a real assert gate`, () => {
-      const { tasksYaml } = loadRoleFiles(role);
-      assert.match(tasksYaml, /ansible\.builtin\.assert:/, `${role} must still assert its own required variables before doing real work`);
-      assert.doesNotMatch(tasksYaml, /not yet implemented|skeleton reached/, `${role} is no longer a skeleton - PR #28 landed its real implementation`);
-    });
-  }
+  test(`role ${role}: defaults/main.yml and tasks/main.yml parse, with a real assert gate`, () => {
+    const { tasksYaml } = loadRoleFiles(role);
+    assert.match(tasksYaml, /ansible\.builtin\.assert:/, `${role} must still assert its own required variables before doing real work`);
+    assert.doesNotMatch(tasksYaml, /not yet implemented|skeleton reached/, `${role} is no longer a skeleton - its real implementation has landed`);
+  });
 }
 
 test("host role bootstraps python3 via raw before gathering facts, then installs Docker only when genuinely absent", () => {
@@ -152,6 +108,38 @@ test("config role delivers exactly the fixed generated-artifact filenames, disco
   assert.match(tasksYaml, /ansible\.builtin\.find:/);
   assert.match(tasksYaml, /delegate_to: localhost/);
   assert.match(tasksYaml, /\/etc\/hof\/generated/);
+});
+
+test("database role runs a migration via `docker compose run`, reusing the service's own already-rendered definition, never a bare docker run", () => {
+  const { tasksYaml } = loadRoleFiles("database");
+  assert.match(tasksYaml, /docker compose|'docker', 'compose'/);
+  assert.match(tasksYaml, /--no-deps/);
+  assert.match(tasksYaml, /hof_migrate_argv/);
+});
+
+test("service role starts exactly one Compose unit, scoped with --no-deps and never re-pulling", () => {
+  const { tasksYaml } = loadRoleFiles("service");
+  assert.match(tasksYaml, /--no-deps/);
+  assert.match(tasksYaml, /--pull/);
+  assert.match(tasksYaml, /hof_service_unit/);
+});
+
+test("readiness role discovers the container by its own real Compose labels and polls docker inspect's JSON, never a Go-template format string", () => {
+  const { tasksYaml } = loadRoleFiles("readiness");
+  assert.match(tasksYaml, /com\.docker\.compose\.project=hof/);
+  assert.match(tasksYaml, /com\.docker\.compose\.service=/);
+  assert.match(tasksYaml, /from_json/);
+  assert.match(tasksYaml, /until:/);
+});
+
+test("state role writes topology.json before current.json, both via ansible.builtin.copy's own atomic write-then-rename", () => {
+  const { tasksYaml } = loadRoleFiles("state");
+  const topologyIndex = tasksYaml.indexOf("dest: /var/lib/hof/state/topology.json");
+  const currentIndex = tasksYaml.indexOf("dest: /var/lib/hof/state/current.json");
+  assert.ok(topologyIndex > 0 && currentIndex > 0, "both files must be written");
+  assert.ok(topologyIndex < currentIndex, "topology.json must be written before current.json - see ADR 0004 and state.mjs's own resolveBaseline() corruption check");
+  const copyCount = (tasksYaml.match(/ansible\.builtin\.copy:/g) ?? []).length;
+  assert.equal(copyCount, 2, "both writes must use copy's own atomic semantics, no hand-rolled temp-file dance");
 });
 
 test("ansible/requirements.yml pins the exact collections the roles' own README/defaults comments promise", () => {

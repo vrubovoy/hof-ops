@@ -180,12 +180,24 @@ function sanitizeError(error) {
 // genuine sudo-enabled ephemeral target.
 async function dispatchOperation(operation, context) {
   const extraVars = buildExtraVars(operation, context);
-  const args = [
-    "run", "--rm",
+  const args = ["run", "--rm"];
+  // executionEnvironmentDockerNetwork is a narrow testing seam only
+  // (see test/apply-acceptance.mjs) - a real target is a real remote
+  // host, reached over the ordinary internet from Docker's own default
+  // bridge network; there is no Docker network to join. The
+  // acceptance test's own target runs on a private, test-only Docker
+  // bridge network precisely so it never needs a published host port,
+  // and the Execution Environment container must join that same
+  // network to reach it - Docker's own inter-network isolation
+  // otherwise refuses that traffic (confirmed for real: this container
+  // could not reach the target's own bridge IP at all until it joined
+  // the same network).
+  if (context.dockerNetwork) args.push("--network", context.dockerNetwork);
+  args.push(
     "--volume", `${context.identityFile}:/hof/identity:ro`,
     "--volume", `${context.knownHostsFile}:/hof/known_hosts:ro`,
     "--volume", `${context.inventoryFile}:/hof/inventory.ini:ro`,
-  ];
+  );
   // secret.ensure/config.write are the only two operations that need
   // real content mounted in beyond the fixed transport files above -
   // never through extra-vars/argv (visible to anything that can list
@@ -236,8 +248,8 @@ function buildInventory({ host, port, user, connectTimeoutSeconds }) {
 //     apply-specific informational lines) as they happen, for bounded
 //     NDJSON streaming to stdout. Defaults to a no-op.
 //   inspect, verifyEeSignature, dockerRun, mutate, run,
-//   executionEnvironmentImageOverride, readSecretsStore - testing seams;
-//   the real CLI never passes them.
+//   executionEnvironmentImageOverride, executionEnvironmentDockerNetwork,
+//   readSecretsStore - testing seams; the real CLI never passes them.
 export async function runApply(options) {
   const emit = options.emit ?? (() => {});
   // The target-mutate layer's own transport correctness (script
@@ -506,7 +518,7 @@ export async function runApply(options) {
       const context = {
         image: options.executionEnvironmentImageOverride ?? releaseLock.ansibleEnvironment.image, identityFile: options.identityFile,
         knownHostsFile, inventoryFile, connectTimeoutSeconds, dockerRun, secretsFile, generatedFilesDir,
-        installationId, generation,
+        installationId, generation, dockerNetwork: options.executionEnvironmentDockerNetwork,
       };
 
       const eventsByStep = options.resume ? groupByStep(await m.readEvents(mutateConn, operationId)) : new Map();

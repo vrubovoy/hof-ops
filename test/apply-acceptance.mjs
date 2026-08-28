@@ -233,6 +233,12 @@ function baseOptions() {
     recoveryAgeRecipient: "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
     verifyEeSignature: async () => {},
     executionEnvironmentImageOverride: eeImageReference,
+    // The target only exists on this test's own private Docker bridge
+    // network (never a published host port) - the Execution
+    // Environment container must join that same network to reach it at
+    // all (confirmed for real: Docker refuses inter-network traffic
+    // between two separate bridge networks by default).
+    executionEnvironmentDockerNetwork: networkName,
     secretsStorePath: "/dev/null", // never actually read - readSecretsStore is stubbed below
     readSecretsStore: async () => fakeSecretValues,
   };

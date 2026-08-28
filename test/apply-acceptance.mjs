@@ -226,12 +226,32 @@ after(async () => {
   if (workDir) await rm(workDir, { recursive: true, force: true });
 });
 
+// apply.mjs's own sanitizeError() only ever keeps the last 8 lines of a
+// failed operation's raw output (by design - never a raw dump into the
+// journal/stdout event stream) - useful for a real operator, but it
+// hides the actually-useful failure detail when THIS test itself is
+// what's failing during development. Wraps the real dockerRun with the
+// exact same argv/behavior, additionally logging the complete,
+// untruncated stdout/stderr of every dispatched operation to this
+// process's own stderr - never reaches apply.mjs's own journal/NDJSON
+// stream, purely a local diagnostic aid.
+function loggingDockerRun(command, args, options) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(command, args, { maxBuffer: 8 * 1024 * 1024, ...options }, (error, stdout, stderr) => {
+      console.error(`--- docker ${args.join(" ")} ---\nstdout:\n${stdout}\nstderr:\n${stderr}\n--- end ---`);
+      if (error) reject(Object.assign(error, { stdout, stderr }));
+      else resolve({ stdout, stderr });
+    });
+  });
+}
+
 function baseOptions() {
   return {
     manifestPath: servicesPath, releaseLockPath, releaseLockIdentity: "test@example.com",
     hostKeySha256: hostKeyFingerprint, identityFile: userKeyPath, connectTimeoutSeconds: 15,
     recoveryAgeRecipient: "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
     verifyEeSignature: async () => {},
+    dockerRun: loggingDockerRun,
     executionEnvironmentImageOverride: eeImageReference,
     // The target only exists on this test's own private Docker bridge
     // network (never a published host port) - the Execution

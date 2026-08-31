@@ -201,13 +201,26 @@ ${criticalSection}
 // before the writing pipeline even runs). A further, 2026-08-31 review
 // found that old form left exactly that window open: a crash of the
 // remote script mid-transfer (a dropped connection, an OOM-kill, a
-// power loss) could leave a truncated lock or journal file behind. Only
-// safe to call from within a script already holding the lock guard
-// above (a fixed temp filename is reused across calls, safe only under
-// that same mutual exclusion).
+// power loss) could leave a truncated lock or journal file behind.
+//
+// The temp name itself is a genuinely unique `mktemp`, never a fixed
+// `targetPath.tmp` - a STILL FURTHER, 2026-08-31 review found reusing a
+// fixed name was itself a real corruption path: if a PRIOR, crashed
+// invocation's own `ln` had already succeeded but its own `rm` never
+// ran (dying in that exact gap), the fixed tmp name and targetPath were
+// left as two hard links to the SAME inode - a LATER invocation's own
+// `printf ... > targetPath.tmp` would then truncate that shared inode,
+// silently corrupting the already-live, currently-held targetPath, even
+// though the later invocation's own `ln` would (correctly) then refuse
+// with EEXIST. Reproduced and confirmed for real against a scratch
+// directory before this fix, and confirmed fixed after it. Only safe to
+// call from within a script already holding the lock guard above (the
+// opportunistic cleanup of any orphaned prior mktemp files relies on
+// that same mutual exclusion - no live invocation could be using one).
 function atomicExclusiveCreateStep(targetPath, payloadVar, resultVar) {
   return `mkdir -p "$(dirname '${targetPath}')"
-${resultVar}_tmp='${targetPath}.tmp'
+rm -f '${targetPath}'.??????
+${resultVar}_tmp=$(mktemp '${targetPath}.XXXXXX')
 printf '%s' "$${payloadVar}" | base64 -d > "$${resultVar}_tmp"
 if ln "$${resultVar}_tmp" '${targetPath}' 2>/dev/null; then
   rm -f "$${resultVar}_tmp"

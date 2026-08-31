@@ -315,11 +315,13 @@ function computeExpectedCommittedState({ manifest, catalog, releaseLock, service
 // Reads and validates every durable event for operationId - schema,
 // operationId, known-step membership, PHYSICAL append order (see
 // decideStepResumption()'s own comment), and the plan's own dispatch
-// order (a real run only ever dispatches plan.operations strictly in
-// array order, so a later step can never have recorded events while an
-// earlier one has none at all). Returns eventsByStep on success, throws
-// a plain Error carrying a human message on any violation - the caller
-// turns that into blocked("resume", ...).
+// order in the RAW stream, not just per-step (a real run only ever
+// dispatches plan.operations strictly in array order - every one of a
+// step's own events, in the raw file, forms one contiguous block, and
+// the next step's own block can never begin until the previous one's
+// already resolved to a genuine success). Returns eventsByStep on
+// success, throws a plain Error carrying a human message on any
+// violation - the caller turns that into blocked("resume", ...).
 async function readAndValidateEvents(m, mutateConn, operationId, plan) {
   let rawEvents;
   try {
@@ -327,7 +329,7 @@ async function readAndValidateEvents(m, mutateConn, operationId, plan) {
   } catch (error) {
     throw new Error(`could not read operation events for ${operationId}: ${error instanceof Error ? error.message : error}`);
   }
-  const knownStepIds = new Set(plan.operations.map((operation) => operation.id));
+  const stepIndex = new Map(plan.operations.map((operation, index) => [operation.id, index]));
   for (const event of rawEvents) {
     try {
       await assertEventValid(event);
@@ -337,26 +339,42 @@ async function readAndValidateEvents(m, mutateConn, operationId, plan) {
     if (event.operationId !== operationId) {
       throw new Error(`a recorded event claims operationId ${event.operationId}, but this resume is for ${operationId} - refusing to trust it`);
     }
-    if (!knownStepIds.has(event.step)) {
+    if (!stepIndex.has(event.step)) {
       throw new Error(`a recorded event references step ${event.step}, which isn't part of the approved plan's own operations - refusing to trust it`);
     }
   }
-  const eventsByStep = groupByStep(rawEvents);
-  // The plan's own dispatch order: a real run only ever advances to
-  // plan.operations[i+1] once plan.operations[i] is already resolved
-  // (skip, from an earlier pass, or dispatched-and-resolved in this
-  // one) - so a later step recording events while an earlier one has
-  // none at all is never a shape a healthy run could produce.
-  let seenGap = false;
-  for (const operation of plan.operations) {
-    const stepEvents = eventsByStep.get(operation.id) ?? [];
-    if (stepEvents.length === 0) {
-      seenGap = true;
-    } else if (seenGap) {
-      throw new Error(`step ${operation.id} has recorded events but an earlier step in the approved plan has none at all - the event history is not a valid prefix of the plan's own dispatch order, refusing to trust it`);
+  // A further, 2026-08-31 review found the per-step physical-order check
+  // (decideStepResumption() itself) and the old prefix-only gap check
+  // here together still missed the RAW stream's own cross-step order -
+  // two concrete, schema-valid-but-impossible shapes: a later step's
+  // own [started, succeeded] pair appearing in the file entirely BEFORE
+  // an earlier step's own events even begin, and two steps' events
+  // genuinely interleaved (```A.started, B.started, B.succeeded,
+  // A.succeeded```) - neither is a gap (both steps have events) and
+  // neither breaks EITHER step's own per-step ordering in isolation, so
+  // both survived every check PR #46 added. Walking the raw stream once,
+  // in order, and requiring every event to belong to either the step
+  // currently "open" or the next one in plan order - and requiring the
+  // previous step's own accumulated history to already resolve to
+  // "skip" before the next one may open - catches both: a real run's
+  // own dispatch loop can never legitimately produce anything else.
+  let openIndex = -1;
+  let openStepEvents = [];
+  for (const event of rawEvents) {
+    const index = stepIndex.get(event.step);
+    if (index === openIndex) {
+      openStepEvents.push(event);
+    } else if (index === openIndex + 1) {
+      if (openIndex >= 0 && decideStepResumption(openStepEvents) !== "skip") {
+        throw new Error(`step ${plan.operations[openIndex].id}'s own recorded events don't resolve to a genuine success before step ${event.step}'s own events begin in the raw stream - refusing to trust an event history that isn't a valid append-order record of the plan's own dispatch order`);
+      }
+      openIndex = index;
+      openStepEvents = [event];
+    } else {
+      throw new Error(`step ${event.step}'s own event appears out of the plan's own dispatch order in the raw event stream - refusing to trust an event history that isn't a valid append-order record of the plan's own dispatch order`);
     }
   }
-  return eventsByStep;
+  return groupByStep(rawEvents);
 }
 
 // Reports whether releaseLock() genuinely cleared the target's own lock

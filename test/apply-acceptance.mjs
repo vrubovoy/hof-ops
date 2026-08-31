@@ -8,7 +8,7 @@
 // inspectTarget() over real SSH, a real plan-v2 build, real
 // target-mutate lock/journal/event writes over real SSH (with sudo), a
 // real `docker run` of the real, published, independently-signed
-// ee-v0.1.2 Execution Environment image for every operation (no local
+// ee-v0.1.3 Execution Environment image for every operation (no local
 // build, no signature bypass, no image override - see baseOptions()
 // below), reaching the real target over a real SSH connection FROM
 // inside that container, running every one of item 8's ten real role
@@ -18,7 +18,7 @@
 // "Item 8 reopened" entry named as missing (finding #9): earlier
 // versions of this file stopped at a real, expected image-pull failure
 // (examples/release-lock.json's own images were illustrative). This one
-// uses the real, published, real-Cosign-signed v0.1.3 platform release
+// uses the real, published, real-Cosign-signed v0.1.4 platform release
 // lock instead - downloaded fresh in before() via `gh release download`
 // - so every image reference in it is genuinely pullable and genuinely
 // signed. The manifest enables only the platform's own mandatory core
@@ -81,14 +81,14 @@ import { runPlan } from "../scripts/plan-command.mjs";
 
 const RECOVERY_AGE_RECIPIENT = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
 // The real platform release this test downloads and applies - see
-// releases/0.1.3.yml (reuses releases/0.1.2.yml's own app-component
-// selections unchanged; only ansibleEnvironment moves to ee-v0.1.2, the
-// build that actually carries the secret-file-permission fix - #39/#40).
+// releases/0.1.4.yml (reuses releases/0.1.3.yml's own app-component
+// selections unchanged; only ansibleEnvironment moves to ee-v0.1.3, the
+// build that actually carries the Docker-service-enable fix - #43/#44).
 // `workflow_dispatch` signs with the DISPATCHING branch's own ref, never
 // a tag (confirmed for real by inspecting the v0.1.1 release's own
 // certificate - `@refs/heads/main`, not `@refs/tags/v0.1.1`), unlike
 // execution-environment.yml's own tag-triggered identity below.
-const RELEASE_VERSION = "0.1.3";
+const RELEASE_VERSION = "0.1.4";
 const RELEASE_LOCK_IDENTITY = "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/heads/main";
 
 const exec = promisify(execFile);
@@ -276,7 +276,7 @@ function baseOptions() {
     recoveryAgeRecipient: RECOVERY_AGE_RECIPIENT,
     dockerRun: loggingDockerRun,
     // No executionEnvironmentImageOverride, no verifyEeSignature stub -
-    // the real, published ee-v0.1.2 image referenced by the real
+    // the real, published ee-v0.1.3 image referenced by the real
     // release lock above, with its real Cosign signature genuinely
     // verified.
     //
@@ -289,7 +289,7 @@ function baseOptions() {
   };
 }
 
-test("a real, full bootstrap apply against the real, published, signed v0.1.3 release - every real role, start to finish, to a genuine generation-1 commit", async () => {
+test("a real, full bootstrap apply against the real, published, signed v0.1.4 release - every real role, start to finish, to a genuine generation-1 commit", async () => {
   // The real operator workflow, exercised for real: a genuine `hofctl
   // plan` run (real inspectTarget() over the real SSH transport this
   // whole fixture already sets up, real cosign verification of the

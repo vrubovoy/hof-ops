@@ -199,15 +199,108 @@ function computeGeneratedDrift(baseline, observation) {
 // touched for any reason" - a sibling unit's config-only change (say,
 // Schlüssel's ALLOWED_ORIGINS shifting because an unrelated service was
 // enabled) must never trigger a migration on its own.
+//
+// Item 9 (ADR 0005): a service being re-enabled from a RETAINED disable
+// (baseline.retainedServices carries its own last-migrated schema
+// version) needs no migration at all when that recorded version already
+// matches what's now desired - re-running the initial migration against
+// data that's already at the current schema would be wrong, not just
+// redundant. A retained schema version that DISAGREES with desired can
+// only happen via a release change, already refused elsewhere as
+// upgrade scope (see computeUpgradeBlockers) - this is defensive, not a
+// path a real plan can actually reach.
 function servicesNeedingMigration(baseline, desired, imageChangedUnits, catalog) {
   return catalog.services.filter((service) => {
     if (!service.database || !desired.services[service.id]?.enabled) return false;
     const wasEnabled = baseline.services[service.id]?.enabled === true;
+    const retained = baseline.retainedServices?.[service.id];
+    const isRetainedReenable = !wasEnabled && retained && retained.schemaVersion === desired.services[service.id]?.schemaVersion;
+    if (isRetainedReenable) return false;
     const schemaChanged = baseline.services[service.id]?.schemaVersion !== desired.services[service.id]?.schemaVersion;
     const unitEntry = Object.entries(desired.services[service.id].units).find(([, unit]) => unit.artifact === service.database.component);
     const componentImageChanged = unitEntry && imageChangedUnits.has(`${service.id}/${unitEntry[0]}`);
     return !wasEnabled || schemaChanged || componentImageChanged;
   });
+}
+
+// Item 9 (ADR 0005): release/schema/image changes to an ALREADY-enabled
+// unit are out of this item's own scope - items 10/11's job. The
+// primary check is release-level (this platform's own image/schema
+// versions are always tied to a release as a whole, never bumped
+// independently) - the per-unit check right after is defense in depth
+// for the same invariant, never reachable on its own given the
+// release-level check already ran, but cheap and exact. Deliberately
+// compares fromImage !== toImage, NOT the entry's own imageChanged flag
+// - a drift-repair fold (foldMissingIntoRepairs/foldManualChangeIntoRepairs)
+// also sets imageChanged: true for a legitimate repair back to the
+// SAME already-expected image (fromImage === toImage there), which must
+// never be mistaken for an upgrade attempt. create entries are never
+// checked here - a brand-new unit always uses the CURRENT release's own
+// image by construction; that's a first enable, never an upgrade.
+//
+// A THIRD, independent check follows for schema version specifically -
+// ADR 0005's own decision text calls out "release, schema version, or
+// image" as three separate upgrade-scope dimensions, and while a real
+// release always ties its schema versions to itself as a whole (so the
+// release-level check above is the path that actually fires in
+// practice), a bare schema bump with no accompanying release/image
+// change must still be caught directly, not assumed unreachable - this
+// is what keeps migrationOperations()'s own wasEnabled/needsBackup path
+// genuinely dead code under item 9, as its own comment claims. A
+// service that isn't enabled in BOTH baseline and desired is skipped
+// here entirely - a first enable and a retained re-enable are never
+// upgrades, whatever their schema version.
+function computeUpgradeBlockers(baseline, desired, update, catalog) {
+  const blockers = [];
+  if (baseline.release !== null && desired.release !== baseline.release) {
+    blockers.push(`release change (${baseline.release} -> ${desired.release}) is out of item 9's own scope - see ADR 0005, items 10-11`);
+  }
+  for (const entry of update) {
+    if (entry.imageChanged && entry.fromImage !== entry.toImage) {
+      blockers.push(`${entry.service}/${entry.unit}: image change on an already-enabled unit (${entry.fromImage} -> ${entry.toImage}) is out of item 9's own scope - see ADR 0005, items 10-11`);
+    }
+  }
+  for (const service of catalog.services) {
+    if (!service.database) continue;
+    const wasEnabled = baseline.services[service.id]?.enabled === true;
+    const stillEnabled = desired.services[service.id]?.enabled === true;
+    if (!wasEnabled || !stillEnabled) continue;
+    const baselineSchema = baseline.services[service.id]?.schemaVersion ?? null;
+    const desiredSchema = desired.services[service.id]?.schemaVersion ?? null;
+    if (baselineSchema !== null && desiredSchema !== null && baselineSchema !== desiredSchema) {
+      blockers.push(`${service.id}: schema version change (${baselineSchema} -> ${desiredSchema}) on an already-enabled service is out of item 9's own scope - see ADR 0005, items 10-11`);
+    }
+  }
+  return blockers;
+}
+
+// Item 9 (ADR 0005): retain-only removal for a persistent (database-
+// owning) service - never a silent default. Returns { blockers,
+// retainedServices } - retainedServices is what desired.retainedServices
+// will carry forward if this plan runs: baseline's own map, minus any
+// service this plan is about to re-enable, plus a fresh entry for any
+// service this plan is about to disable-with-retain. A stateless
+// service's own removal is unaffected (never needs authorization, never
+// enters retainedServices at all - there's no database to retain).
+function computeRetainedServices(baseline, manifest, remove, create, catalog) {
+  const blockers = [];
+  const retainedServices = { ...(baseline.retainedServices ?? {}) };
+  for (const entry of remove) {
+    const service = catalog.services.find((candidate) => candidate.id === entry.service);
+    if (!service?.database) continue; // stateless - nothing to retain, no authorization needed
+    if (manifest.services?.[entry.service]?.dataRetention !== "retain") {
+      blockers.push(`${entry.service}: disabling a persistent service requires services.${entry.service}.dataRetention: retain (see ADR 0005) - refusing to plan a silent, irreversible removal`);
+      continue;
+    }
+    retainedServices[entry.service] = { volume: service.database.volume, schemaVersion: baseline.services[entry.service]?.schemaVersion ?? 0 };
+  }
+  // A service this plan is re-enabling (present in `create` - it was
+  // disabled a moment ago) is no longer retained-and-disabled; it's
+  // live again.
+  for (const entry of create) {
+    if (retainedServices[entry.service]) delete retainedServices[entry.service];
+  }
+  return { blockers, retainedServices };
 }
 
 // A schema-only bump (image/config otherwise untouched) still needs its
@@ -248,7 +341,6 @@ function migrationOperations(baseline, desired, desiredRendered, needing) {
   const operations = [];
   const blockers = [];
   const warnings = [];
-  const needsBackup = [];
 
   for (const service of needing) {
     const wasEnabled = baseline.services[service.id]?.enabled === true;
@@ -281,16 +373,29 @@ function migrationOperations(baseline, desired, desiredRendered, needing) {
       schema: { from: schema.from, to: schema.to, rollbackCompatible: schema.rollbackCompatible },
       reason: !wasEnabled ? "initialize database" : schemaChanged ? "schema version changed" : "component image changed",
     });
-    // Bootstrap migrates into a database nothing has ever written to -
-    // there's nothing to protect yet. An in-place upgrade is exactly
-    // the case that needs a safety net before an irreversible schema
-    // change.
-    if (wasEnabled) needsBackup.push({ service: service.id, volume: service.database.volume });
+    // Item 9 (ADR 0005): a wasEnabled service reaching here at all means
+    // computeUpgradeBlockers has already blocked this plan (any real
+    // schema or image change on an already-enabled service is upgrade
+    // scope, items 10-11) - so this migration is purely informational on
+    // a non-executable plan, never something a real apply would run.
+    // backup.create is gone entirely - it isn't in item 9's own applied
+    // whitelist (scripts/applied-actions.mjs) and no item-9 path ever
+    // runs a backup, blocked-and-informational or not.
   }
-  return { operations, blockers, warnings, needsBackup };
+  return { operations, blockers, warnings };
 }
 
-function buildOperations({ baseline, desired, create, update, remove, migrations, needsBackup, catalog, missingVolumes, missingNetworks, generatedDriftToRepair }) {
+// Item 9 (ADR 0005) reordered this: volume/network ensure, image
+// verify/pull, THEN stop affected/removed units, THEN write the new
+// desired config, THEN remove disabled units, THEN migrations, THEN
+// start/readiness, THEN commit - config.write used to run BEFORE any
+// stop at all, so the freshly-written compose.yml could momentarily
+// describe a topology units still running under the OLD one hadn't
+// caught up to yet. backup.create is gone entirely, from both the
+// removal path AND the migration path (never in item 9's own action
+// whitelist - see scripts/applied-actions.mjs and ADR 0005) - real
+// again once items 10-11 relax it.
+function buildOperations({ baseline, desired, create, update, remove, migrations, catalog, missingVolumes, missingNetworks, generatedDriftToRepair }) {
   const operations = [];
   let sequence = 0;
   const next = (id, phase, action, resource, rest) => {
@@ -306,9 +411,15 @@ function buildOperations({ baseline, desired, create, update, remove, migrations
   const topologyChanged = baseline.topologyDigest !== desired.topologyDigest;
   const anyChange = create.length + update.length + remove.length + migrations.length + generatedDriftToRepair.length > 0
     || topologyChanged || missingNetworks.length > 0;
-  if (baseline.mode === "bootstrap" && anyChange) {
-    next("host.prepare", "host", "host.prepare", "host", { reason: "first successful apply for this installation" });
-    next("secret.ensure", "secret", "secret.ensure", "secrets.sops.yaml", { reason: "first successful apply for this installation" });
+  if (anyChange) {
+    if (baseline.mode === "bootstrap") {
+      next("host.prepare", "host", "host.prepare", "host", { reason: "first successful apply for this installation" });
+    }
+    // Idempotent either way (the secret role's own copy loop over an
+    // unchanged map is simply a no-op) - unconditional on anyChange for
+    // BOTH modes now, not just bootstrap, so a newly-enabled service
+    // that needs its own secret actually gets it.
+    next("secret.ensure", "secret", "secret.ensure", "secrets.sops.yaml", { reason: baseline.mode === "bootstrap" ? "first successful apply for this installation" : "keep every required secret current, including any this change newly needs" });
   }
 
   const newVolumes = desired.volumes.filter((volume) => !baseline.volumes.includes(volume));
@@ -327,27 +438,12 @@ function buildOperations({ baseline, desired, create, update, remove, migrations
     next(`image.pull.${entry.service}.${entry.unit}`, "image", "image.pull", entry.unit, { image: entry.image ?? entry.toImage, reason: "pull the digest-pinned image" });
   }
 
+  for (const entry of update) next(`service.stop.${entry.service}.${entry.unit}`, "service", "service.stop", entry.unit, { reason: entry.reason });
+  for (const entry of remove) next(`service.stop.${entry.service}.${entry.unit}`, "service", "service.stop", entry.unit, { reason: "service disabled" });
+
   if (anyChange) next("config.write", "config", "config.write", "compose.yml", { reason: "regenerate Compose/Caddyfile/env from the current desired state" });
 
-  for (const entry of update) next(`service.stop.${entry.service}.${entry.unit}`, "service", "service.stop", entry.unit, { reason: entry.reason });
-
-  for (const entry of remove) next(`service.stop.${entry.service}.${entry.unit}`, "service", "service.stop", entry.unit, { reason: "service disabled" });
-  // One backup per service being removed, not one per removed unit - a
-  // service with two units (backend+frontend) must not back up its
-  // single shared volume twice.
-  const backedUpForRemoval = new Set();
-  for (const entry of remove) {
-    const service = catalog.services.find((candidate) => candidate.id === entry.service);
-    if (service?.database && !backedUpForRemoval.has(entry.service)) {
-      next(`backup.create.${entry.service}`, "backup", "backup.create", service.database.volume, { reason: "back up before removing a persistent service" });
-      backedUpForRemoval.add(entry.service);
-    }
-  }
   for (const entry of remove) next(`service.remove.${entry.service}.${entry.unit}`, "service", "service.remove", entry.unit, { reason: "service disabled" });
-
-  // After the units that need it are stopped, before the (irreversible)
-  // schema change actually runs.
-  for (const backup of needsBackup) next(`backup.create.migrate.${backup.service}`, "backup", "backup.create", backup.volume, { reason: "back up before an in-place database migration" });
 
   for (const operation of migrations) {
     sequence += 1;
@@ -380,8 +476,8 @@ function buildOperations({ baseline, desired, create, update, remove, migrations
 //   generated files need their own explicit repair path);
 // - a baseline-expected persistent volume is simply gone (never
 //   silently replaced with an empty one).
-function computeBlockers({ baseline, observation, migrationBlockers, drift, generatedDrift, repairDrift, missingVolumes }) {
-  const blockers = [...migrationBlockers];
+function computeBlockers({ baseline, observation, migrationBlockers, drift, generatedDrift, repairDrift, missingVolumes, upgradeBlockers, retainBlockers }) {
+  const blockers = [...migrationBlockers, ...upgradeBlockers, ...retainBlockers];
   if (baseline.mode === "applied" && observation.containersStatus !== "available") {
     blockers.push("observation unavailable - cannot verify current host state before planning changes to an existing installation");
   }
@@ -420,8 +516,14 @@ function computeBlockers({ baseline, observation, migrationBlockers, drift, gene
 // options: { baseline, desiredRendered, manifest, releaseLock, catalog,
 //   observation: { containersStatus, resources, volumesStatus, volumes,
 //     networksStatus, networks, generatedArtifactsStatus, generatedArtifacts },
-//   repairDrift = false }
-export function buildPlan({ baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift = false }) {
+//   repairDrift = false,
+//   suppliedTlsCertificateFingerprint/suppliedTlsPrivateKeyFingerprint:
+//     item 9 (ADR 0005) - only ever given for a real "supplied" tls
+//     mode, threaded straight into desired's own topologyToServiceState()
+//     call (see that function's own comment) and folded into the
+//     gateway unit's own configFingerprint, so a workstation-side
+//     certificate rotation registers as a real diff. }
+export function buildPlan({ baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift = false, suppliedTlsCertificateFingerprint, suppliedTlsPrivateKeyFingerprint }) {
   const observationOk = observation
     && ["containersStatus", "volumesStatus", "networksStatus", "generatedArtifactsStatus"].every((key) => typeof observation[key] === "string")
     && ["resources", "volumes", "networks"].every((key) => Array.isArray(observation[key]))
@@ -433,7 +535,7 @@ export function buildPlan({ baseline, desiredRendered, manifest, releaseLock, ca
     );
   }
 
-  const desired = topologyToServiceState(desiredRendered, catalog, { manifest, releaseLock });
+  const desired = topologyToServiceState(desiredRendered, catalog, { manifest, releaseLock, suppliedTlsCertificateFingerprint, suppliedTlsPrivateKeyFingerprint });
   const drift = computeDrift(baseline, observation);
   const generatedDrift = computeGeneratedDrift(baseline, observation);
   const missingVolumes = computeMissingResources(baseline, "volume", observation.volumesStatus, observation.volumes);
@@ -451,21 +553,30 @@ export function buildPlan({ baseline, desiredRendered, manifest, releaseLock, ca
   const generatedDriftToRepair = generatedDrift.filter((entry) => entry.kind === "generated-missing" || (entry.kind === "generated-modified" && repairDrift));
   foldGatewayRestartForCaddyfile(desired, generatedDriftToRepair, create, update);
 
+  // Item 9 (ADR 0005): release/schema/image changes to an existing unit,
+  // and retain-only removal for a persistent service - computed from
+  // create/update/remove exactly as diffUnits (plus the folds above)
+  // left them, before migration folding below adds anything further
+  // (migration-only folds never set imageChanged: true, so they can
+  // never trip the upgrade blocker; they're irrelevant to retention).
+  const upgradeBlockers = computeUpgradeBlockers(baseline, desired, update, catalog);
+  const { blockers: retainBlockers, retainedServices } = computeRetainedServices(baseline, manifest, remove, create, catalog);
+
   const imageChangedUnits = new Set([...create, ...update].filter((entry) => entry.imageChanged).map((entry) => `${entry.service}/${entry.unit}`));
   const needingMigration = servicesNeedingMigration(baseline, desired, imageChangedUnits, catalog);
   foldMigrationOnlyIntoUpdates(desired, needingMigration, create, update);
 
-  const { operations: migrations, blockers: migrationBlockers, warnings: migrationWarnings, needsBackup } =
+  const { operations: migrations, blockers: migrationBlockers, warnings: migrationWarnings } =
     migrationOperations(baseline, desired, desiredRendered, needingMigration);
 
   const operations = buildOperations({
-    baseline, desired, create, update, remove, migrations, needsBackup, catalog,
+    baseline, desired, create, update, remove, migrations, catalog,
     missingVolumes, missingNetworks, generatedDriftToRepair,
   });
   const migrateCount = operations.filter((operation) => operation.action === "database.migrate").length;
 
   const mode = baseline.mode === "bootstrap" ? "bootstrap" : "applied";
-  const blockers = computeBlockers({ baseline, observation, migrationBlockers, drift, generatedDrift, repairDrift, missingVolumes });
+  const blockers = computeBlockers({ baseline, observation, migrationBlockers, drift, generatedDrift, repairDrift, missingVolumes, upgradeBlockers, retainBlockers });
   const driftWarnings = drift
     .filter((entry) => entry.kind === "manual-change" || entry.kind === "unmanaged")
     .map((entry) => `${entry.resource}: ${entry.detail}`);
@@ -477,7 +588,7 @@ export function buildPlan({ baseline, desiredRendered, manifest, releaseLock, ca
     mode,
     executable: blockers.length === 0,
     baseline,
-    desired,
+    desired: { ...desired, retainedServices },
     drift: [...drift, ...generatedDrift],
     summary: { create: create.length, update: update.length, remove: remove.length, migrate: migrateCount },
     operations,

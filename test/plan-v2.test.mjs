@@ -157,13 +157,49 @@ test("computePlanId: an actual content change still changes the id, even after c
   assert.notEqual(computePlanId(tampered), plan.planId);
 });
 
-test("refuses to produce anything but a bootstrap plan - an applied baseline is rejected outright", async () => {
+// Item 9 (ADR 0005): buildPlanV2 covers both baseline modes now - the
+// bootstrap-only guard this used to test is gone. Mirrors plan.test.mjs's
+// own "no-op: re-planning an untouched, fully-observed host changes
+// nothing" convention: baseline and desiredRendered come from the exact
+// SAME rendered topology (buildPlanV2 never re-renders desiredRendered
+// itself with a bumped generation - that's plan-command.mjs's/apply.mjs's
+// own job, done before calling in), so a genuine no-op needs no separate
+// re-render just to prove the applied path produces a real, schema-valid
+// plan-v2 document.
+test("a genuine applied plan-v2 no-op document is schema-valid, mode: applied, with no recovery field and the baseline's own installationId/generation", async () => {
+  const validate = await planV2Validator();
   const { contracts, rendered } = await fixture();
-  const appliedBaseline = { mode: "applied", installationId: "inst-1", generation: 5, ...topologyToServiceState(rendered, contracts.catalog), generatedArtifacts: {} };
-  assert.throws(
-    () => buildPlanV2({ ...bootstrapOptions({ baseline: appliedBaseline }), desiredRendered: rendered, manifest: contracts.manifest, releaseLock: contracts.releaseLock, catalog: contracts.catalog }),
-    /only ever produces a bootstrap plan.*applied-mode reconciliation is a later delivery item/s,
+  const installationId = "00000000-0000-0000-0000-000000000000"; // this file's own fixture() renders with this fixed id
+  const baseline = { mode: "applied", installationId, generation: 5, ...topologyToServiceState(rendered, contracts.catalog), generatedArtifacts: {} };
+
+  const resources = Object.entries(baseline.services).flatMap(([service, definition]) =>
+    definition.enabled
+      ? Object.entries(definition.units).map(([unit, entry]) => ({ service, unit, artifact: entry.artifact, image: entry.image, state: "running", managed: true, installationId }))
+      : [],
   );
+  const asResourceRecord = (name, kind) => ({ resource: name, name, managed: true, installationId, kind, composeProject: "hof" });
+  const observation = {
+    containersStatus: "available", resources,
+    volumesStatus: "available", volumes: baseline.volumes.map((name) => asResourceRecord(name, "volume")),
+    networksStatus: "available", networks: baseline.networks.map((name) => asResourceRecord(name, "network")),
+    generatedArtifactsStatus: "available", generatedArtifacts: {},
+  };
+
+  const plan = buildPlanV2({
+    baseline, desiredRendered: rendered, manifest: contracts.manifest, releaseLock: contracts.releaseLock, catalog: contracts.catalog,
+    observation, repairDrift: false,
+    target: { mode: "ssh", host: "hof.example.com", port: 22, user: "deploy", hostKeySha256: "SHA256:abcdefgh" },
+  });
+
+  assert.ok(validate(plan), JSON.stringify(validate.errors));
+  assert.equal(plan.mode, "applied");
+  assert.equal(plan.executable, true, plan.blockers.join("\n"));
+  assert.deepEqual(plan.summary, { create: 0, update: 0, remove: 0, migrate: 0 });
+  assert.deepEqual(plan.target, {
+    mode: "ssh", host: "hof.example.com", port: 22, user: "deploy", hostKeySha256: "SHA256:abcdefgh",
+    installationId, baselineGeneration: 5,
+  });
+  assert.ok(!("recovery" in plan), "an applied plan never carries a recovery field - the schema forbids it");
 });
 
 test("refuses a bootstrap plan with no recovery age recipient at all", async () => {

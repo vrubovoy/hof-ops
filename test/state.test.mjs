@@ -99,6 +99,7 @@ test("emptyBaseline is the synthetic bootstrap baseline", () => {
     mode: "bootstrap", generation: 0, release: null, installationId: null,
     manifestDigest: null, releaseLockDigest: null, topologyDigest: null,
     services: {}, volumes: [], networks: [], generatedArtifacts: {},
+    retainedServices: {}, suppliedTlsCertificateFingerprint: null, suppliedTlsPrivateKeyFingerprint: null,
   });
 });
 
@@ -355,6 +356,42 @@ test("resolveBaseline: a saved generation with no recorded generatedArtifacts de
   };
   const baseline = resolveBaseline({ managedState, catalog: contracts.catalog, observation: available });
   assert.deepEqual(baseline.generatedArtifacts, {});
+});
+
+// Item 9 (ADR 0005): a 2026-08-31 review found resolveBaseline()'s own
+// topologyToServiceState() call never threaded current.json's own
+// recorded supplied-TLS fingerprint through at all - the baseline's
+// gateway configFingerprint was always computed as if suppliedTls were
+// absent, while buildPlan's own desired-side call gets the real, fresh
+// fingerprint. That would have shown a spurious gateway diff on EVERY
+// plan against a supplied-TLS installation, even a genuine no-op -
+// breaking the no-op invariant for any real supplied-TLS deployment.
+test("resolveBaseline threads the recorded supplied-TLS fingerprint into the baseline's own gateway configFingerprint - a no-op stays a no-op for a supplied-TLS installation", async () => {
+  const contracts = await loadContracts();
+  const rendered = renderTopology(contracts);
+  const certificateFingerprint = "sha256:" + "1".repeat(64);
+  const privateKeyFingerprint = "sha256:" + "2".repeat(64);
+  const withFingerprint = topologyToServiceState(rendered, contracts.catalog, { suppliedTlsCertificateFingerprint: certificateFingerprint, suppliedTlsPrivateKeyFingerprint: privateKeyFingerprint });
+  const withoutFingerprint = topologyToServiceState(rendered, contracts.catalog);
+  assert.notEqual(
+    withFingerprint.services.tor.units.gateway.configFingerprint,
+    withoutFingerprint.services.tor.units.gateway.configFingerprint,
+    "fixture assumption: folding a supplied-TLS fingerprint into the gateway's own hash must actually change it",
+  );
+
+  const managedState = {
+    current: {
+      generation: 3, installationId: "inst-1", topologyDigest: withFingerprint.topologyDigest,
+      suppliedTlsCertificateFingerprint: certificateFingerprint, suppliedTlsPrivateKeyFingerprint: privateKeyFingerprint,
+    },
+    topology: rendered,
+  };
+  const baseline = resolveBaseline({ managedState, catalog: contracts.catalog, observation: available });
+  assert.equal(baseline.services.tor.units.gateway.configFingerprint, withFingerprint.services.tor.units.gateway.configFingerprint);
+  assert.notEqual(
+    baseline.services.tor.units.gateway.configFingerprint, withoutFingerprint.services.tor.units.gateway.configFingerprint,
+    "without threading the recorded fingerprint through, every plan against this installation would show a spurious gateway diff",
+  );
 });
 
 test("resolveBaseline: refuses managed state whose recorded topologyDigest doesn't match its own saved topology.json", async () => {

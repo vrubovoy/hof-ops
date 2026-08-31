@@ -16,6 +16,7 @@ export function emptyBaseline() {
     mode: "bootstrap", generation: 0, release: null, installationId: null,
     manifestDigest: null, releaseLockDigest: null, topologyDigest: null,
     services: {}, volumes: [], networks: [], generatedArtifacts: {},
+    retainedServices: {}, suppliedTlsCertificateFingerprint: null, suppliedTlsPrivateKeyFingerprint: null,
   };
 }
 
@@ -38,13 +39,24 @@ const FINGERPRINT_EXCLUDED_LABELS = new Set(["hof.installation-id", "hof.generat
 // a real diff even when the pinned image tag didn't move. The gateway
 // unit additionally folds in the rendered Caddyfile, since that's the
 // one generated artifact a Compose service definition alone doesn't
-// capture at all (it's a bind-mounted file, not an env var).
-function unitConfigFingerprint(definition, unit, rendered) {
+// capture at all (it's a bind-mounted file, not an env var) - and, item
+// 9 (ADR 0005), the supplied TLS certificate/private-key fingerprint:
+// Caddy only ever references a FIXED target-side path for a supplied
+// certificate, never its content, so the Caddyfile's own text stays
+// byte-identical across a real certificate rotation - without folding
+// the fingerprint in here too, a workstation-side cert/key swap with no
+// other config change would be invisible to this whole diff, exactly
+// the "rotation looks like a no-op" gap a further review found.
+function unitConfigFingerprint(definition, unit, rendered, suppliedTlsFingerprint) {
   const stableLabels = definition.labels
     ? Object.fromEntries(Object.entries(definition.labels).filter(([key]) => !FINGERPRINT_EXCLUDED_LABELS.has(key)))
     : definition.labels;
   const stableDefinition = { ...definition, labels: stableLabels };
-  return sha256(Buffer.from(stableStringify({ definition: stableDefinition, caddyfile: unit === "gateway" ? rendered.caddyfile : undefined })));
+  return sha256(Buffer.from(stableStringify({
+    definition: stableDefinition,
+    caddyfile: unit === "gateway" ? rendered.caddyfile : undefined,
+    suppliedTls: unit === "gateway" ? suppliedTlsFingerprint : undefined,
+  })));
 }
 
 // topologyToServiceState() is handed either a freshly rendered
@@ -86,7 +98,14 @@ function assertRenderedShape(rendered) {
 // from the live files) can supply them; a baseline loaded from a past
 // topology.json doesn't have the original files to hash, and trusts
 // current.json's own recorded digests instead (see resolveBaseline).
-export function topologyToServiceState(rendered, catalog, { manifest, releaseLock } = {}) {
+// suppliedTlsCertificateFingerprint/suppliedTlsPrivateKeyFingerprint
+// (item 9, ADR 0005): only ever given for the DESIRED side (a fresh
+// read+hash of the operator's own certificate/private-key files right
+// now, exactly like buildPlanV2's own top-level suppliedTls already
+// does) - a baseline loaded from a past current.json trusts its own
+// recorded value instead (see resolveBaseline), the same manifestDigest/
+// releaseLockDigest pattern this function already established.
+export function topologyToServiceState(rendered, catalog, { manifest, releaseLock, suppliedTlsCertificateFingerprint, suppliedTlsPrivateKeyFingerprint } = {}) {
   assertRenderedShape(rendered);
   const enabledIds = new Set(rendered.topology.enabledServices);
   const services = {};
@@ -99,11 +118,14 @@ export function topologyToServiceState(rendered, catalog, { manifest, releaseLoc
     if (service.database) services[service.id].schemaVersion = rendered.topology.databaseSchemas?.[service.id]?.to ?? null;
   }
 
+  const suppliedTlsFingerprint = suppliedTlsCertificateFingerprint !== undefined || suppliedTlsPrivateKeyFingerprint !== undefined
+    ? { certificateFingerprint: suppliedTlsCertificateFingerprint ?? null, privateKeyFingerprint: suppliedTlsPrivateKeyFingerprint ?? null }
+    : undefined;
   for (const [unit, definition] of Object.entries(rendered.compose.services)) {
     const serviceId = definition.labels?.["hof.service"];
     const artifactId = definition.labels?.["hof.artifact"];
     if (!serviceId || !artifactId || !services[serviceId]) continue;
-    services[serviceId].units[unit] = { artifact: artifactId, image: definition.image, configFingerprint: unitConfigFingerprint(definition, unit, rendered) };
+    services[serviceId].units[unit] = { artifact: artifactId, image: definition.image, configFingerprint: unitConfigFingerprint(definition, unit, rendered, suppliedTlsFingerprint) };
   }
 
   return {
@@ -122,6 +144,8 @@ export function topologyToServiceState(rendered, catalog, { manifest, releaseLoc
     // (stateless infrastructure) - plan.mjs still needs to know what's
     // expected to tell "recreate this" apart from "this was never ours".
     networks: Object.keys(rendered.compose.networks).sort(),
+    suppliedTlsCertificateFingerprint: suppliedTlsCertificateFingerprint ?? null,
+    suppliedTlsPrivateKeyFingerprint: suppliedTlsPrivateKeyFingerprint ?? null,
   };
 }
 
@@ -175,7 +199,21 @@ export function resolveBaseline({ managedState, catalog, observation }) {
   }
 
   if (current) {
-    const serviceState = topologyToServiceState(topology, catalog);
+    // Item 9 (ADR 0005): the baseline's own gateway configFingerprint
+    // must be recomputed with the SAME supplied-TLS fingerprint that was
+    // actually current when this generation was committed - otherwise
+    // every single plan against a supplied-TLS installation would show a
+    // spurious gateway diff (baseline computed as if suppliedTls were
+    // absent, desired computed with the real, current fingerprint),
+    // breaking the no-op invariant for any installation using supplied
+    // TLS at all. A real certificate/key rotation still registers as a
+    // genuine diff: buildPlan's own desired-side topologyToServiceState
+    // call is given the FRESH fingerprint read off disk at planning
+    // time, not this recorded one.
+    const serviceState = topologyToServiceState(topology, catalog, {
+      suppliedTlsCertificateFingerprint: current.suppliedTlsCertificateFingerprint ?? undefined,
+      suppliedTlsPrivateKeyFingerprint: current.suppliedTlsPrivateKeyFingerprint ?? undefined,
+    });
     // current.json's own recorded topologyDigest should always match a
     // fresh recompute from the topology.json saved alongside it - if it
     // doesn't, the state directory was corrupted or hand-edited after
@@ -186,6 +224,16 @@ export function resolveBaseline({ managedState, catalog, observation }) {
         "state directory is corrupt or was hand-edited, cannot compute a baseline",
       );
     }
+    // Item 9 (ADR 0005): a retained service's own volume is deliberately
+    // folded in here, not just left to serviceState.volumes above -
+    // topologyToServiceState() only ever derives volumes from the
+    // rendered Compose (a disabled service renders no volume at all), so
+    // without this a retained-but-currently-disabled service's own real,
+    // still-existing volume would look "missing" to computeMissingResources
+    // the moment it's no longer mounted by a running container, even
+    // though it was never actually removed.
+    const retainedServices = current.retainedServices ?? {};
+    const volumes = [...new Set([...serviceState.volumes, ...Object.values(retainedServices).map((entry) => entry.volume)])].sort();
     return {
       mode: "applied",
       generation: current.generation,
@@ -198,9 +246,12 @@ export function resolveBaseline({ managedState, catalog, observation }) {
       topologyDigest: serviceState.topologyDigest,
       release: serviceState.release,
       services: serviceState.services,
-      volumes: serviceState.volumes,
+      volumes,
       networks: serviceState.networks,
       generatedArtifacts: current.generatedArtifacts ?? {},
+      retainedServices,
+      suppliedTlsCertificateFingerprint: current.suppliedTlsCertificateFingerprint ?? null,
+      suppliedTlsPrivateKeyFingerprint: current.suppliedTlsPrivateKeyFingerprint ?? null,
     };
   }
 

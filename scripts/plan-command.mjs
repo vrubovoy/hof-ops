@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // hofctl plan - the last piece of delivery item 7's read-only path
 // (validate -> preflight -> plan). Wires the already-landed pure pieces
-// (buildPlan/resolveBaseline/inspectTarget) into one real CLI flow:
+// (buildPlanV2/resolveBaseline/inspectTarget) into one real CLI flow:
 // validate the deployment contracts exactly like `hofctl validate` does
 // (including the release lock's real Cosign signature - never
 // skippable here, unlike validate), inspect the target exactly once,
@@ -10,31 +10,21 @@
 // installation/generation semantics, and print exactly one plan
 // document to stdout. Never writes anything, anywhere.
 //
-// A BOOTSTRAP target prints a real plan-v2 document (item 8, PR #31
-// fix) - the exact same buildPlanV2() `hofctl apply` itself recomputes
-// and requires --approve-plan-id/--plan to match byte-for-byte; before
-// this fix, plan printed plan-v1 while apply independently required
-// approval of a structurally different plan-v2 document, so a real
-// `hofctl plan` run's own planId could never be the ID apply actually
-// needed (see PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry). An
-// APPLIED target (item 9, applied-mode reconciliation, doesn't exist
-// yet - hofctl apply only ever supports a bootstrap plan, see ADR 0004)
-// still prints the historical plan-v1 shape, informational only - there
-// is nothing for a v2 plan to be approved for yet on an already-applied
-// host.
+// Always prints a real plan-v2 document, for EITHER baseline mode (item
+// 9, ADR 0005) - the exact same buildPlanV2() `hofctl apply` itself
+// recomputes and requires --approve-plan-id/--plan to match byte-for-
+// byte. A BOOTSTRAP target has done this since item 8 (PR #31 fix - see
+// PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry for why plan-v1 could
+// never satisfy that on its own); an APPLIED target used to print the
+// historical, informational-only plan-v1 shape instead, since item 9
+// didn't exist yet to give it anything to be approved FOR - now it does.
+// plan-v1/buildPlan() (the pure core buildPlanV2 wraps) stay unchanged,
+// still directly schema-tested on their own in plan.test.mjs.
 //
 // Deliberately its own module, not folded into hofctl.mjs, matching
 // every other subcommand's own file (render-topology.mjs, preflight.mjs,
 // validate-deployment.mjs) - hofctl.mjs stays a thin dispatcher.
 
-import { readFile } from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
-import Ajv2020 from "ajv/dist/2020.js";
-import addFormats from "ajv-formats";
-
-import { buildPlan } from "./plan.mjs";
 import { buildPlanV2, planV2Validator } from "./plan-v2.mjs";
 import { checkManagedStateReadable, observationFromSnapshot } from "./preflight.mjs";
 import { renderTopology } from "./render-topology.mjs";
@@ -42,8 +32,6 @@ import { resolveBaseline } from "./state.mjs";
 import { readSuppliedTlsMaterial } from "./supplied-tls.mjs";
 import { inspectTarget } from "./target-inspector.mjs";
 import { loadAndValidateDeployment } from "./validate-deployment.mjs";
-
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 // A plan is computed entirely in memory and never actually applied, so
 // there is no real installation yet to name on a bootstrap host - a
@@ -53,17 +41,6 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // installationId is assigned once, for real, by a future `hofctl apply`
 // - this value is never written anywhere.
 export const BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER = "00000000-0000-0000-0000-000000000000";
-
-let compiledPlanValidator;
-async function planValidator() {
-  compiledPlanValidator ??= await (async () => {
-    const ajv = new Ajv2020({ allErrors: true, strict: true });
-    addFormats(ajv);
-    const schema = JSON.parse(await readFile(path.join(root, "schemas/plan-v1.schema.json"), "utf8"));
-    return ajv.compile(schema);
-  })();
-  return compiledPlanValidator;
-}
 
 // Every way runPlan() can end without a plan at all - always a single
 // human-readable diagnostic line plus a short machine-stable `reason`
@@ -157,59 +134,29 @@ export async function runPlan(options) {
     return blocked("state", error instanceof Error ? error.message : String(error));
   }
 
-  if (baseline.mode === "bootstrap") {
-    // Step 5v2: the exact same plan-v2 document `hofctl apply` itself
-    // recomputes and requires --approve-plan-id/--plan to match. Target
-    // binding, recovery recipient, and supplied-TLS fingerprint mirror
-    // apply.mjs's own identical derivation exactly - a real value here,
-    // not a caller-suppliable override, is what makes an operator-
-    // approved planId actually mean something (see ADR 0004).
-    let suppliedTls;
-    try {
-      suppliedTls = await readSuppliedTlsMaterial(manifest, catalog);
-    } catch (error) {
-      return blocked("tls", error instanceof Error ? error.message : String(error));
-    }
-    if (!options.recoveryAgeRecipient) {
-      return blocked("recovery", "--recovery-age-recipient is required (a bootstrap plan always needs one, see ADR 0004)");
-    }
-
-    const generation = 1;
-    let desiredRendered;
-    try {
-      desiredRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId: BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER, generation });
-    } catch (error) {
-      return blocked("render", error instanceof Error ? error.message : String(error));
-    }
-
-    let plan;
-    try {
-      plan = buildPlanV2({
-        baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift: options.repairDrift ?? false,
-        target: { mode: targetMode, host, port, user, hostKeySha256: snapshot.transport.trustDigest },
-        recoveryAgeRecipient: options.recoveryAgeRecipient,
-        suppliedTlsCertificateFingerprint: suppliedTls?.certificateFingerprint,
-        suppliedTlsPrivateKeyFingerprint: suppliedTls?.privateKeyFingerprint,
-      });
-    } catch (error) {
-      return blocked("plan", error instanceof Error ? error.message : String(error));
-    }
-
-    const validatePlanV2 = await planV2Validator();
-    if (!validatePlanV2(plan)) {
-      return blocked("internal", `buildPlanV2 produced a result that does not satisfy schemas/plan-v2.schema.json: ${JSON.stringify(validatePlanV2.errors)}`);
-    }
-
-    return { blocked: false, plan };
+  // Step 5v2: the exact same plan-v2 document `hofctl apply` itself
+  // recomputes and requires --approve-plan-id/--plan to match, for
+  // EITHER baseline mode (item 9, ADR 0005 - no plan-v3, no informational
+  // plan-v1 branch anymore; buildPlan()/plan-v1.schema.json stay as the
+  // pure core buildPlanV2 wraps, directly schema-tested on their own in
+  // plan.test.mjs). Target binding and supplied-TLS fingerprint mirror
+  // apply.mjs's own identical derivation exactly - a real value here,
+  // not a caller-suppliable override, is what makes an operator-
+  // approved planId actually mean something (see ADR 0004). Supplied TLS
+  // is read for an applied target too now - a certificate/key rotation
+  // with no other config change must be a real, planned diff (ADR 0005).
+  let suppliedTls;
+  try {
+    suppliedTls = await readSuppliedTlsMaterial(manifest, catalog);
+  } catch (error) {
+    return blocked("tls", error instanceof Error ? error.message : String(error));
+  }
+  if (baseline.mode === "bootstrap" && !options.recoveryAgeRecipient) {
+    return blocked("recovery", "--recovery-age-recipient is required (a bootstrap plan always needs one, see ADR 0004)");
   }
 
-  // baseline.mode === "applied": item 9 (applied-mode reconciliation)
-  // doesn't exist yet, and hofctl apply only ever supports a bootstrap
-  // plan (ADR 0004) - there is nothing for a v2 plan to be approved for
-  // on an already-applied host. Stays the historical plan-v1 shape,
-  // informational only.
-  const installationId = baseline.installationId;
-  const generation = baseline.generation + 1;
+  const installationId = baseline.mode === "bootstrap" ? BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER : baseline.installationId;
+  const generation = baseline.mode === "bootstrap" ? 1 : baseline.generation + 1;
   let desiredRendered;
   try {
     desiredRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId, generation });
@@ -217,16 +164,22 @@ export async function runPlan(options) {
     return blocked("render", error instanceof Error ? error.message : String(error));
   }
 
-  // Step 6: buildPlan() itself - the pure core, unchanged by this CLI.
-  const plan = buildPlan({ baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift: options.repairDrift ?? false });
+  let plan;
+  try {
+    plan = buildPlanV2({
+      baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift: options.repairDrift ?? false,
+      target: { mode: targetMode, host, port, user, hostKeySha256: snapshot.transport.trustDigest },
+      recoveryAgeRecipient: options.recoveryAgeRecipient,
+      suppliedTlsCertificateFingerprint: suppliedTls?.certificateFingerprint,
+      suppliedTlsPrivateKeyFingerprint: suppliedTls?.privateKeyFingerprint,
+    });
+  } catch (error) {
+    return blocked("plan", error instanceof Error ? error.message : String(error));
+  }
 
-  // Step 7: the plan this command is about to print must itself satisfy
-  // its own published contract - an internal bug in buildPlan (or a
-  // schema edited out of sync with it) must never reach a caller as a
-  // plan-shaped object that isn't actually plan-v1.
-  const validate = await planValidator();
-  if (!validate(plan)) {
-    return blocked("internal", `buildPlan produced a result that does not satisfy schemas/plan-v1.schema.json: ${JSON.stringify(validate.errors)}`);
+  const validatePlanV2 = await planV2Validator();
+  if (!validatePlanV2(plan)) {
+    return blocked("internal", `buildPlanV2 produced a result that does not satisfy schemas/plan-v2.schema.json: ${JSON.stringify(validatePlanV2.errors)}`);
   }
 
   return { blocked: false, plan };

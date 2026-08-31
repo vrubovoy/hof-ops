@@ -4,13 +4,28 @@
 // (a genuine sudo-enabled ephemeral container, real noclobber exclusive
 // create, a real atomic rename) is covered separately by
 // test/apply-acceptance.mjs (`pnpm test:apply-ssh`), not reproduced
-// here.
+// here. ONE deliberate exception below (the orphaned-hard-link
+// regression test): a further, 2026-08-31 review found a real
+// filesystem/inode-level corruption path that only a genuine `sh`
+// execution against a real scratch directory can actually exercise -
+// capture the real script acquireLockAndJournal() would send over SSH
+// (via the same mockRun() capture every other test here already uses),
+// path-substitute the real /var/lib/hof/state prefix for a scratch
+// directory, and run that exact script for real. Never touches the
+// real target path, needs no root.
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { link, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import { acquireLock, acquireLockAndJournal, appendEvent, readCurrentState, readEvents, readJournal, readLock, readTopology, releaseLock, updateJournalStatus, writeJournal } from "../scripts/target-mutate.mjs";
+
+const exec = promisify(execFile);
 
 const FAKE_PUBKEY_B64 = "AAAAC3NzaC1lZDI1NTE5AAAAIKPZsomeFakeButValidBase64Blob==";
 const HOST_KEY_SHA256 = "SHA256:" + createHash("sha256").update(Buffer.from(FAKE_PUBKEY_B64, "base64")).digest("base64").replace(/=+$/, "");
@@ -114,6 +129,53 @@ test("acquireLockAndJournal: a structurally-impossible journal conflict (lock ab
     () => acquireLockAndJournal({ ...SSH_TARGET, run }, { operationId: OPERATION_ID }, { operationId: OPERATION_ID }),
     /structurally impossible/,
   );
+});
+
+test("acquireLockAndJournal: an orphaned hard-linked temp file left by a crashed prior attempt never corrupts an already-live lock", async () => {
+  // A further, 2026-08-31 review found the fixed `targetPath.tmp` name
+  // this used to reuse was itself a real corruption path: if a PRIOR,
+  // crashed attempt's own `ln` had already succeeded but its own `rm`
+  // never ran (dying in exactly that gap), the fixed tmp name and the
+  // real lock.json were left as two hard links to the SAME inode - a
+  // LATER attempt's own `printf ... > lock.json.tmp` would then
+  // truncate that shared inode, corrupting the already-live lock, even
+  // though the later attempt's own `ln` would (correctly) then refuse
+  // with EEXIST. Fixed with a genuinely unique `mktemp` name every
+  // call, plus an opportunistic cleanup of any orphaned prior one.
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-lock-atomicity-"));
+  try {
+    const lockDoc = { apiVersion: "hof.dev/operation-lock/v1", operationId: OPERATION_ID };
+    const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "in-progress" };
+    const first = mockRun({ sshStdout: "HOF_MUTATE_CREATED\n" });
+    await acquireLockAndJournal({ ...SSH_TARGET, run: first.run }, lockDoc, journalDoc);
+    const firstScript = first.calls.find((c) => c.command === "ssh").input.replaceAll("/var/lib/hof/state", scratchDir);
+    await exec("sh", ["-c", firstScript]);
+
+    const lockPath = path.join(scratchDir, "lock.json");
+    assert.equal(await readFile(lockPath, "utf8"), JSON.stringify(lockDoc));
+
+    // Simulate the exact crash state: an orphaned tmp hard-linked to
+    // the now-live lock.json (what a crashed prior attempt's own
+    // successful `ln`, followed by a death before its own `rm`, would
+    // leave behind).
+    await link(lockPath, `${lockPath}.aB3xY9`);
+
+    // A brand new attempt, a different operationId - must never corrupt
+    // the still-live lock via the shared inode, and must clean the
+    // orphan up along the way.
+    const lockDoc2 = { apiVersion: "hof.dev/operation-lock/v1", operationId: "22222222-2222-2222-2222-222222222222" };
+    const journalDoc2 = { apiVersion: "hof.dev/operation-journal/v1", operationId: "22222222-2222-2222-2222-222222222222", status: "in-progress" };
+    const second = mockRun({ sshStdout: "HOF_MUTATE_CREATED\n" });
+    await acquireLockAndJournal({ ...SSH_TARGET, run: second.run }, lockDoc2, journalDoc2);
+    const secondScript = second.calls.find((c) => c.command === "ssh").input.replaceAll("/var/lib/hof/state", scratchDir);
+    await exec("sh", ["-c", secondScript]);
+
+    assert.equal(await readFile(lockPath, "utf8"), JSON.stringify(lockDoc), "the live lock must still be the ORIGINAL operation's own document, never overwritten via the shared-inode orphan");
+    const remaining = await readdir(scratchDir);
+    assert.ok(!remaining.some((name) => name.startsWith("lock.json.") && name !== "lock.json"), `no stray lock tmp files should remain: ${remaining.join(", ")}`);
+  } finally {
+    await rm(scratchDir, { recursive: true, force: true });
+  }
 });
 
 test("readLock: present/unreadable/absent all parse distinctly", async () => {

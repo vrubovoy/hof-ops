@@ -390,6 +390,30 @@ test("a genuine, approved, signature-verified bootstrap apply runs every operati
   assert.ok(events.some((event) => event.type === "apply.committed"));
 });
 
+test("a normal (non-resume) successful commit whose final lock release fails is reported blocked, never silently blocked: false", async () => {
+  // A further, 2026-08-31 review found this exact path - the ordinary,
+  // non-resume successful-commit case, not the resume-side succeeded
+  // fast path PR #46 already fixed - still discarded releaseLock()'s
+  // own return value outright (`await m.releaseLock(...)`, no check at
+  // all).
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({
+    mutate, inspect: async () => cleanSnapshot(),
+    dockerRun: async () => ({ stdout: "", stderr: "" }),
+  });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  mutate.releaseLock = async () => { throw new Error("simulated transport failure"); };
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lock");
+  assert.match(result.diagnostics[0], /committed successfully.*lock could not be confirmed released/s);
+  // The operation itself genuinely did succeed - the journal is still
+  // marked succeeded, real state that must never be silently undone
+  // just because the final cleanup step couldn't be confirmed.
+  assert.equal(mutate.state.journals.size, 1);
+  assert.equal([...mutate.state.journals.values()][0].status, "succeeded");
+});
+
 test("state.commit's own extra-vars carry the real commit generation (1, for a bootstrap)", async () => {
   const mutate = makeFakeMutate();
   const seen = [];
@@ -1145,7 +1169,68 @@ test("resume: a later plan step has recorded events while an earlier one has non
   const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
   assert.equal(result.blocked, true);
   assert.equal(result.reason, "resume");
-  assert.match(result.diagnostics[0], /not a valid prefix of the plan's own dispatch order/);
+  assert.match(result.diagnostics[0], /out of the plan's own dispatch order/);
+});
+
+test("resume: a later step's own fully-resolved events appearing in the raw stream entirely BEFORE an earlier step's is refused, even though neither step's own history has a gap", async () => {
+  // A further, 2026-08-31 review found the gap check above still missed
+  // this: both steps have events, neither individual step's own history
+  // is malformed, so both the gap check and the per-step physical-order
+  // check pass - only walking the RAW stream's own cross-step order
+  // catches it.
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const inputDigests = await realInputDigests();
+  const operationId = "77777777-8888-8888-8888-888888888888";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+  const [stepA, stepB] = plan.operations; // stepA comes before stepB in the plan's own real order
+  mutate.state.events.set(operationId, [
+    // stepB's own events, fully resolved, appear FIRST in the file -
+    // stepA's own don't even begin until after.
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: stepB.id, attempt: 1, phase: "started", at: "2026-08-27T09:00:00Z" },
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: stepB.id, attempt: 1, phase: "succeeded", at: "2026-08-27T09:00:01Z" },
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: stepA.id, attempt: 1, phase: "started", at: "2026-08-27T09:00:02Z" },
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: stepA.id, attempt: 1, phase: "succeeded", at: "2026-08-27T09:00:03Z" },
+  ]);
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /out of the plan's own dispatch order/);
+});
+
+test("resume: two steps' own events genuinely interleaved in the raw stream is refused, even though each step's own isolated history looks fine", async () => {
+  // A.started, B.started, B.succeeded, A.succeeded - a real run's own
+  // dispatch loop can never produce this (it never starts step B until
+  // step A has already resolved), but neither the per-step physical-
+  // order check (each step's OWN filtered sub-list is still internally
+  // [started, succeeded], in order) nor the old gap check (both steps
+  // have events) would have caught it.
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const inputDigests = await realInputDigests();
+  const operationId = "77777777-9999-9999-9999-999999999999";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+  const [stepA, stepB] = plan.operations;
+  mutate.state.events.set(operationId, [
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: stepA.id, attempt: 1, phase: "started", at: "2026-08-27T09:00:00Z" },
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: stepB.id, attempt: 1, phase: "started", at: "2026-08-27T09:00:01Z" },
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: stepB.id, attempt: 1, phase: "succeeded", at: "2026-08-27T09:00:02Z" },
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: stepA.id, attempt: 1, phase: "succeeded", at: "2026-08-27T09:00:03Z" },
+  ]);
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /out of the plan's own dispatch order|don't resolve to a genuine success/);
 });
 
 test("--plan pointing at a schema-valid file whose own planId doesn't match its own content is refused, not trusted", async () => {

@@ -34,7 +34,26 @@
       "description": "Filename -> sha256 for every file hofctl render produced (compose.yml, Caddyfile, service.env, ...) - lets a drift check notice a generated file was hand-edited after the fact.",
       "type": "object",
       "additionalProperties": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
-    }
+    },
+    "retainedServices": {
+      "description": "Item 9 (ADR 0005): a persistent service disabled with dataRetention: retain, keyed by service id - its own volume name and the schema version it was last migrated to, carried forward so a later re-enable reuses the same volume and never re-runs a migration against data already at the current schema. Optional and absent (never merely {}) on state written before this item, and on any installation that has never retained a service - resolveBaseline() treats a missing key the same as {}.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["volume", "schemaVersion"],
+        "properties": {
+          "volume": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
+          "schemaVersion": { "type": "integer", "minimum": 0 },
+          "retainedAt": {
+            "description": "When this entry was first written - carried forward unchanged on every later commit that still retains the same service; set fresh only the one commit that actually disables it. Optional: plan.mjs's own pure planning core never reads the clock, so a freshly-planned retain entry has no value here yet - apply.mjs fills it in at real commit time.",
+            "type": "string", "format": "date-time"
+          }
+        }
+      }
+    },
+    "suppliedTlsCertificateFingerprint": { "$ref": "#/$defs/digestOrNull" },
+    "suppliedTlsPrivateKeyFingerprint": { "$ref": "#/$defs/digestOrNull" }
   },
   "$defs": {
     "digestOrNull": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" }

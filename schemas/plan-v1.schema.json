@@ -97,6 +97,20 @@
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/digestOrNull" }
     },
+    "retainedServices": {
+      "description": "Item 9 (ADR 0005): a persistent service disabled with dataRetention: retain, keyed by service id. baseline.retainedServices is what was actually committed; desired.retainedServices is what the planner computes WILL be committed if this plan runs (baseline's own map carried forward, minus any service re-enabled by this plan, plus any newly disabled-with-retain) - not itself something services.yml/the catalog/the release lock render to, but the one place a real apply's own state.commit reads what to write.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["volume", "schemaVersion"],
+        "properties": {
+          "volume": { "$ref": "#/$defs/identifier" },
+          "schemaVersion": { "type": "integer", "minimum": 0 },
+          "retainedAt": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
     "baselineState": {
       "description": "The last-applied state this plan is diffing from - either loaded from /var/lib/hof/state, or the synthetic empty baseline (mode: bootstrap, generation: 0, installationId: null) on a truly clean host.",
       "type": "object",
@@ -116,7 +130,10 @@
         "services": { "$ref": "#/$defs/services" },
         "volumes": { "$ref": "#/$defs/volumes" },
         "networks": { "$ref": "#/$defs/volumes" },
-        "generatedArtifacts": { "$ref": "#/$defs/generatedArtifacts" }
+        "generatedArtifacts": { "$ref": "#/$defs/generatedArtifacts" },
+        "retainedServices": { "$ref": "#/$defs/retainedServices" },
+        "suppliedTlsCertificateFingerprint": { "$ref": "#/$defs/digestOrNull" },
+        "suppliedTlsPrivateKeyFingerprint": { "$ref": "#/$defs/digestOrNull" }
       }
     },
     "desiredState": {
@@ -131,7 +148,10 @@
         "topologyDigest": { "$ref": "#/$defs/digestOrNull" },
         "services": { "$ref": "#/$defs/services" },
         "volumes": { "$ref": "#/$defs/volumes" },
-        "networks": { "$ref": "#/$defs/volumes" }
+        "networks": { "$ref": "#/$defs/volumes" },
+        "retainedServices": { "$ref": "#/$defs/retainedServices" },
+        "suppliedTlsCertificateFingerprint": { "$ref": "#/$defs/digestOrNull" },
+        "suppliedTlsPrivateKeyFingerprint": { "$ref": "#/$defs/digestOrNull" }
       }
     },
     "driftEntry": {

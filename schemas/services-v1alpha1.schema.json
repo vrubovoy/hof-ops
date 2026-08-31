@@ -128,7 +128,11 @@
       "additionalProperties": false,
       "required": ["enabled"],
       "properties": {
-        "enabled": { "type": "boolean" }
+        "enabled": { "type": "boolean" },
+        "dataRetention": {
+          "description": "Item 9 (ADR 0005): required by the planner - not by this schema alone, which only ever validates its presence when given - whenever an already-enabled, persistent (database-owning) service transitions to disabled; never required merely for existing, and never required for a service that was never enabled. The only value defined so far - a later item's own explicit decision adds a way to actually purge retained data; there is deliberately no such value yet.",
+          "enum": ["retain"]
+        }
       }
     },
     "backupDestination": {

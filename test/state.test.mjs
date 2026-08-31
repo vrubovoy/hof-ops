@@ -47,6 +47,48 @@ test("a real current.json record satisfies schemas/state-v1.schema.json", async 
   assert.ok(validate(record), JSON.stringify(validate.errors));
 });
 
+// Item 9 (ADR 0005): retainedServices/suppliedTls*Fingerprint are new,
+// optional fields - a real generation-1 current.json written before
+// this item (the test above, unmodified) must stay valid with neither
+// field present at all, and a real applied current.json carrying both
+// must also validate.
+test("state-v1 accepts retainedServices and suppliedTls*Fingerprint when present, optional otherwise", async () => {
+  const ajv = new Ajv2020({ allErrors: true, strict: true });
+  addFormats(ajv);
+  const { readFile } = await import("node:fs/promises");
+  const validate = ajv.compile(JSON.parse(await readFile(path.join(root, "schemas/state-v1.schema.json"), "utf8")));
+
+  const base = {
+    apiVersion: "hof.dev/state/v1",
+    installationId: "3b1f6c2e-6e35-4f7a-9c3b-000000000000",
+    generation: 3,
+    lastSuccessfulOperationId: "operation-3",
+    appliedAt: "2026-08-27T10:00:00Z",
+    release: "0.1.1",
+    manifestDigest: "sha256:" + "1".repeat(64),
+    releaseLockDigest: "sha256:" + "2".repeat(64),
+    catalogDigest: "sha256:" + "3".repeat(64),
+    composeTemplateDigest: "sha256:" + "4".repeat(64),
+    topologyDigest: "sha256:" + "5".repeat(64),
+    generatedArtifacts: {},
+  };
+  assert.ok(validate(base), "a document with neither new field present must still validate - backward readability");
+
+  const withNewFields = {
+    ...base,
+    retainedServices: { kuvert: { volume: "kuvert-backend-data", schemaVersion: 1, retainedAt: "2026-08-30T00:00:00Z" } },
+    suppliedTlsCertificateFingerprint: "sha256:" + "8".repeat(64),
+    suppliedTlsPrivateKeyFingerprint: "sha256:" + "9".repeat(64),
+  };
+  assert.ok(validate(withNewFields), JSON.stringify(validate.errors));
+
+  const withNullFingerprints = { ...base, suppliedTlsCertificateFingerprint: null, suppliedTlsPrivateKeyFingerprint: null };
+  assert.ok(validate(withNullFingerprints), JSON.stringify(validate.errors));
+
+  const missingVolume = { ...base, retainedServices: { kuvert: { schemaVersion: 1 } } };
+  assert.equal(validate(missingVolume), false, "retainedServices entries require volume+schemaVersion - retainedAt alone is optional, the other two are not");
+});
+
 // A real current.json is only ever validated against state-v1.schema.json
 // by target-inspector.mjs (see target-inspector.test.mjs's own
 // generation-0-is-invalid coverage) - generation 0 is exclusively the

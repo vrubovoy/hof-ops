@@ -3,9 +3,16 @@
   ansible.builtin.assert:
     that:
       - hof_operation_id is not none
+      - hof_service_action in ["start", "stop", "remove"]
       - hof_service_unit is not none
+    fail_msg: "service role requires hof_operation_id, hof_service_action (start|stop|remove), hof_service_unit - never invoked without them"
+
+- name: Assert start's own required variables are present
+  when: hof_service_action == "start"
+  ansible.builtin.assert:
+    that:
       - hof_service_image is not none
-    fail_msg: "service role requires hof_operation_id, hof_service_unit, hof_service_image - never invoked without them"
+    fail_msg: "service role's start action additionally requires hof_service_image"
 
 # --no-deps: scoped strictly to this one unit, exactly like this role's
 # own defaults/main.yml comment promises - every OTHER unit that needs
@@ -15,6 +22,7 @@
 # an earlier operation in this same plan - Compose must use exactly
 # that, never silently fetch something else at this stage.
 - name: Start this one Compose unit
+  when: hof_service_action == "start"
   ansible.builtin.command:
     argv:
       - docker
@@ -27,4 +35,70 @@
       - --pull
       - "never"
       - "{{ hof_service_unit }}"
+  changed_when: true
+
+# Item 9 (ADR 0005): stop/remove - applied-mode-only, never invoked for
+# a bootstrap plan (bootstrap-actions.mjs's own whitelist has no
+# service.stop/service.remove at all). Discovery is deliberately
+# stricter than readiness's own 2-filter lookup (see
+# ansible/roles/readiness/tasks/main.yml): a mutating operation must
+# never touch a foreign installation's same-named unit, so it filters
+# on ALL FOUR of hof.managed=true, this exact installationId, this
+# exact unit, AND the Compose project - never just the project+service
+# pair readiness already trusts (that pair alone can't distinguish two
+# DIFFERENT installations' same-named unit on a shared host, a real
+# scenario a mutating operation must never risk).
+- name: "{{ hof_service_action }}: find the exact container this unit's own labels identify"
+  when: hof_service_action in ["stop", "remove"]
+  ansible.builtin.command:
+    argv:
+      - docker
+      - ps
+      - --all
+      - -q
+      - --filter
+      - "label=hof.managed=true"
+      - --filter
+      - "label=hof.installation-id={{ hof_installation_id }}"
+      - --filter
+      - "label=hof.unit={{ hof_service_unit }}"
+      - --filter
+      - "label=com.docker.compose.project=hof"
+  register: hof_service_discovery
+  changed_when: false
+
+# Zero matches is idempotent success (nothing to do - a repeated
+# stop/remove of an already-gone container, or a resumed operation that
+# already completed). More than one match is corruption (two containers
+# somehow carry the exact same hof.managed + installationId + unit +
+# project identity at once) - a hard failure, never guessed at.
+- name: "{{ hof_service_action }}: more than one match is corruption - refuse rather than guess"
+  when: hof_service_action in ["stop", "remove"] and hof_service_discovery.stdout_lines | length > 1
+  ansible.builtin.fail:
+    msg: >-
+      {{ hof_service_discovery.stdout_lines | length }} containers matched hof.managed=true,
+      hof.installation-id={{ hof_installation_id }}, hof.unit={{ hof_service_unit }}, and Compose
+      project hof for a {{ hof_service_action }} operation - exactly zero or one is expected; this
+      is corruption, not guessed at
+
+- name: Stop the exact discovered container
+  when: hof_service_action == "stop" and hof_service_discovery.stdout_lines | length == 1
+  ansible.builtin.command:
+    argv:
+      - docker
+      - stop
+      - "{{ hof_service_discovery.stdout_lines[0] }}"
+  changed_when: true
+
+# Never `compose down` (project-wide, would touch every other unit too)
+# and never a volume removal of any kind - item 9's own retain-only
+# removal contract (ADR 0005) means the volume is never Ansible's
+# concern here at all; it is simply left exactly as it is.
+- name: Remove the exact discovered container (never compose down, never a project-wide command, never touches its volume)
+  when: hof_service_action == "remove" and hof_service_discovery.stdout_lines | length == 1
+  ansible.builtin.command:
+    argv:
+      - docker
+      - rm
+      - "{{ hof_service_discovery.stdout_lines[0] }}"
   changed_when: true

@@ -10,7 +10,11 @@
 # a directory apply.mjs wrote the real current.json/topology.json
 # content into (see schemas/state-v1.schema.json and state.mjs's own
 # assertRenderedShape for their two very different shapes) - mounted
-# read-only, once, for this one operation.
+# read-only, once, for this one operation. Item 9 (ADR 0005): the same
+# directory also carries release-lock.json - the exact release lock
+# this commit was applied under - used only for this role's own
+# immutable per-generation snapshot (generations/NNNNNN/*), never for
+# the two pointer files themselves.
 hof_operation_id: null
 hof_state_generation: null
 hof_state_dir: null

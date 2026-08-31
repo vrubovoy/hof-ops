@@ -94,6 +94,28 @@ test("a host-key change alone produces a different planId - the exact ADR 0004 p
   assert.notEqual(planA.planId, planB.planId);
 });
 
+// Item 9 (ADR 0005): schema-level forward-compat only - a real bootstrap
+// plan (this test's own fixture) never carries these fields at all
+// (buildPlan/buildPlanV2 don't emit them until the planner itself gains
+// applied-mode support, plan.test.mjs's own job), but the schema must
+// already accept a document that does, since a real applied plan will.
+test("plan-v2 schema accepts baseline.retainedServices and baseline/desired suppliedTls*Fingerprint when present", async () => {
+  const validate = await planV2Validator();
+  const { contracts, rendered } = await fixture();
+  const plan = buildPlanV2({ ...bootstrapOptions(), desiredRendered: rendered, manifest: contracts.manifest, releaseLock: contracts.releaseLock, catalog: contracts.catalog });
+  const withNewFields = {
+    ...plan,
+    baseline: {
+      ...plan.baseline,
+      retainedServices: { kuvert: { volume: "kuvert-backend-data", schemaVersion: 1, retainedAt: "2026-08-30T00:00:00Z" } },
+      suppliedTlsCertificateFingerprint: "sha256:" + "8".repeat(64),
+      suppliedTlsPrivateKeyFingerprint: "sha256:" + "9".repeat(64),
+    },
+    desired: { ...plan.desired, suppliedTlsCertificateFingerprint: "sha256:" + "8".repeat(64), suppliedTlsPrivateKeyFingerprint: "sha256:" + "9".repeat(64) },
+  };
+  assert.ok(validate(withNewFields), JSON.stringify(validate.errors));
+});
+
 test("planId is deterministic for identical inputs, including the target binding", async () => {
   const { contracts, rendered } = await fixture();
   const base = { desiredRendered: rendered, manifest: contracts.manifest, releaseLock: contracts.releaseLock, catalog: contracts.catalog };

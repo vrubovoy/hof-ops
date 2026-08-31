@@ -9,6 +9,22 @@ test("repository contract examples are valid", async () => {
   assert.deepEqual(validateContracts(contracts), []);
 });
 
+// Item 9 (ADR 0005): schema-level acceptance only - the planner's own
+// "required exactly when a persistent service transitions from enabled
+// to disabled" rule is plan.mjs's own job (see plan.test.mjs), not this
+// schema's.
+test("dataRetention: retain is a valid, optional service-selection field", async () => {
+  const contracts = structuredClone(await loadContracts());
+  contracts.manifest.services.kuvert.dataRetention = "retain";
+  assert.deepEqual(validateContracts(contracts), []);
+});
+
+test("dataRetention rejects any value other than \"retain\" - there is deliberately no way to express purge yet", async () => {
+  const contracts = structuredClone(await loadContracts());
+  contracts.manifest.services.kuvert.dataRetention = "purge";
+  assert.match(validateContracts(contracts).join("\n"), /services\.yml/);
+});
+
 test("browser push requires Glocke", async () => {
   const contracts = structuredClone(await loadContracts());
   contracts.manifest.services.glocke.enabled = false;

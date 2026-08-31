@@ -152,6 +152,18 @@ test("operation-journal-v1: rejects committedGeneration: 0 - a bootstrap always 
   assert.equal(validate(journalFixture({ status: "succeeded", committedGeneration: 0 })), false);
 });
 
+// Item 9 (ADR 0005): the same journal schema now serves an applied
+// commit too, which can land at any positive generation (baseline.generation
+// + 1) - relaxed back from a brief const: 1 (bootstrap-only, item 8's
+// own scope) once this item needed it. A bootstrap always committing
+// exactly 1 is enforced by apply.mjs itself now, not this schema.
+test("operation-journal-v1: accepts any positive committedGeneration once succeeded - not just 1", async () => {
+  const validate = await validatorFor("operation-journal-v1.schema.json");
+  for (const generation of [1, 2, 5, 42]) {
+    assert.ok(validate(journalFixture({ status: "succeeded", committedGeneration: generation })), `generation ${generation}: ${JSON.stringify(validate.errors)}`);
+  }
+});
+
 // A further, 2026-08-31 review found the status/committedGeneration
 // pairing this schema's own `status` property description already
 // documented ("succeeded... committedGeneration is then always set")

@@ -122,10 +122,21 @@ export async function loadAndValidateDeployment(options) {
     readJson(path.join(root, "schemas/stable-channel-v1.schema.json")),
   ]);
 
-  let manifest, catalog, catalogBytes, releaseLock, releaseLockBytes;
+  // Every one of these three now captures the EXACT bytes this one read
+  // parsed - manifest previously went through readYaml() (bytes read,
+  // then discarded), and every caller needing a digest of its own
+  // (apply.mjs's own journal inputDigests, in particular) used to
+  // independently re-read the same path a second time afterward. A
+  // further, 2026-08-31 review found that real TOCTOU: a file edited on
+  // the workstation between this read and that later one could mean
+  // planning happened against one version of a file while the journal
+  // recorded a digest of a different one. Returning the bytes this read
+  // actually parsed closes it by construction - nothing after this
+  // point ever reads any of these three files again.
+  let manifest, servicesBytes, catalog, catalogBytes, releaseLock, releaseLockBytes;
   try {
-    [manifest, [catalog, catalogBytes], [releaseLock, releaseLockBytes]] = await Promise.all([
-      readYaml(options.servicesPath),
+    [[manifest, servicesBytes], [catalog, catalogBytes], [releaseLock, releaseLockBytes]] = await Promise.all([
+      readFile(options.servicesPath).then((bytes) => [YAML.parse(bytes.toString("utf8")), bytes]),
       readFile(options.catalogPath).then((bytes) => [YAML.parse(bytes.toString("utf8")), bytes]),
       readFile(options.releaseLockPath).then((bytes) => [JSON.parse(bytes.toString("utf8")), bytes]),
     ]);
@@ -161,7 +172,7 @@ export async function loadAndValidateDeployment(options) {
     errors.push(...await verifyReleaseLockSignature(options.releaseLockPath, releaseLockBytes, options));
   }
 
-  return { errors, manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema };
+  return { errors, manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, servicesBytes, catalogBytes, releaseLockBytes, composeTemplateBytes };
 }
 
 // The original, narrower shape (`validate`'s own CLI still only ever

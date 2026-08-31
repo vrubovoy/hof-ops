@@ -44,9 +44,9 @@
   },
   "allOf": [
     {
-      "description": "The status/committedGeneration pairing this schema's own prose above already documents, actually enforced - a 2026-08-31 review found the invariant was prose-only, so a schema-valid but self-contradictory document (succeeded with committedGeneration still null; in-progress or failed with one already set) would have been silently accepted.",
+      "description": "The status/committedGeneration pairing this schema's own prose above already documents, actually enforced - a 2026-08-31 review found the invariant was prose-only, so a schema-valid but self-contradictory document (succeeded with committedGeneration still null; in-progress or failed with one already set) would have been silently accepted. committedGeneration is pinned to the literal value 1, not merely any positive integer - item 8's own scope (ADR 0004) is bootstrap-only, and a bootstrap always commits generation 1; a further, 2026-08-31 review found this schema still permitted any integer >= 1 despite that.",
       "if": { "properties": { "status": { "const": "succeeded" } } },
-      "then": { "properties": { "committedGeneration": { "type": "integer" } } },
+      "then": { "properties": { "committedGeneration": { "const": 1 } } },
       "else": { "properties": { "committedGeneration": { "type": "null" } } }
     }
   ],

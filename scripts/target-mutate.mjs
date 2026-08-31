@@ -168,27 +168,89 @@ fi
 `;
 }
 
-function acquireLockAndJournalScript(lockPayload, journalTargetPath, journalPayload) {
+// Every script that touches lock.json's own critical section (create or
+// release) runs inside this same target-side flock - a further,
+// 2026-08-31 review found releaseLock()'s own grep-then-rm was a real
+// compare-and-delete race without it: another releaser removing the
+// same lock, and a brand new apply acquiring the NEXT one, could both
+// land in the tiny window between one releaser's own grep and its rm,
+// making it delete a completely unrelated, currently-live lock. The
+// flock is held only for the duration of the ONE script process that
+// takes it (fd 9, opened and locked here, released automatically when
+// that script's shell exits) - no persistent session is needed across
+// separate SSH round trips for this to serialize them against each
+// other.
+function withLockGuard(criticalSection) {
   return `set -eu
-lock_payload='${lockPayload}'
-journal_payload='${journalPayload}'
-mkdir -p "$(dirname '${LOCK_PATH}')"
-mkdir -p "$(dirname '${journalTargetPath}')"
+mkdir -p "$(dirname '${LOCK_GUARD_PATH}')"
 umask 077
-if (set -C; printf '%s' "$lock_payload" | base64 -d > '${LOCK_PATH}') 2>/dev/null; then
-  if (set -C; printf '%s' "$journal_payload" | base64 -d > '${journalTargetPath}') 2>/dev/null; then
-    echo HOF_MUTATE_CREATED
-  else
-    echo HOF_MUTATE_JOURNAL_CONFLICT
-    rm -f '${LOCK_PATH}'
-  fi
+exec 9>'${LOCK_GUARD_PATH}'
+flock -x 9
+${criticalSection}
+`;
+}
+
+// Atomically creates targetPath with the exact given payload, or leaves
+// it untouched and reports failure if it already exists - writes the
+// FULL content to a fresh temp file in the same directory first, then
+// `ln`s (never `mv`s) it into place: `ln` fails outright with EEXIST
+// rather than silently overwriting, and - unlike the plain `set -C; ...
+// > targetPath` redirection this used to be - never exposes a partial
+// or empty file at targetPath at any point (a `>` redirection opens and
+// truncates/creates the destination the instant the shell parses it,
+// before the writing pipeline even runs). A further, 2026-08-31 review
+// found that old form left exactly that window open: a crash of the
+// remote script mid-transfer (a dropped connection, an OOM-kill, a
+// power loss) could leave a truncated lock or journal file behind. Only
+// safe to call from within a script already holding the lock guard
+// above (a fixed temp filename is reused across calls, safe only under
+// that same mutual exclusion).
+function atomicExclusiveCreateStep(targetPath, payloadVar, resultVar) {
+  return `mkdir -p "$(dirname '${targetPath}')"
+${resultVar}_tmp='${targetPath}.tmp'
+printf '%s' "$${payloadVar}" | base64 -d > "$${resultVar}_tmp"
+if ln "$${resultVar}_tmp" '${targetPath}' 2>/dev/null; then
+  rm -f "$${resultVar}_tmp"
+  ${resultVar}=1
 else
+  rm -f "$${resultVar}_tmp"
+  ${resultVar}=0
+fi`;
+}
+
+// Creates the journal FIRST, then the lock - the reverse of this
+// module's own original order. A further, 2026-08-31 review found the
+// original lock-then-journal order still left a real (if much smaller)
+// window: even bundled into one remote script, a crash strictly inside
+// that script's own execution, between the lock's own create and the
+// journal's, left a lock with no journal - exactly the state resume had
+// no recovery path for. Journal-first makes that state structurally
+// unreachable through the normal path instead: by the time the lock
+// (the sole real exclusivity gate - the journal's own path is already
+// unique per fresh operationId, no exclusivity of its own is needed for
+// correctness) is ever observed present, the journal it names is
+// GUARANTEED to already have been durably created, in this exact same
+// script, moments earlier. If the lock step still somehow fails (target
+// already locked by another operation), the just-created journal is
+// rolled back - it was never actually claimed by anything.
+function acquireLockAndJournalScript(lockPayload, journalTargetPath, journalPayload) {
+  return withLockGuard(`lock_payload='${lockPayload}'
+journal_payload='${journalPayload}'
+${atomicExclusiveCreateStep(journalTargetPath, "journal_payload", "journal_created")}
+if [ "$journal_created" != 1 ]; then
+  echo HOF_MUTATE_JOURNAL_CONFLICT
+  exit 0
+fi
+${atomicExclusiveCreateStep(LOCK_PATH, "lock_payload", "lock_created")}
+if [ "$lock_created" = 1 ]; then
+  echo HOF_MUTATE_CREATED
+else
+  rm -f '${journalTargetPath}'
   echo HOF_MUTATE_EXISTS
   if [ -r '${LOCK_PATH}' ]; then
     cat '${LOCK_PATH}'
   fi
-fi
-`;
+fi`);
 }
 
 function readScript(targetPath) {
@@ -220,6 +282,7 @@ function parseReadResponse(stdout) {
 }
 
 const LOCK_PATH = "/var/lib/hof/state/lock.json";
+const LOCK_GUARD_PATH = "/var/lib/hof/state/lock.flock";
 const CURRENT_STATE_PATH = "/var/lib/hof/state/current.json";
 const TOPOLOGY_PATH = "/var/lib/hof/state/topology.json";
 const journalPath = (operationId) => `/var/lib/hof/state/journal/${validateOperationId(operationId)}.json`;
@@ -235,6 +298,13 @@ const eventsPath = (operationId) => `/var/lib/hof/state/journal/${validateOperat
 // same operationId - a resume" from "held by someone else - refuse")
 // when the target is already locked. Never throws for the ordinary
 // "already locked" case - only for a genuine transport/protocol failure.
+// No longer used by apply.mjs's own live path (superseded by
+// acquireLockAndJournal() below) - kept for its own narrow test
+// coverage and as a documented building block. Deliberately NOT wrapped
+// in the flock guard acquireLockAndJournal()/releaseLock() share (there
+// is nothing else touching lock.json for it to race against once it's
+// no longer part of the live path) - a future caller reintroducing this
+// into any real code path would need to add that back.
 export async function acquireLock(conn, lockDocument) {
   const stdout = await runScript(conn, exclusiveCreateScript(LOCK_PATH, b64(lockDocument)));
   const result = parseCreateResponse(stdout);
@@ -244,22 +314,20 @@ export async function acquireLock(conn, lockDocument) {
 // Creates the lock AND the journal as ONE remote script invocation - a
 // single SSH round trip, not two - so there is no window between them
 // where the LOCAL apply.mjs process itself (not the SSH session) could
-// crash after the lock is durably created but before the journal write
-// is even issued (a real gap a further, 2026-08-31 review found: a
-// resume then reads a lock referencing an operationId whose journal
-// genuinely doesn't exist yet, and had nothing to do but refuse
-// forever). The remote script itself creates the journal only once the
-// lock create has already succeeded, and rolls the lock back if the
-// journal create then somehow still fails (structurally this should be
-// impossible - journalDocument.operationId is always a fresh
-// randomUUID, so no journal file at that exact path can already exist -
-// but a script that can't happen is not the same as a script that
-// doesn't check). A crash strictly inside the remote script's own
-// execution (between its two file creates) remains possible in
-// principle, same as any single remote command - not something a
-// client-side reordering could ever fully close - but it's the same
-// class of risk every other single-runScript call in this module
-// already carries, not a new one this function introduces.
+// crash after one is durably created but before the other is even
+// issued (a real gap a further, 2026-08-31 review found: a resume then
+// reads a lock referencing an operationId whose journal genuinely
+// doesn't exist yet, and had nothing to do but refuse forever). The
+// remote script itself (see acquireLockAndJournalScript()'s own
+// comment) creates the JOURNAL first, then the lock, atomically -
+// rolling the journal back if the lock step then fails (target already
+// locked by another operation). A further, 2026-08-31 review found even
+// the single-round-trip, lock-then-journal version of this still left a
+// real (if much smaller) window: a crash strictly inside the remote
+// script's own execution, between its two creates, could leave a lock
+// with no journal. Journal-first removes that specific window
+// structurally, not just probabilistically - see the script's own
+// comment for why.
 export async function acquireLockAndJournal(conn, lockDocument, journalDocument) {
   const stdout = await runScript(conn, acquireLockAndJournalScript(b64(lockDocument), journalPath(journalDocument.operationId), b64(journalDocument)));
   const [tag, ...rest] = stdout.split("\n");
@@ -278,17 +346,21 @@ export async function readLock(conn) {
 // Only ever removes the lock when it's still owned by operationId - a
 // defense-in-depth check even though this is control-plane code, not
 // adversarial input (the lock could, in principle, already have been
-// hand-removed and replaced by a stuck operator's manual recovery).
+// hand-removed and replaced by a stuck operator's manual recovery). The
+// check-then-delete itself is still two shell statements, not one atomic
+// syscall - safe against a genuine compare-and-delete race (a different
+// releaser removing this exact lock, and a brand new apply acquiring
+// the NEXT one, both landing between this grep and this rm) only
+// because it now runs inside the SAME target-side flock
+// acquireLockAndJournal() takes - see withLockGuard()'s own comment.
 export async function releaseLock(conn, operationId) {
-  const script = `set -eu
-op='${validateOperationId(operationId)}'
+  const script = withLockGuard(`op='${validateOperationId(operationId)}'
 if [ -r '${LOCK_PATH}' ] && grep -qF "\\"operationId\\":\\"$op\\"" '${LOCK_PATH}'; then
   rm -f '${LOCK_PATH}'
   echo HOF_MUTATE_RELEASED
 else
   echo HOF_MUTATE_MISMATCH
-fi
-`;
+fi`);
   const stdout = await runScript(conn, script);
   const tag = stdout.split("\n")[0];
   if (tag === "HOF_MUTATE_RELEASED") return { released: true };

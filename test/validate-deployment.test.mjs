@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { validateDeployment } from "../scripts/validate-deployment.mjs";
+import YAML from "yaml";
+
+import { loadAndValidateDeployment, validateDeployment } from "../scripts/validate-deployment.mjs";
+import { sha256 } from "../scripts/digest.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 const examplesServices = path.join(root, "examples/services.yml");
@@ -119,4 +122,28 @@ test("surfaces a readable error when a required file is simply missing", async (
   const errors = await validateDeployment(baseOptions({ servicesPath: path.join(root, "does-not-exist.yml") }));
   assert.equal(errors.length, 1);
   assert.match(errors[0], /could not read services\.yml\/catalog\/release-lock/);
+});
+
+// loadAndValidateDeployment() now returns the exact bytes each of
+// manifest/catalog/releaseLock/render-topology.mjs was parsed from - a
+// further, 2026-08-31 review found apply.mjs used to independently
+// re-read all four a second time afterward, just for their digests, a
+// real TOCTOU (a file edited on the workstation between the two reads
+// could mean planning happened against different content than the
+// journal ends up recording a digest of). These bytes must genuinely be
+// what was parsed, not merely present.
+test("returns the exact bytes each of manifest/catalog/releaseLock/composeTemplate was actually parsed from", async () => {
+  const result = await loadAndValidateDeployment(baseOptions());
+  assert.deepEqual(YAML.parse(result.servicesBytes.toString("utf8")), result.manifest);
+  assert.deepEqual(YAML.parse(result.catalogBytes.toString("utf8")), result.catalog);
+  assert.deepEqual(JSON.parse(result.releaseLockBytes.toString("utf8")), result.releaseLock);
+  // Independently re-read here (this IS the one legitimate place a
+  // second read belongs - a test asserting the bytes are honest, not
+  // production code trusting them blindly) and cross-checked against
+  // the release lock's own composeTemplateDigest, which loadAndValidateDeployment()
+  // already validated composeTemplateBytes against internally.
+  const { readFile } = await import("node:fs/promises");
+  const composeTemplatePath = path.join(root, "scripts/render-topology.mjs");
+  assert.deepEqual(result.composeTemplateBytes, await readFile(composeTemplatePath));
+  assert.equal(sha256(result.composeTemplateBytes), result.releaseLock.composeTemplateDigest);
 });

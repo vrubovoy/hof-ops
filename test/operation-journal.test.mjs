@@ -188,6 +188,25 @@ test("decideStepResumption: a next attempt after an earlier attempt that already
   ]), "corrupted");
 });
 
+// The exact case a further, 2026-08-31 review named directly: counting
+// phases per attempt alone (the previous implementation) still trusted
+// this - one "started", one "succeeded", both present - even though a
+// real, healthy run can only ever append "started" BEFORE its own
+// attempt's resolution, never after.
+test("decideStepResumption: a succeeded event appearing in the file BEFORE its own attempt's started is corrupted, not treated as a genuine pair", () => {
+  assert.equal(decideStepResumption([
+    { phase: "succeeded", attempt: 1 },
+    { phase: "started", attempt: 1 },
+  ]), "corrupted");
+});
+
+test("decideStepResumption: an earlier attempt's own event appearing in the file AFTER a later attempt's is corrupted (attempt numbers never decrease in append order)", () => {
+  assert.equal(decideStepResumption([
+    { phase: "started", attempt: 2 },
+    { phase: "started", attempt: 1 },
+  ]), "corrupted");
+});
+
 test("assertJournalResumable refuses an already-succeeded journal", () => {
   assert.throws(
     () => assertJournalResumable({ operationId: "x", status: "succeeded", committedGeneration: 1 }),

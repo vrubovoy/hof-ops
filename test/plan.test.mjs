@@ -6,6 +6,7 @@ import test from "node:test";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 
+import { validateAppliedActions } from "../scripts/applied-actions.mjs";
 import { loadContracts } from "../scripts/contracts.mjs";
 import { buildPlan } from "../scripts/plan.mjs";
 import { renderTopology } from "../scripts/render-topology.mjs";
@@ -197,30 +198,79 @@ test("topology change: enabling a previously-disabled service creates its own un
   assert.ok(!plan.operations.some((o) => o.action === "database.migrate" && o.resource !== "schrank-backend"));
 });
 
-test("topology change: disabling a multi-unit service creates exactly one backup for its shared volume, stops and removes every one of its units", async () => {
+// Item 9 (ADR 0005): disabling a persistent service without
+// dataRetention: retain is a blocker, not a quiet delete.
+test("topology change: disabling a persistent service without dataRetention: retain is a blocker, never a silent delete", async () => {
   const before = await fixture();
   const baseline = baselineFrom(before.rendered, before.contracts.catalog, 4);
 
   const after = await fixture((contracts) => { contracts.manifest.services.kuvert.enabled = false; });
   const plan = buildDesired({ baseline, rendered: after.rendered, contracts: after.contracts, observation: observedMatching(baseline) });
 
+  assert.equal(plan.executable, false);
+  assert.ok(plan.blockers.some((b) => b.includes("kuvert") && b.includes("dataRetention: retain")), plan.blockers.join("\n"));
+});
+
+test("topology change: disabling a multi-unit persistent service WITH dataRetention: retain stops and removes every unit, never backs up, never touches the volume, and records retainedServices", async () => {
+  const before = await fixture();
+  const baseline = baselineFrom(before.rendered, before.contracts.catalog, 4);
+
+  const after = await fixture((contracts) => {
+    contracts.manifest.services.kuvert.enabled = false;
+    contracts.manifest.services.kuvert.dataRetention = "retain";
+  });
+  const plan = buildDesired({ baseline, rendered: after.rendered, contracts: after.contracts, observation: observedMatching(baseline) });
+
+  assert.equal(plan.executable, true, plan.blockers.join("\n"));
   assert.equal(plan.summary.remove, 2);
-  const backups = plan.operations.filter((o) => o.action === "backup.create" && o.resource === "kuvert-data");
-  assert.equal(backups.length, 1, "one backup per removed SERVICE, not one per removed unit");
+  assert.ok(!plan.operations.some((o) => o.action === "backup.create"), "item 9 never backs anything up on removal (ADR 0005) - backup.create isn't even in the applied whitelist");
   for (const unit of ["kuvert-backend", "kuvert-frontend"]) {
     assert.ok(plan.operations.some((o) => o.action === "service.stop" && o.resource === unit), `${unit} stopped`);
     assert.ok(plan.operations.some((o) => o.action === "service.remove" && o.resource === unit), `${unit} actually removed, not left running`);
   }
   assert.ok(!plan.operations.some((o) => o.action === "volume.ensure" && o.resource === "kuvert-data"), "the volume itself is never touched - never destroyed");
+  assert.deepEqual(plan.desired.retainedServices.kuvert, { volume: "kuvert-data", schemaVersion: baseline.services.kuvert.schemaVersion });
 
-  // Ordering within the removal: every unit is stopped first, the shared
-  // backup happens once after all stops, and removal happens only after
-  // the backup - never remove-before-backup.
+  // Ordering: every unit is stopped before config.write regenerates the
+  // topology, and removal happens only after that.
   const lastStop = plan.operations.findLastIndex((o) => o.action === "service.stop" && (o.resource === "kuvert-backend" || o.resource === "kuvert-frontend"));
-  const backupIndex = plan.operations.findIndex((o) => o.action === "backup.create" && o.resource === "kuvert-data");
+  const configWriteIndex = plan.operations.findIndex((o) => o.action === "config.write");
   const firstRemove = plan.operations.findIndex((o) => o.action === "service.remove" && (o.resource === "kuvert-backend" || o.resource === "kuvert-frontend"));
-  assert.ok(lastStop < backupIndex, "every unit stopped before the shared backup runs");
-  assert.ok(backupIndex < firstRemove, "backup completes before any unit is actually removed");
+  assert.ok(lastStop < configWriteIndex, "every unit stopped before config.write regenerates the topology");
+  assert.ok(configWriteIndex < firstRemove, "config.write completes before any unit is actually removed");
+});
+
+test("a stateless service's own removal needs no dataRetention at all - there's no database to retain", async () => {
+  const before = await fixture();
+  const baseline = baselineFrom(before.rendered, before.contracts.catalog, 4);
+
+  const after = await fixture((contracts) => { contracts.manifest.services.wachter.enabled = false; });
+  const plan = buildDesired({ baseline, rendered: after.rendered, contracts: after.contracts, observation: observedMatching(baseline) });
+
+  assert.equal(plan.executable, true, plan.blockers.join("\n"));
+  assert.equal(plan.desired.retainedServices.wachter, undefined);
+});
+
+test("re-enabling a retained service reuses the same volume (no volume.ensure), skips its migration when the retained schema already matches, and drops it from retainedServices", async () => {
+  const before = await fixture();
+  const baseline = {
+    ...baselineFrom(before.rendered, before.contracts.catalog, 5),
+    retainedServices: { kuvert: { volume: "kuvert-data", schemaVersion: before.rendered.topology.databaseSchemas.kuvert.to } },
+  };
+  // The baseline's own services.kuvert reads disabled (it was retained,
+  // not currently enabled) - matches what a real resolveBaseline() would
+  // load after a retain-disable actually committed.
+  baseline.services.kuvert = { enabled: false, units: {}, schemaVersion: null };
+
+  const after = await fixture(); // kuvert re-enabled (the repo's own default), no dataRetention needed to re-enable
+  const observation = observedMatching(baseline); // baseline.services.kuvert is disabled above - nothing observed for it either
+  const plan = buildDesired({ baseline, rendered: after.rendered, contracts: after.contracts, observation });
+
+  assert.equal(plan.executable, true, plan.blockers.join("\n"));
+  assert.equal(plan.summary.create, 2); // kuvert-backend + kuvert-frontend
+  assert.equal(plan.summary.migrate, 0, "a retained re-enable at the already-current schema needs no migration");
+  assert.ok(!plan.operations.some((o) => o.action === "volume.ensure" && o.resource === "kuvert-data"), "the retained volume is reused, never recreated");
+  assert.equal(plan.desired.retainedServices.kuvert, undefined, "no longer retained once re-enabled");
 });
 
 test("topology change: re-planning after a disable has already been applied is a true no-op - removed units don't linger as orphan drift", async () => {
@@ -492,6 +542,66 @@ test("generated-file drift: a non-Caddyfile file (e.g. compose.yml) never trigge
   assert.ok(!plan.operations.some((o) => o.resource === "gateway"));
 });
 
+// Item 9 (ADR 0005): Caddy references a FIXED target-side file path for
+// a supplied certificate, never its content - the Caddyfile's own
+// rendered text is byte-identical across a real certificate rotation,
+// so without folding the fingerprint itself into the gateway's own
+// configFingerprint, a cert/key swap would be invisible to this whole
+// diff. baseline and desired are built from the exact SAME rendered
+// topology here (only the fingerprint option differs) - proving the
+// gateway restart is caused by the fingerprint alone, nothing else.
+test("supplied TLS: a certificate/key rotation with no other config change plans a real gateway restart, never a silent no-op", async () => {
+  const { contracts, rendered } = await fixture();
+  const oldCert = "sha256:" + "a".repeat(64);
+  const oldKey = "sha256:" + "b".repeat(64);
+  const newCert = "sha256:" + "c".repeat(64);
+  const newKey = "sha256:" + "d".repeat(64);
+
+  const baseline = {
+    mode: "applied", generation: 4, installationId: "inst-1", generatedArtifacts: {},
+    ...topologyToServiceState(rendered, contracts.catalog, { suppliedTlsCertificateFingerprint: oldCert, suppliedTlsPrivateKeyFingerprint: oldKey }),
+  };
+  const observation = observedMatching(baseline);
+
+  const plan = buildPlan({
+    baseline, desiredRendered: rendered, manifest: contracts.manifest, releaseLock: contracts.releaseLock,
+    catalog: contracts.catalog, observation,
+    suppliedTlsCertificateFingerprint: newCert, suppliedTlsPrivateKeyFingerprint: newKey,
+  });
+
+  assert.equal(plan.executable, true, plan.blockers.join("\n"));
+  assert.ok(plan.operations.some((o) => o.action === "service.stop" && o.resource === "gateway"), "a supplied TLS rotation restarts the gateway");
+  assert.ok(plan.operations.some((o) => o.action === "service.start" && o.resource === "gateway"));
+  // Nothing else changed - only the gateway's own unit is touched.
+  assert.equal(plan.summary.update, 1);
+  assert.equal(plan.summary.create, 0);
+  assert.equal(plan.summary.remove, 0);
+  assert.equal(plan.summary.migrate, 0);
+  assert.equal(plan.desired.suppliedTlsCertificateFingerprint, newCert);
+  assert.equal(plan.desired.suppliedTlsPrivateKeyFingerprint, newKey);
+});
+
+test("supplied TLS: an unchanged fingerprint is a genuine no-op, no gateway restart", async () => {
+  const { contracts, rendered } = await fixture();
+  const cert = "sha256:" + "a".repeat(64);
+  const key = "sha256:" + "b".repeat(64);
+
+  const baseline = {
+    mode: "applied", generation: 4, installationId: "inst-1", generatedArtifacts: {},
+    ...topologyToServiceState(rendered, contracts.catalog, { suppliedTlsCertificateFingerprint: cert, suppliedTlsPrivateKeyFingerprint: key }),
+  };
+  const observation = observedMatching(baseline);
+
+  const plan = buildPlan({
+    baseline, desiredRendered: rendered, manifest: contracts.manifest, releaseLock: contracts.releaseLock,
+    catalog: contracts.catalog, observation,
+    suppliedTlsCertificateFingerprint: cert, suppliedTlsPrivateKeyFingerprint: key,
+  });
+
+  assert.deepEqual(plan.summary, { create: 0, update: 0, remove: 0, migrate: 0 });
+  assert.deepEqual(plan.operations, []);
+});
+
 test("observation unavailable: an applied host refuses to plan changes blind", async () => {
   const { contracts, rendered } = await fixture();
   const baseline = baselineFrom(rendered, contracts.catalog, 1);
@@ -537,7 +647,14 @@ test("buildPlan requires an explicit observation - never defaults to 'nothing is
   );
 });
 
-test("upgrade: a schema version bump on an otherwise-unchanged service triggers exactly its own migration, with a backup first", async () => {
+// Item 9 (ADR 0005): this scenario predates item 9 - it used to plan a
+// real in-place migration with a backup first, back when an applied
+// plan was informational-only (plan-v1) and never actually approved or
+// executed. Now that an applied plan is real and executable, a bare
+// schema version bump on an already-enabled service - with no
+// accompanying release change - is upgrade scope, out of item 9
+// entirely (items 10-11's job): a blocker, not a plan.
+test("upgrade: a schema version bump on an already-enabled, otherwise-unchanged service is an upgrade-scope blocker, not a migration", async () => {
   const { contracts, rendered } = await fixture();
   const baseline = baselineFrom(rendered, contracts.catalog, 1);
   const bumped = structuredClone(rendered);
@@ -548,33 +665,32 @@ test("upgrade: a schema version bump on an otherwise-unchanged service triggers 
     catalog: contracts.catalog, observation: observedMatching(baseline),
   });
 
-  assert.equal(plan.summary.migrate, 1);
-  assert.equal(plan.summary.create, 0);
-  assert.equal(plan.summary.update, 1, "the migrated unit still needs a stop/start cycle even with no image change");
-  const migration = plan.operations.find((o) => o.action === "database.migrate");
-  assert.equal(migration.resource, "kuvert-backend");
-  assert.deepEqual(migration.schema, { from: 1, to: 2, rollbackCompatible: true });
-  assert.equal(migration.reason, "schema version changed");
-  assert.ok(plan.operations.some((o) => o.action === "backup.create" && o.resource === "kuvert-data"), "an in-place upgrade migration backs up first");
-  const stopIndex = plan.operations.findIndex((o) => o.action === "service.stop" && o.resource === "kuvert-backend");
-  const backupIndex = plan.operations.findIndex((o) => o.action === "backup.create" && o.resource === "kuvert-data");
-  const migrateIndex = plan.operations.findIndex((o) => o.action === "database.migrate");
-  assert.ok(stopIndex < backupIndex && backupIndex < migrateIndex, "stop, then backup, then migrate");
+  assert.equal(plan.executable, false);
+  assert.ok(plan.blockers.some((blocker) => blocker.includes("kuvert") && blocker.includes("schema version change") && blocker.includes("items 10-11")), plan.blockers.join("\n"));
+  assert.ok(!plan.operations.some((o) => o.action === "backup.create"), "backup.create isn't even in item 9's own applied whitelist - never generated for a blocked upgrade");
 });
 
-test("upgrade: a rollback-incompatible migration is a warning, not a blocker", async () => {
-  const { contracts, rendered } = await fixture();
-  const baseline = baselineFrom(rendered, contracts.catalog, 1);
-  const bumped = structuredClone(rendered);
-  bumped.topology.databaseSchemas.kuvert = { from: 1, to: 2, rollbackCompatible: false };
+// Item 9 (ADR 0005): a wasEnabled schema bump is unconditionally upgrade
+// scope now (see the blocker test above), so the only way this warning
+// can still appear on an EXECUTABLE plan is a first-time migration - a
+// previously-disabled service being enabled for the first time, exactly
+// like a bootstrap migration. computeUpgradeBlockers never checks
+// create entries at all (a first enable always legitimately uses the
+// current release's own image/schema), so this stays unblocked.
+test("upgrade: a rollback-incompatible first-time migration (a newly enabled service) is a warning, not a blocker", async () => {
+  const before = await fixture((contracts) => { contracts.manifest.services.schrank.enabled = false; });
+  const baseline = baselineFrom(before.rendered, before.contracts.catalog, 2);
+
+  const after = await fixture((contracts) => { contracts.manifest.services.schrank.enabled = true; });
+  after.rendered.topology.databaseSchemas.schrank = { ...after.rendered.topology.databaseSchemas.schrank, rollbackCompatible: false };
 
   const plan = buildPlan({
-    baseline, desiredRendered: bumped, manifest: contracts.manifest, releaseLock: contracts.releaseLock,
-    catalog: contracts.catalog, observation: observedMatching(baseline),
+    baseline, desiredRendered: after.rendered, manifest: after.contracts.manifest, releaseLock: after.contracts.releaseLock,
+    catalog: after.contracts.catalog, observation: observedMatching(baseline),
   });
 
-  assert.equal(plan.executable, true);
-  assert.ok(plan.warnings.some((warning) => warning.includes("not rollback-compatible")));
+  assert.equal(plan.executable, true, plan.blockers.join("\n"));
+  assert.ok(plan.warnings.some((warning) => warning.includes("schrank") && warning.includes("not rollback-compatible")), plan.warnings.join("\n"));
 });
 
 test("upgrade: a baseline schema that doesn't match this release's expected starting point is a blocker", async () => {
@@ -620,4 +736,45 @@ test("planId is deterministic for identical inputs and changes when the plan act
   const other = await fixture((c) => { c.manifest.services.schrank.enabled = true; });
   const planC = buildDesired({ baseline: emptyBaseline(), rendered: other.rendered, contracts: other.contracts });
   assert.notEqual(planA.planId, planC.planId);
+});
+
+// Item 9 (ADR 0005), cross-cutting fixture required by the delivery
+// plan itself: backup.create is never generated (it's in NEITHER the
+// bootstrap nor the applied whitelist for this item - see
+// scripts/applied-actions.mjs), and there is no volume-deletion action
+// anywhere in this platform's own action vocabulary at all (see
+// schemas/plan-v2.schema.json's own operation.action enum - volume.ensure
+// is the only volume-phase action that exists) - swept across every
+// representative applied-mode scenario this file exercises: a no-op, a
+// config-only change, a first enable, a retain-disable of a
+// multi-unit persistent service, a retained re-enable, and a rejected
+// (blocked) upgrade attempt. Every EXECUTABLE plan's own operations must
+// also pass the real applied whitelist validator wholesale, not just an
+// ad hoc backup.create check.
+test("cross-cutting: no item-9 path ever generates backup.create, and every executable applied plan's operations pass the real applied whitelist", async () => {
+  function assertClean(plan, label) {
+    assert.ok(!plan.operations.some((o) => o.action === "backup.create"), `${label}: backup.create must never appear`);
+    if (plan.executable) {
+      assert.deepEqual(validateAppliedActions({ mode: "applied", operations: plan.operations }), [], `${label}: every operation must pass the applied whitelist`);
+    }
+  }
+
+  const before = await fixture();
+  const noOpBaseline = baselineFrom(before.rendered, before.contracts.catalog, 4);
+  assertClean(buildDesired({ baseline: noOpBaseline, rendered: before.rendered, contracts: before.contracts, observation: observedMatching(noOpBaseline) }), "no-op");
+
+  const backupSchedule = await fixture((c) => { c.manifest.backup.schedule = "04:30"; });
+  assertClean(buildDesired({ baseline: noOpBaseline, rendered: backupSchedule.rendered, contracts: backupSchedule.contracts, observation: observedMatching(noOpBaseline) }), "config-only change");
+
+  const schrankDisabled = await fixture((c) => { c.manifest.services.schrank.enabled = false; });
+  const schrankBaseline = baselineFrom(schrankDisabled.rendered, schrankDisabled.contracts.catalog, 4);
+  const schrankEnabled = await fixture((c) => { c.manifest.services.schrank.enabled = true; });
+  assertClean(buildDesired({ baseline: schrankBaseline, rendered: schrankEnabled.rendered, contracts: schrankEnabled.contracts, observation: observedMatching(schrankBaseline) }), "first enable");
+
+  const retainDisabled = await fixture((c) => { c.manifest.services.kuvert.enabled = false; c.manifest.services.kuvert.dataRetention = "retain"; });
+  assertClean(buildDesired({ baseline: noOpBaseline, rendered: retainDisabled.rendered, contracts: retainDisabled.contracts, observation: observedMatching(noOpBaseline) }), "retain-disable");
+
+  const schemaBump = structuredClone(before.rendered);
+  schemaBump.topology.databaseSchemas.kuvert = { from: 1, to: 2, rollbackCompatible: true };
+  assertClean(buildDesired({ baseline: noOpBaseline, rendered: schemaBump, contracts: before.contracts, observation: observedMatching(noOpBaseline) }), "blocked upgrade attempt");
 });

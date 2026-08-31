@@ -1,11 +1,12 @@
-// hofctl plan's v2 output - target-bound, bootstrap-only for delivery
-// item 8 (see ADR 0004). Deliberately NOT wired into the real hofctl
-// plan CLI in this PR - that happens once hofctl apply actually exists
-// to consume --approve-plan-id (a later item-8 PR). This module is a
-// pure wrapper around plan.mjs's own buildPlan() (the v1 diff engine,
-// unchanged): it adds exact target binding, planning policy, per-
-// image.verify trust policy (from the release lock), and the bootstrap-
-// only recovery/suppliedTls fields, then recomputes planId over the
+// hofctl plan's v2 output - target-bound, originally bootstrap-only for
+// delivery item 8 (ADR 0004), now covering an applied baseline too
+// (delivery item 9, ADR 0005) - the same module, no plan-v3, since v2's
+// own `mode`/target/policy shape and the applied-compatible baseline/
+// desired $defs already cover both. This module is a pure wrapper
+// around plan.mjs's own buildPlan() (the v1 diff engine): it adds exact
+// target binding, planning policy, per-image.verify trust policy (from
+// the release lock), and the bootstrap-only recovery field plus the
+// (either-mode) suppliedTls field, then recomputes planId over the
 // whole v2 document. plan-v1 itself is untouched and stays the
 // historical contract.
 
@@ -73,10 +74,12 @@ function imageTrustFor(component) {
 export function buildPlanV2(options) {
   const { baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift, target, recoveryAgeRecipient, suppliedTlsCertificateFingerprint, suppliedTlsPrivateKeyFingerprint } = options;
 
-  if (baseline.mode !== "bootstrap") {
-    throw new Error("buildPlanV2 only ever produces a bootstrap plan in this delivery item - applied-mode reconciliation is a later delivery item, see ADR 0004");
-  }
-  if (!recoveryAgeRecipient) {
+  // Item 9 (ADR 0005): buildPlanV2 now covers both baseline modes - the
+  // bootstrap-only guard this used to have is gone. recoveryAgeRecipient
+  // stays required for bootstrap only (an applied plan never re-derives
+  // a fresh secrets.sops.yaml recovery recipient - it already has one,
+  // untouched by an ordinary applied change).
+  if (baseline.mode === "bootstrap" && !recoveryAgeRecipient) {
     throw new Error("a bootstrap plan requires an external age recovery recipient (recoveryAgeRecipient) - see ADR 0004");
   }
   if (manifest.tls.mode === "supplied" && (suppliedTlsCertificateFingerprint === undefined || suppliedTlsPrivateKeyFingerprint === undefined)) {
@@ -86,7 +89,7 @@ export function buildPlanV2(options) {
     throw new Error("suppliedTlsCertificateFingerprint/suppliedTlsPrivateKeyFingerprint was given but manifest.tls.mode is not \"supplied\"");
   }
 
-  const v1 = buildPlan({ baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift });
+  const v1 = buildPlan({ baseline, desiredRendered, manifest, releaseLock, catalog, observation, repairDrift, suppliedTlsCertificateFingerprint, suppliedTlsPrivateKeyFingerprint });
 
   // Compose unit -> catalog artifact, so an image.verify operation's own
   // `resource` (the unit) can be mapped back to the release lock's own
@@ -120,7 +123,12 @@ export function buildPlanV2(options) {
       baselineGeneration: baseline.generation,
     },
     policy: { repairDrift: Boolean(repairDrift) },
-    recovery: { ageRecipient: recoveryAgeRecipient },
+    // recovery is required for bootstrap, forbidden for applied (see
+    // plan-v2.schema.json's own allOf) - item 9 (ADR 0005) made
+    // recoveryAgeRecipient itself optional for an applied plan, so this
+    // must now be conditional too, matching suppliedTls's own pattern
+    // right below.
+    ...(v1.mode === "bootstrap" ? { recovery: { ageRecipient: recoveryAgeRecipient } } : {}),
     ...(suppliedTlsCertificateFingerprint !== undefined
       ? { suppliedTls: { mode: "supplied", certificateFingerprint: suppliedTlsCertificateFingerprint, privateKeyFingerprint: suppliedTlsPrivateKeyFingerprint } }
       : {}),

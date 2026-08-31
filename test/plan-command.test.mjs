@@ -18,9 +18,6 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import Ajv2020 from "ajv/dist/2020.js";
-import addFormats from "ajv-formats";
-
 import { loadContracts } from "../scripts/contracts.mjs";
 import { BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER, runPlan } from "../scripts/plan-command.mjs";
 import { planV2Validator } from "../scripts/plan-v2.mjs";
@@ -34,13 +31,6 @@ const examplesReleaseLock = path.join(root, "examples/release-lock.json");
 
 let workDir;
 let signedReleaseLockPath;
-
-async function planValidator() {
-  const ajv = new Ajv2020({ allErrors: true, strict: true });
-  addFormats(ajv);
-  const { readFile } = await import("node:fs/promises");
-  return ajv.compile(JSON.parse(await readFile(path.join(root, "schemas/plan-v1.schema.json"), "utf8")));
-}
 
 test.before(async () => {
   workDir = await mkdtemp(path.join(tmpdir(), "hof-plan-command-"));
@@ -195,7 +185,11 @@ test("deployment blocked: a real cosign signature failure (fake cosign scripted 
 });
 
 test("a genuine applied no-op plan against a matching, already-applied installation is schema-valid and executable", async () => {
-  const validate = await planValidator();
+  // Item 9 (ADR 0005): plan-command.mjs now always prints plan-v2, for
+  // EITHER baseline mode - the historical, informational plan-v1 branch
+  // for an applied target is gone (see plan-command.mjs's own top-of-
+  // file comment).
+  const validate = await planV2Validator();
   const contracts = await loadContracts();
   const installationId = "3b1f6c2e-6e35-4f7a-9c3b-000000000000";
   const rendered = renderTopology({ ...contracts, installationId, generation: 5 });

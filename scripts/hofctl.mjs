@@ -327,7 +327,7 @@ if (command === "render") {
     } else if (Boolean(options.knownHosts) === Boolean(options.hostKeySha256)) {
       usage("apply requires exactly one of --known-hosts or --host-key-sha256");
     } else if (hasResume ? (options.approvePlanId || options.plan) : (!options.approvePlanId || !options.plan)) {
-      usage("apply requires --resume alone, or both --approve-plan-id and --plan together (never a mix) - approving a plan approves those exact bytes, a resume never takes a new approval (see ADR 0004)");
+      usage("apply requires --resume alone, or both --approve-plan-id and --plan together (never a mix) - approving a plan approves that exact content, a resume never takes a new approval (see ADR 0004)");
     } else {
       try {
         const connectTimeoutSeconds = parsePositiveInteger(options.connectTimeoutSeconds, "--connect-timeout-seconds");

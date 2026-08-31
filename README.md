@@ -66,9 +66,11 @@ historical `plan-v1` shape, informational only.
 
 `hofctl apply` is implemented for delivery item 8's own scope - a bootstrap
 onto a genuinely clean host (see ADR 0004): exact SSH target binding,
-`--plan`/`--approve-plan-id` (approving a plan approves those exact bytes,
-matched against the file you actually reviewed, never "whatever recomputes
-to the same short ID"), an exclusive durable target lock, a durable
+`--plan`/`--approve-plan-id` (approving a plan approves that exact content,
+matched against the file you actually reviewed via a canonical-JSON
+planId - recursively sorted keys, so a reordered-but-otherwise-identical
+document still matches, but never "whatever recomputes to the same short
+ID"), an exclusive durable target lock, a durable
 operation journal (bounded NDJSON progress on stdout) that embeds the full
 approved plan itself, a full canonical-document stale-plan recheck under
 the lock (not just the target's own identity fields),
@@ -222,10 +224,12 @@ plan you approve is the exact document `hofctl plan` printed against a
 bootstrap target (a real `plan-v2` document there too, not `plan-v1` -
 see ADR 0004's own errata note): save it, review it, then hand both its
 own file and its `planId` to `apply` - `--approve-plan-id` must match
-`--plan`'s own `planId` byte for byte, and `apply` then recomputes the
-plan itself (once before ever touching the lock, once again after
-acquiring it) and refuses to proceed unless that live recomputation
-still matches the exact bytes you approved:
+`--plan`'s own `planId` (a canonical-JSON hash: recursively sorted
+object keys, so it's the content that must match exactly, not any one
+particular byte sequence), and `apply` then recomputes the plan itself
+(once before ever touching the lock, once again after acquiring it) and
+refuses to proceed unless that live recomputation still matches the
+exact content you approved:
 
 ```sh
 node scripts/hofctl.mjs plan \

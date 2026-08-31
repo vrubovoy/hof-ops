@@ -168,6 +168,29 @@ fi
 `;
 }
 
+function acquireLockAndJournalScript(lockPayload, journalTargetPath, journalPayload) {
+  return `set -eu
+lock_payload='${lockPayload}'
+journal_payload='${journalPayload}'
+mkdir -p "$(dirname '${LOCK_PATH}')"
+mkdir -p "$(dirname '${journalTargetPath}')"
+umask 077
+if (set -C; printf '%s' "$lock_payload" | base64 -d > '${LOCK_PATH}') 2>/dev/null; then
+  if (set -C; printf '%s' "$journal_payload" | base64 -d > '${journalTargetPath}') 2>/dev/null; then
+    echo HOF_MUTATE_CREATED
+  else
+    echo HOF_MUTATE_JOURNAL_CONFLICT
+    rm -f '${LOCK_PATH}'
+  fi
+else
+  echo HOF_MUTATE_EXISTS
+  if [ -r '${LOCK_PATH}' ]; then
+    cat '${LOCK_PATH}'
+  fi
+fi
+`;
+}
+
 function readScript(targetPath) {
   return `set -eu
 if [ -r '${targetPath}' ]; then
@@ -198,6 +221,7 @@ function parseReadResponse(stdout) {
 
 const LOCK_PATH = "/var/lib/hof/state/lock.json";
 const CURRENT_STATE_PATH = "/var/lib/hof/state/current.json";
+const TOPOLOGY_PATH = "/var/lib/hof/state/topology.json";
 const journalPath = (operationId) => `/var/lib/hof/state/journal/${validateOperationId(operationId)}.json`;
 const eventsPath = (operationId) => `/var/lib/hof/state/journal/${validateOperationId(operationId)}.events.ndjson`;
 
@@ -215,6 +239,34 @@ export async function acquireLock(conn, lockDocument) {
   const stdout = await runScript(conn, exclusiveCreateScript(LOCK_PATH, b64(lockDocument)));
   const result = parseCreateResponse(stdout);
   return result.created ? { acquired: true } : { acquired: false, lock: result.existing };
+}
+
+// Creates the lock AND the journal as ONE remote script invocation - a
+// single SSH round trip, not two - so there is no window between them
+// where the LOCAL apply.mjs process itself (not the SSH session) could
+// crash after the lock is durably created but before the journal write
+// is even issued (a real gap a further, 2026-08-31 review found: a
+// resume then reads a lock referencing an operationId whose journal
+// genuinely doesn't exist yet, and had nothing to do but refuse
+// forever). The remote script itself creates the journal only once the
+// lock create has already succeeded, and rolls the lock back if the
+// journal create then somehow still fails (structurally this should be
+// impossible - journalDocument.operationId is always a fresh
+// randomUUID, so no journal file at that exact path can already exist -
+// but a script that can't happen is not the same as a script that
+// doesn't check). A crash strictly inside the remote script's own
+// execution (between its two file creates) remains possible in
+// principle, same as any single remote command - not something a
+// client-side reordering could ever fully close - but it's the same
+// class of risk every other single-runScript call in this module
+// already carries, not a new one this function introduces.
+export async function acquireLockAndJournal(conn, lockDocument, journalDocument) {
+  const stdout = await runScript(conn, acquireLockAndJournalScript(b64(lockDocument), journalPath(journalDocument.operationId), b64(journalDocument)));
+  const [tag, ...rest] = stdout.split("\n");
+  if (tag === "HOF_MUTATE_CREATED") return { acquired: true };
+  if (tag === "HOF_MUTATE_EXISTS") return { acquired: false, lock: rest.join("\n").trim() ? JSON.parse(rest.join("\n")) : null };
+  if (tag === "HOF_MUTATE_JOURNAL_CONFLICT") throw new Error(`a journal for operation ${journalDocument.operationId} already existed on the target even though its lock did not - structurally impossible for a freshly generated operationId, points at real target-side corruption; the lock write was rolled back`);
+  throw new Error(`unexpected target-mutate response: ${JSON.stringify(stdout)}`);
 }
 
 export async function readLock(conn) {
@@ -269,6 +321,16 @@ export async function readCurrentState(conn) {
   const stdout = await runScript(conn, readScript(CURRENT_STATE_PATH));
   const { status, value } = parseReadResponse(stdout);
   return { status, current: value };
+}
+
+// The same real, durable oracle as readCurrentState() above, for
+// topology.json - used alongside it by apply.mjs's post-commit recovery
+// so a recovered state.commit is confirmed against the FULL real record
+// the target holds, not just current.json's own topologyDigest field.
+export async function readTopology(conn) {
+  const stdout = await runScript(conn, readScript(TOPOLOGY_PATH));
+  const { status, value } = parseReadResponse(stdout);
+  return { status, topology: value };
 }
 
 // Atomic write-then-rename (ADR 0004: "only ever atomically") - the

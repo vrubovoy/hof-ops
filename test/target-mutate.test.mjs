@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
-import { acquireLock, appendEvent, readEvents, readJournal, readLock, releaseLock, updateJournalStatus, writeJournal } from "../scripts/target-mutate.mjs";
+import { acquireLock, acquireLockAndJournal, appendEvent, readCurrentState, readEvents, readJournal, readLock, readTopology, releaseLock, updateJournalStatus, writeJournal } from "../scripts/target-mutate.mjs";
 
 const FAKE_PUBKEY_B64 = "AAAAC3NzaC1lZDI1NTE5AAAAIKPZsomeFakeButValidBase64Blob==";
 const HOST_KEY_SHA256 = "SHA256:" + createHash("sha256").update(Buffer.from(FAKE_PUBKEY_B64, "base64")).digest("base64").replace(/=+$/, "");
@@ -75,6 +75,45 @@ test("acquireLock: HOF_MUTATE_EXISTS reports the already-held lock document, not
   const { run } = mockRun({ sshStdout: `HOF_MUTATE_EXISTS\n${JSON.stringify(existing)}` });
   const result = await acquireLock({ ...SSH_TARGET, run }, { operationId: OPERATION_ID });
   assert.deepEqual(result, { acquired: false, lock: existing });
+});
+
+// acquireLockAndJournal: creates both the lock AND the journal in ONE
+// remote script invocation - a further, 2026-08-31 review found the
+// previous two-separate-round-trip sequence (acquireLock, then
+// writeJournal) left a real window where a crash of the LOCAL apply.mjs
+// process itself (not the SSH session) between the two calls left a
+// durable lock with no journal at all, which resume then had nothing to
+// do but refuse forever.
+
+test("acquireLockAndJournal: a single ssh call creates both documents, embedding each exactly", async () => {
+  const { run, calls } = mockRun({ sshStdout: "HOF_MUTATE_CREATED\n" });
+  const lockDoc = { apiVersion: "hof.dev/operation-lock/v1", operationId: OPERATION_ID };
+  const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "in-progress" };
+  const result = await acquireLockAndJournal({ ...SSH_TARGET, run }, lockDoc, journalDoc);
+  assert.deepEqual(result, { acquired: true });
+
+  const sshCalls = calls.filter((c) => c.command === "ssh");
+  assert.equal(sshCalls.length, 1, "lock and journal are created in exactly one remote round trip, not two");
+  const script = sshCalls[0].input;
+  assert.match(script, /journal\/[0-9a-f-]+\.json/, "the journal's own fixed path is part of the same script");
+  const embeddedPayloads = [...script.matchAll(/'([A-Za-z0-9+/=]+)'/g)].map((m) => JSON.parse(Buffer.from(m[1], "base64").toString("utf8")));
+  assert.ok(embeddedPayloads.some((p) => JSON.stringify(p) === JSON.stringify(lockDoc)));
+  assert.ok(embeddedPayloads.some((p) => JSON.stringify(p) === JSON.stringify(journalDoc)));
+});
+
+test("acquireLockAndJournal: an already-held lock reports the existing document, without ever writing a journal", async () => {
+  const existing = { apiVersion: "hof.dev/operation-lock/v1", operationId: "11111111-1111-1111-1111-111111111111" };
+  const { run } = mockRun({ sshStdout: `HOF_MUTATE_EXISTS\n${JSON.stringify(existing)}` });
+  const result = await acquireLockAndJournal({ ...SSH_TARGET, run }, { operationId: OPERATION_ID }, { operationId: OPERATION_ID, status: "in-progress" });
+  assert.deepEqual(result, { acquired: false, lock: existing });
+});
+
+test("acquireLockAndJournal: a structurally-impossible journal conflict (lock absent, journal already present) throws, never silently succeeds", async () => {
+  const { run } = mockRun({ sshStdout: "HOF_MUTATE_JOURNAL_CONFLICT\n" });
+  await assert.rejects(
+    () => acquireLockAndJournal({ ...SSH_TARGET, run }, { operationId: OPERATION_ID }, { operationId: OPERATION_ID }),
+    /structurally impossible/,
+  );
 });
 
 test("readLock: present/unreadable/absent all parse distinctly", async () => {
@@ -160,6 +199,26 @@ test("readEvents: parses every NDJSON line in order, in the exact recorded shape
   const stdout = `HOF_MUTATE_PRESENT\n${JSON.stringify(e1)}\n${JSON.stringify(e2)}\n`;
   const events = await readEvents({ ...SSH_TARGET, run: mockRun({ sshStdout: stdout }).run }, OPERATION_ID);
   assert.deepEqual(events, [e1, e2]);
+});
+
+test("readCurrentState: present/absent both parse, targeting the fixed current.json path", async () => {
+  const current = { apiVersion: "hof.dev/state/v1", installationId: OPERATION_ID, generation: 1 };
+  const { run, calls } = mockRun({ sshStdout: `HOF_MUTATE_PRESENT\n${JSON.stringify(current)}` });
+  const present = await readCurrentState({ ...SSH_TARGET, run });
+  assert.deepEqual(present, { status: "present", current });
+  assert.match(calls.find((c) => c.command === "ssh").input, /\/var\/lib\/hof\/state\/current\.json/);
+  const absent = await readCurrentState({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run });
+  assert.deepEqual(absent, { status: "absent", current: null });
+});
+
+test("readTopology: present/absent both parse, targeting the fixed topology.json path", async () => {
+  const topology = { compose: {}, caddyfile: "", topology: {}, backup: {} };
+  const { run, calls } = mockRun({ sshStdout: `HOF_MUTATE_PRESENT\n${JSON.stringify(topology)}` });
+  const present = await readTopology({ ...SSH_TARGET, run });
+  assert.deepEqual(present, { status: "present", topology });
+  assert.match(calls.find((c) => c.command === "ssh").input, /\/var\/lib\/hof\/state\/topology\.json/);
+  const absent = await readTopology({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run });
+  assert.deepEqual(absent, { status: "absent", topology: null });
 });
 
 test("local mode: runs `sudo -n sh -s` directly, with no SSH/known_hosts machinery at all", async () => {

@@ -7,7 +7,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 
 import { loadContracts } from "../scripts/contracts.mjs";
-import { buildPlanV2 } from "../scripts/plan-v2.mjs";
+import { buildPlanV2, computePlanId } from "../scripts/plan-v2.mjs";
 import { renderTopology } from "../scripts/render-topology.mjs";
 import { emptyBaseline, topologyToServiceState } from "../scripts/state.mjs";
 
@@ -100,6 +100,39 @@ test("planId is deterministic for identical inputs, including the target binding
   const planA = buildPlanV2({ ...bootstrapOptions(), ...base });
   const planB = buildPlanV2({ ...bootstrapOptions(), ...base });
   assert.equal(planA.planId, planB.planId);
+});
+
+// A further, 2026-08-31 review found computePlanId() used plain
+// JSON.stringify() directly - insertion-order-dependent, not actually
+// canonical despite the name and every caller comment claiming
+// otherwise. A document with the exact same content but differently
+// ordered object keys (a different JS engine, a formatter, a
+// content-preserving hand-edit) must recompute to the SAME planId;
+// actual content changes must still recompute to a different one.
+
+test("computePlanId: reordering an object's own keys never changes the id - only content does", async () => {
+  const { contracts, rendered } = await fixture();
+  const plan = buildPlanV2({ ...bootstrapOptions(), desiredRendered: rendered, manifest: contracts.manifest, releaseLock: contracts.releaseLock, catalog: contracts.catalog });
+
+  const reorderKeysDeep = (value) => {
+    if (Array.isArray(value)) return value.map(reorderKeysDeep);
+    if (value !== null && typeof value === "object") {
+      const reversed = {};
+      for (const key of Object.keys(value).reverse()) reversed[key] = reorderKeysDeep(value[key]);
+      return reversed;
+    }
+    return value;
+  };
+  const reordered = reorderKeysDeep(plan);
+  assert.notDeepEqual(Object.keys(reordered), Object.keys(plan), "fixture assumption: reversing top-level keys must actually change their order");
+  assert.equal(computePlanId(reordered), plan.planId, "same content, different key order, must recompute to the same planId");
+});
+
+test("computePlanId: an actual content change still changes the id, even after canonicalization", async () => {
+  const { contracts, rendered } = await fixture();
+  const plan = buildPlanV2({ ...bootstrapOptions(), desiredRendered: rendered, manifest: contracts.manifest, releaseLock: contracts.releaseLock, catalog: contracts.catalog });
+  const tampered = { ...plan, policy: { repairDrift: !plan.policy.repairDrift } };
+  assert.notEqual(computePlanId(tampered), plan.planId);
 });
 
 test("refuses to produce anything but a bootstrap plan - an applied baseline is rejected outright", async () => {

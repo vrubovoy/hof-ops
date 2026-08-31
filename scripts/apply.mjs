@@ -289,6 +289,24 @@ function summarizePlanDiff(approved, recomputed) {
 // "Item 8 reopened" entry). Factored out once rather than duplicated so
 // the two calls can never quietly drift apart from each other.
 // Returns either a blocked() result or { plan }.
+// Reports whether releaseLock() genuinely cleared the target's own lock
+// file - never swallowed into a bare `.catch(() => {})` and never
+// discarded the { released: false } case either, the way this file used
+// to (a further, 2026-08-31 review found that pattern could report
+// blocked: false to the caller while the target stayed genuinely
+// locked: a real transport failure was silently discarded, and even a
+// clean "mismatch" response was never looked at).
+async function tryReleaseLock(m, mutateConn, operationId) {
+  try {
+    const result = await m.releaseLock(mutateConn, operationId);
+    return result.released
+      ? { released: true }
+      : { released: false, note: `releaseLock reported a mismatch for operation ${operationId} - the target's own lock file no longer matches this operationId (held by a different operation, or already removed by hand)` };
+  } catch (error) {
+    return { released: false, note: `releaseLock failed: ${error instanceof Error ? error.message : error}` };
+  }
+}
+
 async function computeLivePlanV2({ snapshot, manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, targetMode, host, port, user, recoveryAgeRecipient, repairDrift }) {
   // `hofctl preflight` already runs this exact check, but apply itself
   // never required a successful preflight run first, and the Ansible
@@ -407,7 +425,7 @@ export async function runApply(options) {
     return blocked("identity", "hofctl apply requires --identity-file - the Execution Environment container needs a real key file to mount, an SSH agent is not supported");
   }
   if (!options.resume && (!options.approvePlanId || !options.planPath)) {
-    return blocked("approval", "hofctl apply requires both --approve-plan-id and --plan (the exact plan-v2 document being approved) unless --resume is given - approving a plan approves those exact bytes, see ADR 0004");
+    return blocked("approval", "hofctl apply requires both --approve-plan-id and --plan (the exact plan-v2 document being approved) unless --resume is given - approving a plan approves that exact content, see ADR 0004");
   }
 
   const { errors, manifest, catalog, catalogBytes, releaseLock, releaseLockBytes, servicesBytes, servicesSchema, catalogSchema, releaseLockSchema } =
@@ -474,15 +492,19 @@ export async function runApply(options) {
     // changed, the original `planId` left in place) would otherwise be
     // silently accepted here, only ever caught later by the live
     // recompute below (which is real protection, but "approving a plan
-    // approves those exact bytes" - ADR 0004 - deserves catching a
+    // approves that exact content" - ADR 0004 - deserves catching a
     // tampered file at the file itself, not just downstream).
+    // computePlanId() canonicalizes before hashing (recursively sorted
+    // object keys, array order preserved) - a document with the same
+    // content but differently ordered keys still recomputes to the same
+    // planId; any actual content change never does.
     const recomputedFileId = computePlanId(approvedPlanRaw);
     if (recomputedFileId !== approvedPlanRaw.planId) {
-      return blocked("plan-file", `--plan ${options.planPath}'s own planId field (${approvedPlanRaw.planId}) does not match its own content (recomputes to ${recomputedFileId}) - refusing to trust a plan file whose own identity doesn't match its bytes`);
+      return blocked("plan-file", `--plan ${options.planPath}'s own planId field (${approvedPlanRaw.planId}) does not match its own content (recomputes to ${recomputedFileId}) - refusing to trust a plan file whose own identity doesn't match its content`);
     }
     approvedPlan = approvedPlanRaw;
     if (options.approvePlanId !== approvedPlan.planId) {
-      return blocked("approval", `--approve-plan-id ${options.approvePlanId} does not match the plan file's own planId ${approvedPlan.planId} (${options.planPath}) - approving a plan approves those exact bytes, see ADR 0004`);
+      return blocked("approval", `--approve-plan-id ${options.approvePlanId} does not match the plan file's own planId ${approvedPlan.planId} (${options.planPath}) - approving a plan approves that exact content, see ADR 0004`);
     }
   }
 
@@ -540,11 +562,58 @@ export async function runApply(options) {
     operationId = lock.operationId;
 
     const { status: journalStatus, journal: existing } = await m.readJournal(mutateConn, operationId);
-    if (journalStatus !== "present") return blocked("resume", `lock references operation ${operationId} but its journal could not be read (status: ${journalStatus})`);
+    if (journalStatus !== "present") {
+      // Lock and journal are now always created together, as one remote
+      // operation (see acquireLockAndJournal()'s own comment) - no
+      // operation is EVER dispatched before both durably exist, so a
+      // lock with no journal proves nothing has actually run yet. Safe
+      // to clean up and hand the operator back to a fresh apply - this
+      // isn't "guessing" about a real operation outcome, there wasn't
+      // one (a further, 2026-08-31 review found this case used to
+      // refuse forever, with no recovery path at all).
+      const release = await tryReleaseLock(m, mutateConn, operationId);
+      return blocked("resume", `lock references operation ${operationId} but its journal could not be read (status: ${journalStatus}) - since no operation ever dispatches before both are created together, nothing has actually run yet; ${release.released ? "the stale lock has been released - run a fresh (non-resume) apply" : `the stale lock could not be released (${release.note}) - investigate the target directly`}`);
+    }
     try {
       await assertJournalValid(existing);
     } catch (error) {
       return blocked("resume", `the journal for operation ${operationId} does not satisfy its own schema - refusing to trust it: ${error instanceof Error ? error.message : error}`);
+    }
+
+    // Every durable document this resume is about to trust must first
+    // agree about WHICH operation this is and WHAT was approved - a
+    // further, 2026-08-31 review found this cross-binding used to be
+    // partial (only the plan/journal/target triple below) and, worse,
+    // entirely skipped by the succeeded fast path further down. Checked
+    // here, unconditionally, before anything branches on journal status.
+    if (existing.operationId !== lock.operationId) {
+      return blocked("resume", `the journal's own operationId (${existing.operationId}) does not match the lock's (${lock.operationId}) - refusing to trust either`);
+    }
+    if (existing.approvedPlanId !== lock.approvedPlanId) {
+      return blocked("resume", `the journal's own approvedPlanId (${existing.approvedPlanId}) does not match the lock's (${lock.approvedPlanId}) - refusing to trust either`);
+    }
+
+    // The journal's own embedded plan is what every later step in this
+    // resume run trusts completely (operations[], the real installation
+    // id, the target binding) - assertJournalValid() above only checked
+    // the OUTER journal shape (plan itself is loosely typed there on
+    // purpose, see that schema's own comment), so a hand-tampered or
+    // corrupted embedded plan would otherwise reach dispatch unchecked.
+    // Also moved ahead of the succeeded fast path below, for the same
+    // reason as the cross-binding checks just above.
+    const validateEmbeddedPlan = await planV2Validator();
+    if (!validateEmbeddedPlan(existing.plan)) {
+      return blocked("resume", `the journal for operation ${operationId} carries a plan that does not satisfy schemas/plan-v2.schema.json - refusing to trust it: ${JSON.stringify(validateEmbeddedPlan.errors)}`);
+    }
+    if (computePlanId(existing.plan) !== existing.plan.planId || existing.plan.planId !== existing.approvedPlanId || existing.plan.planId !== lock.approvedPlanId) {
+      return blocked("resume", `the journal for operation ${operationId} carries a plan whose own planId does not match its content, its own approvedPlanId, or the lock's approvedPlanId - refusing to trust it`);
+    }
+    const embeddedWhitelistErrors = validateBootstrapActions(existing.plan);
+    if (embeddedWhitelistErrors.length > 0) {
+      return blocked("resume", `the journal for operation ${operationId} carries a plan that fails the bootstrap action whitelist - refusing to trust it: ${embeddedWhitelistErrors.join("; ")}`);
+    }
+    if (JSON.stringify(existing.plan.target) !== JSON.stringify(existing.target) || JSON.stringify(existing.target) !== JSON.stringify(lock.target)) {
+      return blocked("resume", `the journal for operation ${operationId} carries a plan/journal/lock whose own target bindings disagree - refusing to trust it`);
     }
 
     // A journal already marked "succeeded" means state.commit's own
@@ -556,34 +625,24 @@ export async function runApply(options) {
     // ever calls releaseLock() for an already-succeeded journal.
     // Finishing that one remaining step here is not "guessing" - both
     // durable facts this run cares about (the journal's own terminal
-    // status, already schema-validated above) already say it's done.
+    // status, already schema- and cross-binding-validated above) already
+    // say it's done. Only reached AFTER every check above, not before -
+    // see those comments for why.
     if (existing.status === "succeeded") {
-      await m.releaseLock(mutateConn, operationId).catch(() => {});
+      const release = await tryReleaseLock(m, mutateConn, operationId);
+      if (!release.released) {
+        // The operation itself genuinely did succeed - but claiming
+        // blocked: false here anyway would silently misreport a target
+        // that is still locked. A further, 2026-08-31 review found the
+        // old code did exactly that: a bare `.catch(() => {})` discarded
+        // a real transport failure, and even a clean { released: false }
+        // response was never looked at.
+        return blocked("resume", `operation ${operationId} already succeeded (committed generation ${existing.committedGeneration}), but its lock could not be confirmed released: ${release.note} - the target may still be locked; investigate directly rather than retrying`);
+      }
       emit({ type: "apply.committed", operationId, committedGeneration: existing.committedGeneration });
       return { blocked: false, operationId, committedGeneration: existing.committedGeneration, planId: existing.approvedPlanId };
     }
     assertJournalResumable(existing);
-
-    // The journal's own embedded plan is what every later step in this
-    // resume run trusts completely (operations[], the real installation
-    // id, the target binding) - assertJournalValid() above only checked
-    // the OUTER journal shape (plan itself is loosely typed there on
-    // purpose, see that schema's own comment), so a hand-tampered or
-    // corrupted embedded plan would otherwise reach dispatch unchecked.
-    const validateEmbeddedPlan = await planV2Validator();
-    if (!validateEmbeddedPlan(existing.plan)) {
-      return blocked("resume", `the journal for operation ${operationId} carries a plan that does not satisfy schemas/plan-v2.schema.json - refusing to trust it: ${JSON.stringify(validateEmbeddedPlan.errors)}`);
-    }
-    if (computePlanId(existing.plan) !== existing.plan.planId || existing.plan.planId !== existing.approvedPlanId) {
-      return blocked("resume", `the journal for operation ${operationId} carries a plan whose own planId does not match its content or its own approvedPlanId - refusing to trust it`);
-    }
-    const embeddedWhitelistErrors = validateBootstrapActions(existing.plan);
-    if (embeddedWhitelistErrors.length > 0) {
-      return blocked("resume", `the journal for operation ${operationId} carries a plan that fails the bootstrap action whitelist - refusing to trust it: ${embeddedWhitelistErrors.join("; ")}`);
-    }
-    if (JSON.stringify(existing.plan.target) !== JSON.stringify(existing.target) || JSON.stringify(existing.target) !== JSON.stringify(lock.target)) {
-      return blocked("resume", `the journal for operation ${operationId} carries a plan/journal/lock whose own target bindings disagree - refusing to trust it`);
-    }
 
     // The exact same platform check the fresh path runs (see
     // computeLivePlanV2) - resume must never skip it just because it
@@ -623,8 +682,25 @@ export async function runApply(options) {
     }
     plan = firstResult.plan;
 
+    inputDigests = {
+      manifestDigest: sha256(servicesBytes),
+      releaseLockDigest: sha256(releaseLockBytes),
+      catalogDigest: sha256(catalogBytes),
+      composeTemplateDigest: sha256(await readFile(path.join(root, "scripts/render-topology.mjs"))),
+      // Same slice build-release-lock.mjs's own verifySupplyChain already
+      // uses to pull a digest back out of a repo@sha256:... reference.
+      executionEnvironmentDigest: releaseLock.ansibleEnvironment.image.slice(releaseLock.ansibleEnvironment.image.indexOf("@") + 1),
+    };
     const lockDoc = await buildLockDocument({ operationId, approvedPlanId: plan.planId, target: plan.target, acquiredBy: currentOperator() });
-    const { acquired, lock: held } = await m.acquireLock(mutateConn, lockDoc);
+    journal = await buildJournalDocument({ operationId, approvedPlanId: plan.planId, target: plan.target, plan, inputDigests });
+    // Created together, as ONE remote operation (see
+    // acquireLockAndJournal()'s own comment) - a further, 2026-08-31
+    // review found that two separate round trips left a real window
+    // where a crash of THIS process itself (not the SSH session) between
+    // them left a lock durably created with no journal at all, which
+    // resume then had nothing to do but refuse forever, since it
+    // requires an existing journal before it will trust anything.
+    const { acquired, lock: held } = await m.acquireLockAndJournal(mutateConn, lockDoc, journal);
     if (!acquired) {
       try {
         await assertLockValid(held);
@@ -639,7 +715,13 @@ export async function runApply(options) {
     // before running a single operation." A second, genuinely fresh
     // inspectTarget() call plus a full canonical-document recompute -
     // never just the 3 scalar fields this used to compare (see
-    // PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry).
+    // PLATFORM-OPS-PLAN.md's "Item 8 reopened" entry). Runs after the
+    // lock+journal are both already durably created - a recheck failure
+    // below only ever releases the lock, deliberately leaving behind a
+    // harmless, never-referenced-again "in-progress" journal for an
+    // operationId whose lock is gone (nothing in this codebase ever
+    // resumes a lockless journal - readLock() failing is resume's own
+    // very first gate, before a journal is ever read at all).
     let recheckSnapshot;
     try {
       recheckSnapshot = await inspect({
@@ -660,18 +742,6 @@ export async function runApply(options) {
       await m.releaseLock(mutateConn, operationId).catch(() => {});
       return blocked("stale-plan", `the target changed underneath this plan since it was locked - refusing to apply: ${summarizePlanDiff(plan, recheckResult.plan)}`);
     }
-
-    inputDigests = {
-      manifestDigest: sha256(servicesBytes),
-      releaseLockDigest: sha256(releaseLockBytes),
-      catalogDigest: sha256(catalogBytes),
-      composeTemplateDigest: sha256(await readFile(path.join(root, "scripts/render-topology.mjs"))),
-      // Same slice build-release-lock.mjs's own verifySupplyChain already
-      // uses to pull a digest back out of a repo@sha256:... reference.
-      executionEnvironmentDigest: releaseLock.ansibleEnvironment.image.slice(releaseLock.ansibleEnvironment.image.indexOf("@") + 1),
-    };
-    journal = await buildJournalDocument({ operationId, approvedPlanId: plan.planId, target: plan.target, plan, inputDigests });
-    await m.writeJournal(mutateConn, journal);
   }
 
   emit({ type: "apply.locked", operationId, resumed: Boolean(options.resume), planId: plan.planId });
@@ -870,7 +940,32 @@ export async function runApply(options) {
             } catch (error) {
               return blocked("resume", error instanceof Error ? error.message : String(error));
             }
-            if (current.lastSuccessfulOperationId === operationId && current.generation === generation) {
+            // A full comparison against the exact document THIS run's own
+            // state.commit would itself have written - every digest, the
+            // real installation id, the real release, not just
+            // operationId/generation. A further, 2026-08-31 review found
+            // the narrower two-field check let a schema-valid but
+            // otherwise-unrelated current.json (matching operationId and
+            // generation by pure coincidence) pass as "proof" of a real
+            // commit. appliedAt is the one field excluded from the
+            // comparison on purpose: it timestamps the ORIGINAL, crashed
+            // attempt's own real commit moment, never expected to equal
+            // this rerun's freshly generated one.
+            const { appliedAt: _expectedAppliedAt, ...expectedWithoutTimestamp } = currentState;
+            const { appliedAt: _actualAppliedAt, ...actualWithoutTimestamp } = current;
+            const currentMatches = JSON.stringify(actualWithoutTimestamp) === JSON.stringify(expectedWithoutTimestamp);
+            // current.json's own topologyDigest already ties it to a
+            // specific topology, but only by trusting current.json's own
+            // honesty about that digest - independently re-reading the
+            // real topology.json the target actually holds and comparing
+            // it byte for byte against this run's own appliedRendered
+            // closes that one remaining gap for real, not just on paper.
+            let topologyMatches = false;
+            if (currentMatches) {
+              const { status: topologyStatus, topology: actualTopology } = await m.readTopology(mutateConn);
+              topologyMatches = topologyStatus === "present" && JSON.stringify(actualTopology) === JSON.stringify(appliedRendered);
+            }
+            if (currentMatches && topologyMatches) {
               const recovered = await buildEvent({ operationId, step: operation.id, attempt: 1, phase: "succeeded" });
               await m.appendEvent(mutateConn, operationId, recovered);
               emit(recovered);
@@ -883,8 +978,11 @@ export async function runApply(options) {
           if (operation.action === "image.verify") imageTrustByUnit.set(operation.resource, operation.imageTrust);
           continue;
         }
-        if (outcome === "blocked" || outcome === "failed") {
-          return blocked("resume", `step ${operation.id} has an unresolved or failed outcome from a previous attempt (${outcome}) - refusing to guess whether it's safe to retry or skip; investigate the target directly (the lock remains held)`);
+        if (outcome === "blocked" || outcome === "failed" || outcome === "corrupted") {
+          const detail = outcome === "corrupted"
+            ? "its own recorded event history is structurally invalid (a duplicate, out-of-order, or standalone terminal event) and is never silently resolved one way or the other"
+            : "refusing to guess whether it's safe to retry or skip";
+          return blocked("resume", `step ${operation.id} has an unresolved, failed, or corrupted outcome from a previous attempt (${outcome}) - ${detail}; investigate the target directly (the lock remains held)`);
         }
 
         const attempt = 1;

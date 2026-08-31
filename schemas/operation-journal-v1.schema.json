@@ -42,6 +42,14 @@
       "minimum": 1
     }
   },
+  "allOf": [
+    {
+      "description": "The status/committedGeneration pairing this schema's own prose above already documents, actually enforced - a 2026-08-31 review found the invariant was prose-only, so a schema-valid but self-contradictory document (succeeded with committedGeneration still null; in-progress or failed with one already set) would have been silently accepted.",
+      "if": { "properties": { "status": { "const": "succeeded" } } },
+      "then": { "properties": { "committedGeneration": { "type": "integer" } } },
+      "else": { "properties": { "committedGeneration": { "type": "null" } } }
+    }
+  ],
   "$defs": {
     "operationId": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
     "planId": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },

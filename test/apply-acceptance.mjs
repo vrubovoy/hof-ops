@@ -342,6 +342,17 @@ test("a real, full bootstrap apply against the real, published, signed v0.1.3 re
   // assertion can't be fooled by a bug in target-mutate.mjs's own reader.
   const { stdout: journalRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${result.operationId}.json`]);
   const journal = JSON.parse(journalRaw);
+  // Schema-valid, not just spot-checked field by field - a further,
+  // 2026-08-31 review found this test only ever parsed the live journal
+  // and compared three of its fields, never actually validating it
+  // against schemas/operation-journal-v1.schema.json the way current.json
+  // already was below (PLATFORM-OPS-PLAN.md's own PR #33 promise, still
+  // under-delivered here until this).
+  const journalSchema = JSON.parse(await readFile(path.join(root, "schemas/operation-journal-v1.schema.json"), "utf8"));
+  const journalAjv = new Ajv2020({ allErrors: true, strict: true });
+  addFormats(journalAjv);
+  const validateJournal = journalAjv.compile(journalSchema);
+  assert.ok(validateJournal(journal), `the live journal does not satisfy schemas/operation-journal-v1.schema.json: ${JSON.stringify(validateJournal.errors)}`);
   assert.equal(journal.status, "succeeded");
   assert.equal(journal.committedGeneration, 1);
   assert.equal(journal.approvedPlanId, plan.planId);
@@ -349,6 +360,21 @@ test("a real, full bootstrap apply against the real, published, signed v0.1.3 re
   const { stdout: eventsRaw } = await exec("docker", ["exec", containerName, "cat", `/var/lib/hof/state/journal/${result.operationId}.events.ndjson`]);
   const durableEvents = eventsRaw.trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual(durableEvents, operationEvents, "the live NDJSON stream matches the durable journal exactly, event for event");
+  // Independently schema-valid too, not just equal to what this run's
+  // own emit() callback happened to produce - the same gap the journal
+  // check just above closed, for every individual durable event.
+  const eventSchema = JSON.parse(await readFile(path.join(root, "schemas/operation-event-v1.schema.json"), "utf8"));
+  // strictRequired: false - operation-event-v1's own conditional
+  // (allOf[0].then.required: ["error"]) requires a property declared in
+  // the schema's OUTER properties block, not repeated locally in
+  // `then` - the same pattern test/apply-contracts.test.mjs's own
+  // validatorFor() already documents needing this for.
+  const eventAjv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false });
+  addFormats(eventAjv);
+  const validateEvent = eventAjv.compile(eventSchema);
+  for (const event of durableEvents) {
+    assert.ok(validateEvent(event), `a durable event does not satisfy schemas/operation-event-v1.schema.json: ${JSON.stringify(validateEvent.errors)} (${JSON.stringify(event)})`);
+  }
 
   // A real, schema-valid current.json genuinely landed on the target -
   // generation 1, this exact operation, this exact release. Validated

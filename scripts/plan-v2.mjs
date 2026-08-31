@@ -136,18 +136,39 @@ export function buildPlanV2(options) {
   return { ...plan, planId: computePlanId(plan) };
 }
 
+// A genuinely canonical JSON serialization - object keys sorted
+// recursively at every depth, array element order always preserved
+// (order there is semantically meaningful; key order in an object never
+// is). A further, 2026-08-31 review found the previous formula used
+// plain `JSON.stringify()` directly - insertion-order-dependent, not
+// actually canonical despite this function's own name and every caller
+// comment claiming otherwise - so two JSON documents with identical
+// content but differently ordered keys (a real possibility: a different
+// JS engine, a formatter, a hand-edit that preserves meaning but not key
+// order) would previously have hashed to two different planIds. Null and
+// every primitive pass through unchanged.
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === "object") {
+    const sorted = {};
+    for (const key of Object.keys(value).sort()) sorted[key] = canonicalize(value[key]);
+    return sorted;
+  }
+  return value;
+}
+
 // The exact, canonical planId computation - a plan-v2 document (or
 // plan-v1's own object, this formula is action-shape-agnostic) minus its
-// own `planId` field, hashed. Exported so a caller reading a plan back
-// off disk (a --plan file, or a journal's own embedded plan) can
-// recompute this independently and confirm the document's own `planId`
-// field genuinely matches its content - a schema-valid plan document
-// with a stale or hand-edited `planId` field would otherwise be
-// silently trusted (a real gap a 2026-08-28 review found: apply.mjs
-// schema-validated a loaded --plan file and compared the caller's
-// --approve-plan-id against the file's own `planId` property, but never
-// confirmed that property was itself honest).
+// own `planId` field, canonicalized, then hashed. Exported so a caller
+// reading a plan back off disk (a --plan file, or a journal's own
+// embedded plan) can recompute this independently and confirm the
+// document's own `planId` field genuinely matches its content - a
+// schema-valid plan document with a stale or hand-edited `planId` field
+// would otherwise be silently trusted (a real gap a 2026-08-28 review
+// found: apply.mjs schema-validated a loaded --plan file and compared
+// the caller's --approve-plan-id against the file's own `planId`
+// property, but never confirmed that property was itself honest).
 export function computePlanId(planWithoutId) {
   const { planId: _ignored, ...rest } = planWithoutId;
-  return sha256(Buffer.from(JSON.stringify(rest)));
+  return sha256(Buffer.from(JSON.stringify(canonicalize(rest))));
 }

@@ -38,7 +38,7 @@ import { runApply } from "../scripts/apply.mjs";
 import { sha256 } from "../scripts/digest.mjs";
 import { runPlan } from "../scripts/plan-command.mjs";
 import { computePlanId } from "../scripts/plan-v2.mjs";
-import { enabledServiceIds } from "../scripts/render-topology.mjs";
+import { enabledServiceIds, renderedFilesContents, renderTopology } from "../scripts/render-topology.mjs";
 import { requiredSecrets } from "../scripts/secrets.mjs";
 import { loadContracts } from "../scripts/contracts.mjs";
 
@@ -114,12 +114,22 @@ function cleanSnapshot(overrides = {}) {
 // target-mutate.test.mjs's own job; this just needs to behave like a
 // real target would.
 function makeFakeMutate() {
-  const state = { lock: null, journals: new Map(), events: new Map(), current: null };
+  const state = { lock: null, journals: new Map(), events: new Map(), current: null, topology: null };
   return {
     state,
     async acquireLock(_conn, lockDocument) {
       if (state.lock) return { acquired: false, lock: state.lock };
       state.lock = lockDocument;
+      return { acquired: true };
+    },
+    // Mirrors target-mutate.mjs's own acquireLockAndJournal() - lock and
+    // journal created together, or neither, matching the real single
+    // remote-script semantics closely enough for these tests (a real
+    // client-crash-mid-way is target-mutate.test.mjs's own concern).
+    async acquireLockAndJournal(_conn, lockDocument, journalDocument) {
+      if (state.lock) return { acquired: false, lock: state.lock };
+      state.lock = lockDocument;
+      state.journals.set(journalDocument.operationId, journalDocument);
       return { acquired: true };
     },
     async readLock() {
@@ -149,6 +159,9 @@ function makeFakeMutate() {
     },
     async readCurrentState() {
       return state.current ? { status: "present", current: state.current } : { status: "absent", current: null };
+    },
+    async readTopology() {
+      return state.topology ? { status: "present", topology: state.topology } : { status: "absent", topology: null };
     },
     async pinnedKnownHosts() {
       return { file: "/dev/null", cleanup: async () => {} };
@@ -213,6 +226,31 @@ async function realInputDigests() {
     };
   })();
   return { ...cachedInputDigests };
+}
+
+// The exact current.json/topology.json a real state.commit dispatch
+// would itself produce for a given approved plan/operationId - calls
+// the same renderTopology()/renderedFilesContents() apply.mjs's own
+// dispatch loop calls, with the same inputs (installationId is always
+// the operationId itself, generation is always 1 for a bootstrap - see
+// apply.mjs's own realInstallationId/generation). Used to build a
+// resume-recovery fixture that survives the full-document comparison a
+// further, 2026-08-31 review found necessary (the old, narrower
+// two-field check was too easy to fool with an unrelated but
+// coincidentally-matching current.json).
+async function realCommittedState({ plan, operationId, inputDigests }) {
+  const { manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema } = await loadContracts();
+  const topology = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId: operationId, generation: 1 });
+  const generatedFiles = renderedFilesContents(topology);
+  const current = {
+    apiVersion: "hof.dev/state/v1", installationId: operationId, generation: 1, lastSuccessfulOperationId: operationId,
+    appliedAt: "2026-08-27T09:01:00Z", release: releaseLock.release,
+    manifestDigest: inputDigests.manifestDigest, releaseLockDigest: inputDigests.releaseLockDigest,
+    catalogDigest: inputDigests.catalogDigest, composeTemplateDigest: inputDigests.composeTemplateDigest,
+    topologyDigest: plan.desired.topologyDigest,
+    generatedArtifacts: Object.fromEntries(Object.entries(generatedFiles).map(([name, contents]) => [name, sha256(Buffer.from(contents))])),
+  };
+  return { current, topology };
 }
 
 test("refuses --target-mode local outright - the Execution Environment cannot mutate the real local host", async () => {
@@ -715,6 +753,146 @@ test("resume: an already-succeeded journal completes cleanly - finishing the one
   assert.ok(events.some((event) => event.type === "apply.committed" && event.committedGeneration === 1));
 });
 
+test("resume: an already-succeeded journal whose lock release fails is reported blocked, never silently blocked: false", async () => {
+  // A further, 2026-08-31 review found the old code discarded a real
+  // releaseLock() failure via a bare `.catch(() => {})`, and even a
+  // clean { released: false } response was never looked at - either
+  // way, blocked: false was returned regardless, silently misreporting
+  // a target that stayed genuinely locked.
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const inputDigests = await realInputDigests();
+  const operationId = "44444444-5555-5555-5555-555555555555";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "succeeded", committedGeneration: 1,
+  });
+  mutate.releaseLock = async () => { throw new Error("simulated transport failure"); };
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /lock could not be confirmed released/);
+  assert.notEqual(mutate.state.lock, null, "the lock is never silently forgotten just because release failed - the target may still be locked");
+});
+
+test("resume: a lock with no journal at all is refused, and the stale lock is released - nothing could have run yet", async () => {
+  // A further, 2026-08-31 review found this case used to refuse forever
+  // with no recovery path: lock and journal are now always created
+  // together (see acquireLockAndJournal()), so a lock with no journal
+  // proves no operation was ever dispatched - safe to clean up.
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const operationId = "44444444-6666-6666-6666-666666666666";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: "sha256:" + "0".repeat(64), target: { mode: "ssh", host: "h", port: 22, user: "u", hostKeySha256: HOST_KEY, installationId: null, baselineGeneration: 0 }, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  // mutate.state.journals stays empty for this operationId.
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /nothing has actually run yet/);
+  assert.equal(mutate.state.lock, null, "the stale lock is released, not left stuck forever");
+});
+
+test("resume: a journal whose own embedded operationId disagrees with the lock's is refused, not trusted", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const inputDigests = await realInputDigests();
+  const operationId = "44444444-7777-7777-7777-777777777777";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    // Read back by the lock's own operationId (the map key), but the
+    // journal DOCUMENT's own embedded operationId field disagrees - a
+    // real cross-binding gap a further, 2026-08-31 review found:
+    // nothing ever compared this field against the lock's.
+    apiVersion: "hof.dev/operation-journal/v1", operationId: "44444444-9999-9999-9999-999999999999", approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /journal's own operationId .* does not match the lock's/);
+});
+
+test("resume: a journal whose own approvedPlanId disagrees with the lock's is refused, before the embedded plan is even trusted", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const inputDigests = await realInputDigests();
+  const operationId = "44444444-8888-8888-8888-888888888888";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: "sha256:" + "0".repeat(64), target: plan.target, plan,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /journal's own approvedPlanId .* does not match the lock's/);
+});
+
+test("resume: a standalone succeeded event with no preceding started is refused as corrupted, never trusted to skip a step that never ran", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const inputDigests = await realInputDigests();
+  const operationId = "44444444-1111-2222-3333-444444444444";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+  const realStep = plan.operations[0].id;
+  mutate.state.events.set(operationId, [
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: realStep, attempt: 1, phase: "succeeded", at: "2026-08-27T09:00:00Z" },
+  ]);
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /corrupted/);
+  assert.equal(mutate.state.lock?.operationId, operationId, "the lock is never released on a corrupted history either - never guessed at");
+});
+
+test("resume: post-commit recovery refuses a current.json that merely coincides on operationId/generation but disagrees on real content", async () => {
+  // A further, 2026-08-31 review found the old recovery check compared
+  // only two fields (lastSuccessfulOperationId, generation) - a
+  // schema-valid but otherwise-unrelated current.json matching those by
+  // coincidence would have passed as "proof" of a real commit.
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const inputDigests = await realInputDigests();
+  const operationId = "44444444-2222-3333-4444-555555555555";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+  const stateCommitOp = plan.operations.find((op) => op.action === "state.commit");
+  const otherOps = plan.operations.filter((op) => op.action !== "state.commit");
+  mutate.state.events.set(operationId, [
+    ...otherOps.flatMap((op) => [
+      { apiVersion: "hof.dev/operation-event/v1", operationId, step: op.id, attempt: 1, phase: "started", at: "2026-08-27T09:00:00Z" },
+      { apiVersion: "hof.dev/operation-event/v1", operationId, step: op.id, attempt: 1, phase: "succeeded", at: "2026-08-27T09:00:01Z" },
+    ]),
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: stateCommitOp.id, attempt: 1, phase: "started", at: "2026-08-27T09:01:00Z" },
+  ]);
+  const { current, topology } = await realCommittedState({ plan, operationId, inputDigests });
+  // Schema-valid (still a real sha256 digest string), matches
+  // operationId and generation, but claims a manifestDigest that
+  // doesn't actually correspond to this run's own real inputs - the
+  // exact kind of mismatch the old two-field check could never see.
+  mutate.state.current = { ...current, manifestDigest: "sha256:" + "0".repeat(64) };
+  mutate.state.topology = topology;
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /unresolved/);
+  assert.equal(mutate.state.lock?.operationId, operationId, "never releases the lock on an unconfirmed recovery");
+});
+
 test("resume: no lock at all on the target refuses cleanly", async () => {
   const mutate = makeFakeMutate();
   const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
@@ -777,14 +955,12 @@ test("resume: state.commit's own real effect already landed on the target (curre
   ]);
   // The real, durable, target-side record - written by the state role's
   // own atomic copy - already confirms state.commit's own effect
-  // genuinely landed, independent of the event log.
-  mutate.state.current = {
-    apiVersion: "hof.dev/state/v1", installationId: operationId, generation: 1, lastSuccessfulOperationId: operationId,
-    appliedAt: "2026-08-27T09:01:00Z", release: "1.0.0",
-    manifestDigest: inputDigests.manifestDigest, releaseLockDigest: inputDigests.releaseLockDigest,
-    catalogDigest: inputDigests.catalogDigest, composeTemplateDigest: inputDigests.composeTemplateDigest,
-    topologyDigest: plan.desired.topologyDigest, generatedArtifacts: {},
-  };
+  // genuinely landed, independent of the event log. A full, real
+  // current.json/topology.json pair (not just a two-field stand-in) -
+  // apply.mjs's own recovery now compares the whole document.
+  const { current, topology } = await realCommittedState({ plan, operationId, inputDigests });
+  mutate.state.current = current;
+  mutate.state.topology = topology;
 
   const dockerCalls = [];
   const result = await withFakeCosign("success", () => runApply({

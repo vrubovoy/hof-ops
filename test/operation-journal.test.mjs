@@ -128,6 +128,66 @@ test("decideStepResumption: succeeded wins over an earlier failed attempt (a rea
   ]), "skip");
 });
 
+// A further, 2026-08-31 review found the pre-this-fix implementation
+// trusted ANY event history containing a "succeeded" phase, in any
+// shape - a real state machine, below, refuses every one of these
+// instead of silently resolving them one way or the other.
+
+test("decideStepResumption: a standalone succeeded event with no preceding started is corrupted, never trusted", () => {
+  assert.equal(decideStepResumption([{ phase: "succeeded", attempt: 1 }]), "corrupted");
+});
+
+test("decideStepResumption: a standalone failed event with no preceding started is corrupted, never trusted", () => {
+  assert.equal(decideStepResumption([{ phase: "failed", attempt: 1, error: "boom" }]), "corrupted");
+});
+
+test("decideStepResumption: two started events for the same attempt is corrupted", () => {
+  assert.equal(decideStepResumption([
+    { phase: "started", attempt: 1 },
+    { phase: "started", attempt: 1 },
+  ]), "corrupted");
+});
+
+test("decideStepResumption: both succeeded and failed recorded for the same attempt is corrupted, not just \"whichever wins\"", () => {
+  assert.equal(decideStepResumption([
+    { phase: "started", attempt: 1 },
+    { phase: "succeeded", attempt: 1 },
+    { phase: "failed", attempt: 1, error: "boom" },
+  ]), "corrupted");
+});
+
+test("decideStepResumption: two succeeded events for the same attempt is corrupted", () => {
+  assert.equal(decideStepResumption([
+    { phase: "started", attempt: 1 },
+    { phase: "succeeded", attempt: 1 },
+    { phase: "succeeded", attempt: 1 },
+  ]), "corrupted");
+});
+
+test("decideStepResumption: a gap in attempt numbers (1 then 3, no 2) is corrupted", () => {
+  assert.equal(decideStepResumption([
+    { phase: "started", attempt: 1 },
+    { phase: "failed", attempt: 1, error: "boom" },
+    { phase: "started", attempt: 3 },
+  ]), "corrupted");
+});
+
+test("decideStepResumption: a next attempt after an unresolved (not failed) earlier attempt is corrupted", () => {
+  assert.equal(decideStepResumption([
+    { phase: "started", attempt: 1 },
+    { phase: "started", attempt: 2 },
+    { phase: "succeeded", attempt: 2 },
+  ]), "corrupted");
+});
+
+test("decideStepResumption: a next attempt after an earlier attempt that already succeeded is corrupted - nothing ever retries a success", () => {
+  assert.equal(decideStepResumption([
+    { phase: "started", attempt: 1 },
+    { phase: "succeeded", attempt: 1 },
+    { phase: "started", attempt: 2 },
+  ]), "corrupted");
+});
+
 test("assertJournalResumable refuses an already-succeeded journal", () => {
   assert.throws(
     () => assertJournalResumable({ operationId: "x", status: "succeeded", committedGeneration: 1 }),

@@ -152,6 +152,27 @@ test("operation-journal-v1: rejects committedGeneration: 0 - a bootstrap always 
   assert.equal(validate(journalFixture({ status: "succeeded", committedGeneration: 0 })), false);
 });
 
+// A further, 2026-08-31 review found the status/committedGeneration
+// pairing this schema's own `status` property description already
+// documented ("succeeded... committedGeneration is then always set")
+// was never actually enforced - a schema-valid but self-contradictory
+// document, either direction, would have been silently accepted.
+
+test("operation-journal-v1: rejects status: succeeded with committedGeneration still null", async () => {
+  const validate = await validatorFor("operation-journal-v1.schema.json");
+  assert.equal(validate(journalFixture({ status: "succeeded", committedGeneration: null })), false);
+});
+
+test("operation-journal-v1: rejects status: in-progress with a committedGeneration already set", async () => {
+  const validate = await validatorFor("operation-journal-v1.schema.json");
+  assert.equal(validate(journalFixture({ status: "in-progress", committedGeneration: 1 })), false);
+});
+
+test("operation-journal-v1: rejects status: failed with a committedGeneration set", async () => {
+  const validate = await validatorFor("operation-journal-v1.schema.json");
+  assert.equal(validate(journalFixture({ status: "failed", committedGeneration: 1 })), false);
+});
+
 // --- operation-event-v1 -------------------------------------------------
 
 function eventFixture(overrides = {}) {

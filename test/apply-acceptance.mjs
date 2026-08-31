@@ -8,7 +8,7 @@
 // inspectTarget() over real SSH, a real plan-v2 build, real
 // target-mutate lock/journal/event writes over real SSH (with sudo), a
 // real `docker run` of the real, published, independently-signed
-// ee-v0.1.1 Execution Environment image for every operation (no local
+// ee-v0.1.2 Execution Environment image for every operation (no local
 // build, no signature bypass, no image override - see baseOptions()
 // below), reaching the real target over a real SSH connection FROM
 // inside that container, running every one of item 8's ten real role
@@ -18,7 +18,7 @@
 // "Item 8 reopened" entry named as missing (finding #9): earlier
 // versions of this file stopped at a real, expected image-pull failure
 // (examples/release-lock.json's own images were illustrative). This one
-// uses the real, published, real-Cosign-signed v0.1.2 platform release
+// uses the real, published, real-Cosign-signed v0.1.3 platform release
 // lock instead - downloaded fresh in before() via `gh release download`
 // - so every image reference in it is genuinely pullable and genuinely
 // signed. The manifest enables only the platform's own mandatory core
@@ -81,13 +81,14 @@ import { runPlan } from "../scripts/plan-command.mjs";
 
 const RECOVERY_AGE_RECIPIENT = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
 // The real platform release this test downloads and applies - see
-// releases/0.1.2.yml (the first real release selection to carry a real
-// ansibleEnvironment). `workflow_dispatch` signs with the DISPATCHING
-// branch's own ref, never a tag (confirmed for real by inspecting the
-// v0.1.1 release's own certificate - `@refs/heads/main`, not
-// `@refs/tags/v0.1.1`), unlike execution-environment.yml's own
-// tag-triggered identity below.
-const RELEASE_VERSION = "0.1.2";
+// releases/0.1.3.yml (reuses releases/0.1.2.yml's own app-component
+// selections unchanged; only ansibleEnvironment moves to ee-v0.1.2, the
+// build that actually carries the secret-file-permission fix - #39/#40).
+// `workflow_dispatch` signs with the DISPATCHING branch's own ref, never
+// a tag (confirmed for real by inspecting the v0.1.1 release's own
+// certificate - `@refs/heads/main`, not `@refs/tags/v0.1.1`), unlike
+// execution-environment.yml's own tag-triggered identity below.
+const RELEASE_VERSION = "0.1.3";
 const RELEASE_LOCK_IDENTITY = "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/heads/main";
 
 const exec = promisify(execFile);
@@ -275,7 +276,7 @@ function baseOptions() {
     recoveryAgeRecipient: RECOVERY_AGE_RECIPIENT,
     dockerRun: loggingDockerRun,
     // No executionEnvironmentImageOverride, no verifyEeSignature stub -
-    // the real, published ee-v0.1.1 image referenced by the real
+    // the real, published ee-v0.1.2 image referenced by the real
     // release lock above, with its real Cosign signature genuinely
     // verified.
     //
@@ -288,7 +289,7 @@ function baseOptions() {
   };
 }
 
-test("a real, full bootstrap apply against the real, published, signed v0.1.2 release - every real role, start to finish, to a genuine generation-1 commit", async () => {
+test("a real, full bootstrap apply against the real, published, signed v0.1.3 release - every real role, start to finish, to a genuine generation-1 commit", async () => {
   // The real operator workflow, exercised for real: a genuine `hofctl
   // plan` run (real inspectTarget() over the real SSH transport this
   // whole fixture already sets up, real cosign verification of the
@@ -379,21 +380,25 @@ test("a real, full bootstrap apply against the real, published, signed v0.1.2 re
   assert.ok(topology.compose.services.schlussel && topology.compose.services.schloss, "the real mandatory-core services must appear in the delivered topology");
 
   // The real supplied TLS certificate/private key genuinely landed on
-  // the target too, byte-for-byte, root-owned, mode 0400. (A real gap a
+  // the target too, byte-for-byte, root-owned, mode 0444. (A real gap a
   // 2026-08-28 review found - Compose's own file-based secrets are a
   // plain bind-mount, so 0400 root-owned is invisible to any non-root
-  // consuming container - is fixed in ansible/roles/secret/tasks/
-  // main.yml as of this very commit, but that source change alone
-  // doesn't affect this exact pinned ee-v0.1.1 image at all - roles/ is
-  // baked in at image-build time. This assertion flips to 444 in the
-  // PR that cuts a new Execution Environment and platform release
-  // actually carrying this fix, once it's genuinely true.)
+  // consuming container, e.g. Wächter's own `USER node` agent - fixed
+  // in ansible/roles/secret/tasks/main.yml (#39), delivered for real as
+  // of ee-v0.1.2/v0.1.3 (#39's source change alone had zero effect on
+  // the previously-pinned ee-v0.1.1 image, since roles/ is baked in at
+  // image-build time). Safe specifically because the containing
+  // directory, /etc/hof/secrets, stays root-only 0700 - checked below.
   const { stdout: deliveredCertificate } = await exec("docker", ["exec", containerName, "cat", "/etc/hof/secrets/hof.tls.certificate"]);
   assert.equal(deliveredCertificate, suppliedTlsCertificatePem);
   const { stdout: deliveredPrivateKey } = await exec("docker", ["exec", containerName, "cat", "/etc/hof/secrets/hof.tls.privateKey"]);
   assert.equal(deliveredPrivateKey, suppliedTlsPrivateKeyPem);
   const { stdout: tlsCertStat } = await exec("docker", ["exec", containerName, "stat", "--format", "%a %U", "/etc/hof/secrets/hof.tls.certificate"]);
-  assert.equal(tlsCertStat.trim(), "400 root");
+  assert.equal(tlsCertStat.trim(), "444 root");
+  const { stdout: tlsKeyStat } = await exec("docker", ["exec", containerName, "stat", "--format", "%a %U", "/etc/hof/secrets/hof.tls.privateKey"]);
+  assert.equal(tlsKeyStat.trim(), "444 root");
+  const { stdout: secretsDirStat } = await exec("docker", ["exec", containerName, "stat", "--format", "%a %U", "/etc/hof/secrets"]);
+  assert.equal(secretsDirStat.trim(), "700 root");
 
   // Docker itself was genuinely installed by host.prepare, and the real
   // application containers are genuinely running under it - not just

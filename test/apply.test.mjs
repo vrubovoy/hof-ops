@@ -238,6 +238,21 @@ async function realInputDigests() {
 // further, 2026-08-31 review found necessary (the old, narrower
 // two-field check was too easy to fool with an unrelated but
 // coincidentally-matching current.json).
+// A full, honest [started, succeeded] event history for every single
+// operation in a plan, in the plan's own real order - the exact shape
+// apply.mjs's own dispatch loop would leave behind after a genuinely
+// complete, successful run. Used to build a "this journal really did
+// succeed" fixture that survives the full verification a further,
+// 2026-08-31 review added to the resume-side succeeded fast path
+// (every step resolving to skip, not just a bare status: "succeeded"
+// field).
+function fullySucceededEvents(operationId, plan) {
+  return plan.operations.flatMap((operation) => [
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: operation.id, attempt: 1, phase: "started", at: "2026-08-27T09:00:00Z" },
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: operation.id, attempt: 1, phase: "succeeded", at: "2026-08-27T09:00:01Z" },
+  ]);
+}
+
 async function realCommittedState({ plan, operationId, inputDigests }) {
   const { manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema } = await loadContracts();
   const topology = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId: operationId, generation: 1 });
@@ -653,7 +668,16 @@ test("resume: a genuinely partial bootstrap (a real mutation already happened, s
     apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
     inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
   });
-  const succeededSteps = plan.operations.filter((operation) => operation.action === "host.prepare" || operation.action === "volume.ensure").map((operation) => operation.id);
+  // Every step up through the last volume.ensure, in the plan's own
+  // real dispatch order - not just steps matching those two action
+  // names cherry-picked out of order. A further, 2026-08-31 review
+  // found apply.mjs now refuses an event history where a later step has
+  // recorded events while an earlier one in plan order has none at all
+  // (never a shape a real run could produce) - this fixture must be a
+  // valid PREFIX of the plan's own operations, matching what a real
+  // partial bootstrap would actually leave behind.
+  const succeededThroughIndex = plan.operations.findLastIndex((operation) => operation.action === "host.prepare" || operation.action === "volume.ensure");
+  const succeededSteps = plan.operations.slice(0, succeededThroughIndex + 1).map((operation) => operation.id);
   mutate.state.events.set(operationId, succeededSteps.flatMap((step) => [
     { apiVersion: "hof.dev/operation-event/v1", operationId, step, attempt: 1, phase: "started", at: "2026-08-27T09:00:00Z" },
     { apiVersion: "hof.dev/operation-event/v1", operationId, step, attempt: 1, phase: "succeeded", at: "2026-08-27T09:00:01Z" },
@@ -743,6 +767,14 @@ test("resume: an already-succeeded journal completes cleanly - finishing the one
     apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
     inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "succeeded", committedGeneration: 1,
   });
+  // A full, honest event history AND the real target-side current.json/
+  // topology.json - a further, 2026-08-31 review found the succeeded
+  // fast path must independently confirm both, not just trust the
+  // journal's own bare status field.
+  mutate.state.events.set(operationId, fullySucceededEvents(operationId, plan));
+  const { current, topology } = await realCommittedState({ plan, operationId, inputDigests });
+  mutate.state.current = current;
+  mutate.state.topology = topology;
   const events = [];
   const result = await withFakeCosign("success", () => runApply({ ...options, resume: true, emit: (event) => events.push(event) }));
   assert.equal(result.blocked, false, JSON.stringify(result));
@@ -769,6 +801,10 @@ test("resume: an already-succeeded journal whose lock release fails is reported 
     apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
     inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "succeeded", committedGeneration: 1,
   });
+  mutate.state.events.set(operationId, fullySucceededEvents(operationId, plan));
+  const { current, topology } = await realCommittedState({ plan, operationId, inputDigests });
+  mutate.state.current = current;
+  mutate.state.topology = topology;
   mutate.releaseLock = async () => { throw new Error("simulated transport failure"); };
   const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
   assert.equal(result.blocked, true);
@@ -792,6 +828,24 @@ test("resume: a lock with no journal at all is refused, and the stale lock is re
   assert.equal(result.reason, "resume");
   assert.match(result.diagnostics[0], /nothing has actually run yet/);
   assert.equal(mutate.state.lock, null, "the stale lock is released, not left stuck forever");
+});
+
+test("resume: a journal that is present but unreadable is refused WITHOUT auto-releasing the lock - unlike absent, it doesn't prove nothing ran", async () => {
+  // A further, 2026-08-31 review found "unreadable" (the file exists
+  // but couldn't be read/parsed - a permission problem, real on-disk
+  // corruption) used to be treated identically to "absent" (provably
+  // never created at all), silently releasing a lock that might be
+  // guarding a real, unresolved operation.
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const operationId = "44444444-7777-8888-9999-000000000000";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: "sha256:" + "0".repeat(64), target: { mode: "ssh", host: "h", port: 22, user: "u", hostKeySha256: HOST_KEY, installationId: null, baselineGeneration: 0 }, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.readJournal = async () => ({ status: "unreadable", journal: null });
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /refusing to guess whether it's safe to release the lock/);
+  assert.notEqual(mutate.state.lock, null, "an unreadable journal never auto-releases the lock - it isn't proof nothing ran");
 });
 
 test("resume: a journal whose own embedded operationId disagrees with the lock's is refused, not trusted", async () => {
@@ -1065,6 +1119,33 @@ test("resume: an event referencing a step that isn't part of the approved plan i
   assert.equal(result.blocked, true);
   assert.equal(result.reason, "resume");
   assert.match(result.diagnostics[0], /isn't part of the approved plan/);
+});
+
+test("resume: a later plan step has recorded events while an earlier one has none at all is refused - never a shape a real run could produce", async () => {
+  // A real run only ever dispatches plan.operations strictly in order -
+  // a further, 2026-08-31 review found nothing checked this globally,
+  // even though every individual event was already schema/operationId/
+  // step-membership valid.
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const inputDigests = await realInputDigests();
+  const operationId = "77777777-6666-6666-6666-666666666666";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+  // Only the LAST step gets events - every earlier step in the plan's
+  // own real order has none at all.
+  const lastStep = plan.operations.at(-1).id;
+  mutate.state.events.set(operationId, [
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: lastStep, attempt: 1, phase: "started", at: "2026-08-27T09:00:00Z" },
+  ]);
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /not a valid prefix of the plan's own dispatch order/);
 });
 
 test("--plan pointing at a schema-valid file whose own planId doesn't match its own content is refused, not trusted", async () => {

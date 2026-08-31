@@ -149,12 +149,17 @@ export async function buildEvent({ operationId, step, attempt, phase, error }) {
 //     or "run", so a future caller that reaches it anyway (a hand-edited
 //     journal, a bug) gets a clear, distinct signal instead of a
 //     misleading one.
-// A real state machine over a step's own event history, not just "does
-// any event say succeeded" - a further, 2026-08-31 review found that
-// shortcut trusted a schema-valid but structurally impossible standalone
-// "succeeded" (no preceding "started"), or a later contradicting event,
-// exactly as readily as a genuine [started, succeeded] pair. The only
-// histories a healthy apply run can ever produce for one step:
+// A real state machine over a step's own event history, checking its
+// PHYSICAL/append order, not just counting phases per attempt - a
+// further, 2026-08-31 review found the counts-only version still
+// trusted a schema-valid but structurally impossible reordering (a
+// "succeeded" appearing in the file BEFORE its own attempt's "started")
+// exactly as readily as a genuine [started, succeeded] pair, since a
+// real, healthy run can only ever append "started" first. `events` is
+// always in true append/file order here (see apply.mjs's own
+// groupByStep(), which preserves relative order per step from the raw
+// NDJSON read). The only histories a healthy apply run can ever produce
+// for one step:
 //   [] -> run
 //   [started] -> blocked (dispatched, no resolution yet)
 //   [started, succeeded] -> skip
@@ -165,13 +170,22 @@ export async function buildEvent({ operationId, step, attempt, phase, error }) {
 //   both support it): every attempt before the last must be exactly
 //   [started, failed], and the LAST attempt is judged by the same three
 //   cases above.
-// Anything else - a gap in attempt numbers, more than one "started" or
-// more than one terminal phase for the same attempt, a non-final attempt
-// that isn't a clean failure, a standalone terminal event - is
+// Anything else - attempt numbers that decrease or skip, a resolution
+// phase preceding its own attempt's start, more than one event past the
+// start, a non-final attempt that isn't a clean failure - is
 // "corrupted": never silently resolved one way or the other, always
 // refused by the caller (see apply.mjs's own resume dispatch loop).
 export function decideStepResumption(events) {
   if (events.length === 0) return "run";
+
+  // Attempt numbers may never decrease as the file is read in order - a
+  // real retry always starts a strictly new, higher attempt, never
+  // revisits or interleaves with one already left behind.
+  let lastSeenAttempt = 0;
+  for (const event of events) {
+    if (event.attempt < lastSeenAttempt) return "corrupted";
+    lastSeenAttempt = event.attempt;
+  }
 
   const byAttempt = new Map();
   for (const event of events) {
@@ -182,19 +196,18 @@ export function decideStepResumption(events) {
   if (attempts.some((attempt, index) => attempt !== index + 1)) return "corrupted"; // gap, or doesn't start at 1
 
   for (const attempt of attempts) {
-    const phases = byAttempt.get(attempt);
-    const startedCount = phases.filter((phase) => phase === "started").length;
-    const succeededCount = phases.filter((phase) => phase === "succeeded").length;
-    const failedCount = phases.filter((phase) => phase === "failed").length;
-    if (startedCount !== 1) return "corrupted"; // exactly one started per attempt, always
-    if (succeededCount + failedCount > 1) return "corrupted"; // at most one terminal phase per attempt
+    const phases = byAttempt.get(attempt); // already in physical/append order, per attempt
+    if (phases.length > 2) return "corrupted"; // at most "started" + one resolution per attempt
+    if (phases[0] !== "started") return "corrupted"; // the very first event for any attempt must be its own start - never a resolution preceding it, never a duplicate
+    const resolution = phases[1]; // undefined if this attempt hasn't resolved yet
+    if (resolution !== undefined && resolution !== "succeeded" && resolution !== "failed") return "corrupted"; // e.g. a duplicate "started" - unreachable via the schema's own phase enum otherwise, defense in depth
     const isFinalAttempt = attempt === attempts[attempts.length - 1];
-    if (!isFinalAttempt && !(failedCount === 1 && succeededCount === 0)) return "corrupted"; // only a genuine failure ever justifies a next attempt
+    if (!isFinalAttempt && resolution !== "failed") return "corrupted"; // only a genuine failure ever justifies a next attempt
   }
 
   const finalPhases = byAttempt.get(attempts[attempts.length - 1]);
-  if (finalPhases.includes("succeeded")) return "skip";
-  if (finalPhases.includes("failed")) return "failed";
+  if (finalPhases[1] === "succeeded") return "skip";
+  if (finalPhases[1] === "failed") return "failed";
   return "blocked";
 }
 

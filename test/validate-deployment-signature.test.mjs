@@ -13,6 +13,7 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 import { validateDeployment } from "../scripts/validate-deployment.mjs";
@@ -97,13 +98,22 @@ test("the pinned temp blob file is always cleaned up, on both a passing and a fa
   await withFakeCosign({ HOF_TEST_COSIGN_OUTCOME: "success" }, () => validateDeployment(baseOptions()));
   await withFakeCosign({ HOF_TEST_COSIGN_OUTCOME: "failure" }, () => validateDeployment(baseOptions()));
 
-  const after = (await readdir(tmpdir())).filter((name) => name.startsWith("hof-release-lock-"));
-  // Not a strict equality - node:test runs separate test *files*
-  // concurrently, and another file's own verifyReleaseLockSignature
-  // call can legitimately add/remove a same-prefixed temp file in the
-  // shared OS tmpdir during this exact window. The real invariant this
-  // test owns is narrower: its own two calls above must not leave a NET
-  // increase behind, regardless of what else is happening concurrently.
+  // Not a strict equality, and not a single immediate snapshot either -
+  // node:test runs separate test *files* concurrently, every pinned
+  // temp file gets a genuinely unique randomUUID() name (no way to
+  // attribute one to "this test's own call" by name alone), and each
+  // concurrent caller's own cleanup runs in a `finally` moments after
+  // its own use, not necessarily before this test's own single `after`
+  // snapshot happens to land. A brief poll lets that ordinary,
+  // momentary overlap settle out on its own, the same way it always
+  // eventually would in reality - a REAL leak (the actual thing this
+  // test exists to catch) never clears no matter how long this waits.
+  let after;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    after = (await readdir(tmpdir())).filter((name) => name.startsWith("hof-release-lock-"));
+    if (after.length <= before.length) break;
+    await setTimeout(50);
+  }
   assert.ok(after.length <= before.length, `no leftover pinned release-lock temp file from this test's own two calls (before=${before.length}, after=${after.length})`);
 });
 

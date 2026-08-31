@@ -280,15 +280,85 @@ function summarizePlanDiff(approved, recomputed) {
     : "every top-level field looks identical despite a different planId - this points at a canonicalization bug, not a real content change";
 }
 
-// The one real plan-v2 computation a fresh (non-resume) apply run needs
-// twice: once before the lock is ever acquired (so a plan that's
-// already stale doesn't cost a wasted lock round trip), and once again
-// after the lock is held, against a second, genuinely fresh inspection
-// (ADR 0004's own stale-plan recheck, now a full canonical-document
-// recompute rather than a 3-field comparison - see PLATFORM-OPS-PLAN.md's
-// "Item 8 reopened" entry). Factored out once rather than duplicated so
-// the two calls can never quietly drift apart from each other.
-// Returns either a blocked() result or { plan }.
+// The exact current.json/topology.json a real state.commit dispatch for
+// this operationId/generation would itself produce - shared between the
+// real dispatch/commit code and resume's own succeeded-journal
+// verification, so the two can never independently drift out of sync.
+// installationId is always the operationId itself, generation always 1
+// - item 8's own scope (ADR 0004) is bootstrap-only.
+function computeExpectedCommittedState({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, plan, operationId, generation, inputDigests }) {
+  const appliedRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId: operationId, generation });
+  const generatedFiles = renderedFilesContents(appliedRendered);
+  // topologyDigest is deliberately the plan's own already-computed
+  // value, not recomputed from appliedRendered here - that digest's own
+  // formula excludes the installation id by design (a real apply
+  // changes it), so it's identical either way, and reusing the plan's
+  // own value keeps this from ever silently drifting out of sync with
+  // what buildPlanV2 already validated.
+  const currentState = {
+    apiVersion: "hof.dev/state/v1",
+    installationId: operationId,
+    generation,
+    lastSuccessfulOperationId: operationId,
+    appliedAt: new Date().toISOString(),
+    release: releaseLock.release,
+    manifestDigest: inputDigests.manifestDigest,
+    releaseLockDigest: inputDigests.releaseLockDigest,
+    catalogDigest: inputDigests.catalogDigest,
+    composeTemplateDigest: inputDigests.composeTemplateDigest,
+    topologyDigest: plan.desired.topologyDigest,
+    generatedArtifacts: Object.fromEntries(Object.entries(generatedFiles).map(([name, contents]) => [name, sha256(Buffer.from(contents))])),
+  };
+  return { currentState, appliedRendered, generatedFiles };
+}
+
+// Reads and validates every durable event for operationId - schema,
+// operationId, known-step membership, PHYSICAL append order (see
+// decideStepResumption()'s own comment), and the plan's own dispatch
+// order (a real run only ever dispatches plan.operations strictly in
+// array order, so a later step can never have recorded events while an
+// earlier one has none at all). Returns eventsByStep on success, throws
+// a plain Error carrying a human message on any violation - the caller
+// turns that into blocked("resume", ...).
+async function readAndValidateEvents(m, mutateConn, operationId, plan) {
+  let rawEvents;
+  try {
+    rawEvents = await m.readEvents(mutateConn, operationId);
+  } catch (error) {
+    throw new Error(`could not read operation events for ${operationId}: ${error instanceof Error ? error.message : error}`);
+  }
+  const knownStepIds = new Set(plan.operations.map((operation) => operation.id));
+  for (const event of rawEvents) {
+    try {
+      await assertEventValid(event);
+    } catch (error) {
+      throw new Error(`a recorded event for operation ${operationId} does not satisfy its own schema - refusing to trust it: ${error instanceof Error ? error.message : error}`);
+    }
+    if (event.operationId !== operationId) {
+      throw new Error(`a recorded event claims operationId ${event.operationId}, but this resume is for ${operationId} - refusing to trust it`);
+    }
+    if (!knownStepIds.has(event.step)) {
+      throw new Error(`a recorded event references step ${event.step}, which isn't part of the approved plan's own operations - refusing to trust it`);
+    }
+  }
+  const eventsByStep = groupByStep(rawEvents);
+  // The plan's own dispatch order: a real run only ever advances to
+  // plan.operations[i+1] once plan.operations[i] is already resolved
+  // (skip, from an earlier pass, or dispatched-and-resolved in this
+  // one) - so a later step recording events while an earlier one has
+  // none at all is never a shape a healthy run could produce.
+  let seenGap = false;
+  for (const operation of plan.operations) {
+    const stepEvents = eventsByStep.get(operation.id) ?? [];
+    if (stepEvents.length === 0) {
+      seenGap = true;
+    } else if (seenGap) {
+      throw new Error(`step ${operation.id} has recorded events but an earlier step in the approved plan has none at all - the event history is not a valid prefix of the plan's own dispatch order, refusing to trust it`);
+    }
+  }
+  return eventsByStep;
+}
+
 // Reports whether releaseLock() genuinely cleared the target's own lock
 // file - never swallowed into a bare `.catch(() => {})` and never
 // discarded the { released: false } case either, the way this file used
@@ -307,6 +377,15 @@ async function tryReleaseLock(m, mutateConn, operationId) {
   }
 }
 
+// The one real plan-v2 computation a fresh (non-resume) apply run needs
+// twice: once before the lock is ever acquired (so a plan that's
+// already stale doesn't cost a wasted lock round trip), and once again
+// after the lock is held, against a second, genuinely fresh inspection
+// (ADR 0004's own stale-plan recheck, now a full canonical-document
+// recompute rather than a 3-field comparison - see PLATFORM-OPS-PLAN.md's
+// "Item 8 reopened" entry). Factored out once rather than duplicated so
+// the two calls can never quietly drift apart from each other.
+// Returns either a blocked() result or { plan }.
 async function computeLivePlanV2({ snapshot, manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, targetMode, host, port, user, recoveryAgeRecipient, repairDrift }) {
   // `hofctl preflight` already runs this exact check, but apply itself
   // never required a successful preflight run first, and the Ansible
@@ -428,7 +507,7 @@ export async function runApply(options) {
     return blocked("approval", "hofctl apply requires both --approve-plan-id and --plan (the exact plan-v2 document being approved) unless --resume is given - approving a plan approves that exact content, see ADR 0004");
   }
 
-  const { errors, manifest, catalog, catalogBytes, releaseLock, releaseLockBytes, servicesBytes, servicesSchema, catalogSchema, releaseLockSchema } =
+  const { errors, manifest, catalog, catalogBytes, releaseLock, releaseLockBytes, servicesBytes, composeTemplateBytes, servicesSchema, catalogSchema, releaseLockSchema } =
     await loadAndValidateDeploymentWithBytes(options);
   if (errors.length > 0) return { blocked: true, reason: "deployment", diagnostics: errors };
   if (!releaseLock.ansibleEnvironment) return blocked("execution-environment", "release lock has no ansibleEnvironment - cannot apply");
@@ -537,6 +616,7 @@ export async function runApply(options) {
   let plan;
   let journal;
   let inputDigests;
+  let eventsByStep = new Map();
 
   if (options.resume) {
     // Deliberately never re-derives a live baseline/diff here (unlike
@@ -562,17 +642,28 @@ export async function runApply(options) {
     operationId = lock.operationId;
 
     const { status: journalStatus, journal: existing } = await m.readJournal(mutateConn, operationId);
-    if (journalStatus !== "present") {
+    if (journalStatus === "absent") {
       // Lock and journal are now always created together, as one remote
       // operation (see acquireLockAndJournal()'s own comment) - no
       // operation is EVER dispatched before both durably exist, so a
-      // lock with no journal proves nothing has actually run yet. Safe
-      // to clean up and hand the operator back to a fresh apply - this
-      // isn't "guessing" about a real operation outcome, there wasn't
-      // one (a further, 2026-08-31 review found this case used to
-      // refuse forever, with no recovery path at all).
+      // journal PROVABLY ABSENT (not merely unreadable - see below)
+      // proves nothing has actually run yet. Safe to clean up and hand
+      // the operator back to a fresh apply - this isn't "guessing"
+      // about a real operation outcome, there wasn't one (a further,
+      // 2026-08-31 review found this case used to refuse forever, with
+      // no recovery path at all).
       const release = await tryReleaseLock(m, mutateConn, operationId);
-      return blocked("resume", `lock references operation ${operationId} but its journal could not be read (status: ${journalStatus}) - since no operation ever dispatches before both are created together, nothing has actually run yet; ${release.released ? "the stale lock has been released - run a fresh (non-resume) apply" : `the stale lock could not be released (${release.note}) - investigate the target directly`}`);
+      return blocked("resume", `lock references operation ${operationId} but its journal is absent - since no operation ever dispatches before both are created together, nothing has actually run yet; ${release.released ? "the stale lock has been released - run a fresh (non-resume) apply" : `the stale lock could not be released (${release.note}) - investigate the target directly`}`);
+    }
+    if (journalStatus !== "present") {
+      // "unreadable" (the file exists but couldn't be read/parsed) does
+      // NOT prove nothing ran - unlike "absent", it's a genuinely
+      // ambiguous state (a permission problem, real on-disk corruption)
+      // that must never be auto-cleaned. A further, 2026-08-31 review
+      // found this used to be treated identically to "absent", silently
+      // releasing a lock that might be guarding a real, unresolved
+      // operation.
+      return blocked("resume", `lock references operation ${operationId} but its journal could not be read (status: ${journalStatus}) - refusing to guess whether it's safe to release the lock; investigate the target directly (the lock remains held)`);
     }
     try {
       await assertJournalValid(existing);
@@ -616,6 +707,50 @@ export async function runApply(options) {
       return blocked("resume", `the journal for operation ${operationId} carries a plan/journal/lock whose own target bindings disagree - refusing to trust it`);
     }
 
+    // Every check below - platform, input digests, host key, the event
+    // stream itself - now runs UNCONDITIONALLY, before ever branching on
+    // journal status, including for an already-"succeeded" journal. A
+    // further, 2026-08-31 review found the succeeded fast path used to
+    // run before all of this: platform validation, live host-key
+    // comparison, input digest comparison, and event validation were
+    // all skipped outright, and the target's own current.json/
+    // topology.json were never independently confirmed to back up the
+    // journal's own claim at all.
+
+    // The exact same platform check the fresh path runs (see
+    // computeLivePlanV2) - resume must never skip it just because it
+    // also, deliberately, skips baseline resolution.
+    const resumeOsCheck = checkOs(snapshot);
+    if (resumeOsCheck.status !== "pass") return blocked("platform", resumeOsCheck.message);
+    const resumeArchitectureCheck = checkArchitecture(snapshot);
+    if (resumeArchitectureCheck.status !== "pass") return blocked("platform", resumeArchitectureCheck.message);
+
+    const currentDigests = {
+      manifestDigest: sha256(servicesBytes),
+      releaseLockDigest: sha256(releaseLockBytes),
+      catalogDigest: sha256(catalogBytes),
+      // The exact bytes loadAndValidateDeployment() already read - never
+      // an independent second read of the same file (see
+      // loadAndValidateDeploymentWithBytes()'s own comment on the
+      // TOCTOU that used to leave open).
+      composeTemplateDigest: sha256(composeTemplateBytes),
+      executionEnvironmentDigest: releaseLock.ansibleEnvironment.image.slice(releaseLock.ansibleEnvironment.image.indexOf("@") + 1),
+    };
+    const changedDigest = Object.keys(currentDigests).find((key) => currentDigests[key] !== existing.inputDigests[key]);
+    if (changedDigest) {
+      return blocked("resume", `${changedDigest} has changed since operation ${operationId} was journaled (was ${existing.inputDigests[changedDigest]}, now ${currentDigests[changedDigest]}) - refusing to resume against changed inputs, see ADR 0004`);
+    }
+    if (snapshot.transport.trustDigest !== existing.target.hostKeySha256) {
+      return blocked("stale-plan", `host key changed since operation ${operationId} was journaled (was ${existing.target.hostKeySha256}, now ${snapshot.transport.trustDigest}) - refusing to resume`);
+    }
+
+    let resumeEventsByStep;
+    try {
+      resumeEventsByStep = await readAndValidateEvents(m, mutateConn, operationId, existing.plan);
+    } catch (error) {
+      return blocked("resume", error instanceof Error ? error.message : String(error));
+    }
+
     // A journal already marked "succeeded" means state.commit's own
     // real effect landed AND the journal update itself landed - the
     // only thing that could still be outstanding is releasing the lock
@@ -623,12 +758,44 @@ export async function runApply(options) {
     // assertJournalResumable() would otherwise throw "nothing to
     // resume" and leave that lock stuck forever, since nothing else
     // ever calls releaseLock() for an already-succeeded journal.
-    // Finishing that one remaining step here is not "guessing" - both
-    // durable facts this run cares about (the journal's own terminal
-    // status, already schema- and cross-binding-validated above) already
-    // say it's done. Only reached AFTER every check above, not before -
-    // see those comments for why.
+    // Finishing that one remaining step here is not "guessing" - every
+    // durable fact this run can check (schema, cross-binding, platform,
+    // digests, host key, the event stream's own internal consistency,
+    // AND the target's own real current.json/topology.json - not just
+    // the journal's bare `status` field) already says it's done. Only
+    // reached AFTER every check above, not before - see those comments
+    // for why.
     if (existing.status === "succeeded") {
+      const allStepsResolved = existing.plan.operations.every((operation) => decideStepResumption(resumeEventsByStep.get(operation.id) ?? []) === "skip");
+      if (!allStepsResolved) {
+        return blocked("resume", `the journal for operation ${operationId} claims status "succeeded", but its own recorded event history doesn't show every operation actually resolved - refusing to trust a completion claim its own evidence doesn't support`);
+      }
+      const { currentState: expectedCurrentState, appliedRendered: expectedTopology } = computeExpectedCommittedState({
+        manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema,
+        plan: existing.plan, operationId, generation, inputDigests: currentDigests,
+      });
+      const { status: liveCurrentStatus, current: liveCurrent } = await m.readCurrentState(mutateConn);
+      if (liveCurrentStatus !== "present") {
+        return blocked("resume", `the journal for operation ${operationId} claims status "succeeded", but the target's own current.json could not be confirmed present (status: ${liveCurrentStatus}) - refusing to trust a completion claim its own evidence doesn't support`);
+      }
+      try {
+        await validateStateV1(liveCurrent);
+      } catch (error) {
+        return blocked("resume", error instanceof Error ? error.message : String(error));
+      }
+      // appliedAt is the one field excluded from the comparison on
+      // purpose - it timestamps the ORIGINAL commit moment, never
+      // expected to equal a freshly-generated value computed just now.
+      const { appliedAt: _expectedAppliedAt, ...expectedWithoutTimestamp } = expectedCurrentState;
+      const { appliedAt: _liveAppliedAt, ...liveWithoutTimestamp } = liveCurrent;
+      if (JSON.stringify(liveWithoutTimestamp) !== JSON.stringify(expectedWithoutTimestamp)) {
+        return blocked("resume", `the journal for operation ${operationId} claims status "succeeded", but the target's own current.json doesn't match what this exact operation would have committed - refusing to trust a completion claim its own evidence doesn't support`);
+      }
+      const { status: liveTopologyStatus, topology: liveTopology } = await m.readTopology(mutateConn);
+      if (liveTopologyStatus !== "present" || JSON.stringify(liveTopology) !== JSON.stringify(expectedTopology)) {
+        return blocked("resume", `the journal for operation ${operationId} claims status "succeeded", but the target's own topology.json could not be confirmed to match - refusing to trust a completion claim its own evidence doesn't support`);
+      }
+
       const release = await tryReleaseLock(m, mutateConn, operationId);
       if (!release.released) {
         // The operation itself genuinely did succeed - but claiming
@@ -644,32 +811,10 @@ export async function runApply(options) {
     }
     assertJournalResumable(existing);
 
-    // The exact same platform check the fresh path runs (see
-    // computeLivePlanV2) - resume must never skip it just because it
-    // also, deliberately, skips baseline resolution.
-    const resumeOsCheck = checkOs(snapshot);
-    if (resumeOsCheck.status !== "pass") return blocked("platform", resumeOsCheck.message);
-    const resumeArchitectureCheck = checkArchitecture(snapshot);
-    if (resumeArchitectureCheck.status !== "pass") return blocked("platform", resumeArchitectureCheck.message);
-
-    const currentDigests = {
-      manifestDigest: sha256(servicesBytes),
-      releaseLockDigest: sha256(releaseLockBytes),
-      catalogDigest: sha256(catalogBytes),
-      composeTemplateDigest: sha256(await readFile(path.join(root, "scripts/render-topology.mjs"))),
-      executionEnvironmentDigest: releaseLock.ansibleEnvironment.image.slice(releaseLock.ansibleEnvironment.image.indexOf("@") + 1),
-    };
-    const changedDigest = Object.keys(currentDigests).find((key) => currentDigests[key] !== existing.inputDigests[key]);
-    if (changedDigest) {
-      return blocked("resume", `${changedDigest} has changed since operation ${operationId} was journaled (was ${existing.inputDigests[changedDigest]}, now ${currentDigests[changedDigest]}) - refusing to resume against changed inputs, see ADR 0004`);
-    }
-    if (snapshot.transport.trustDigest !== existing.target.hostKeySha256) {
-      return blocked("stale-plan", `host key changed since operation ${operationId} was journaled (was ${existing.target.hostKeySha256}, now ${snapshot.transport.trustDigest}) - refusing to resume`);
-    }
-
     plan = existing.plan;
     journal = existing;
     inputDigests = currentDigests; // already proven identical to existing.inputDigests above
+    eventsByStep = resumeEventsByStep; // already read and validated above - never re-read further down
   } else {
     operationId = newOperationId();
 
@@ -686,7 +831,11 @@ export async function runApply(options) {
       manifestDigest: sha256(servicesBytes),
       releaseLockDigest: sha256(releaseLockBytes),
       catalogDigest: sha256(catalogBytes),
-      composeTemplateDigest: sha256(await readFile(path.join(root, "scripts/render-topology.mjs"))),
+      // The exact bytes loadAndValidateDeployment() already read - never
+      // an independent second read of the same file (see
+      // loadAndValidateDeploymentWithBytes()'s own comment on the
+      // TOCTOU that used to leave open).
+      composeTemplateDigest: sha256(composeTemplateBytes),
       // Same slice build-release-lock.mjs's own verifySupplyChain already
       // uses to pull a digest back out of a repo@sha256:... reference.
       executionEnvironmentDigest: releaseLock.ansibleEnvironment.image.slice(releaseLock.ansibleEnvironment.image.indexOf("@") + 1),
@@ -757,9 +906,12 @@ export async function runApply(options) {
   // it recomputes the exact same real installation id too, without ever
   // having to persist it anywhere new.
   const realInstallationId = operationId;
-  let appliedRendered;
+  let appliedRendered, currentState, generatedFiles;
   try {
-    appliedRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId: realInstallationId, generation });
+    ({ appliedRendered, currentState, generatedFiles } = computeExpectedCommittedState({
+      manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema,
+      plan, operationId: realInstallationId, generation, inputDigests,
+    }));
   } catch (error) {
     if (!options.resume) await m.releaseLock(mutateConn, operationId).catch(() => {});
     return blocked("render", error instanceof Error ? error.message : String(error));
@@ -832,7 +984,6 @@ export async function runApply(options) {
       await writeFile(secretsFile, JSON.stringify(secretValues), { mode: 0o600 });
 
       const generatedFilesDir = path.join(workDir, "generated");
-      const generatedFiles = renderedFilesContents(appliedRendered);
       await mkdir(generatedFilesDir, { recursive: true });
       await Promise.all(Object.entries(generatedFiles).map(([name, contents]) => writeFile(path.join(generatedFilesDir, name), contents)));
 
@@ -843,29 +994,12 @@ export async function runApply(options) {
       // above already delivers under that same filename for a
       // completely different purpose (see state.mjs's own
       // assertRenderedShape comment on why those two must never be
-      // confused). topologyDigest is deliberately plan.desired's own
-      // already-computed value, not recomputed from appliedRendered -
-      // that digest's own formula excludes the installation id by
-      // design (see state.mjs's own unitConfigFingerprint comment: "a
-      // real apply changes it"), so it's identical either way, and
-      // reusing the plan's own value keeps this from ever silently
-      // drifting out of sync with what buildPlanV2 already validated.
+      // confused). Both currentState and appliedRendered were already
+      // computed once, above, by computeExpectedCommittedState() - the
+      // exact same construction resume's own succeeded-journal
+      // verification uses, so the two can never drift apart.
       const stateDir = path.join(workDir, "state");
       await mkdir(stateDir, { recursive: true });
-      const currentState = {
-        apiVersion: "hof.dev/state/v1",
-        installationId: realInstallationId,
-        generation,
-        lastSuccessfulOperationId: operationId,
-        appliedAt: new Date().toISOString(),
-        release: releaseLock.release,
-        manifestDigest: inputDigests.manifestDigest,
-        releaseLockDigest: inputDigests.releaseLockDigest,
-        catalogDigest: inputDigests.catalogDigest,
-        composeTemplateDigest: inputDigests.composeTemplateDigest,
-        topologyDigest: plan.desired.topologyDigest,
-        generatedArtifacts: Object.fromEntries(Object.entries(generatedFiles).map(([name, contents]) => [name, sha256(Buffer.from(contents))])),
-      };
       await writeFile(path.join(stateDir, "current.json"), JSON.stringify(currentState));
       await writeFile(path.join(stateDir, "topology.json"), JSON.stringify(appliedRendered));
 
@@ -887,36 +1021,12 @@ export async function runApply(options) {
         installationId: realInstallationId, generation, dockerNetwork: options.executionEnvironmentDockerNetwork,
       };
 
-      let eventsByStep = new Map();
-      if (options.resume) {
-        let rawEvents;
-        try {
-          rawEvents = await m.readEvents(mutateConn, operationId);
-        } catch (error) {
-          return blocked("resume", `could not read operation events for ${operationId}: ${error instanceof Error ? error.message : error}`);
-        }
-        // target-mutate.mjs's own readEvents() only ever JSON.parses
-        // each NDJSON line - a hand-tampered or foreign event (a
-        // different operationId, or a step that isn't even part of this
-        // approved plan) must never be silently trusted, since
-        // decideStepResumption() below acts directly on phase:
-        // "succeeded" to skip a step outright.
-        const knownStepIds = new Set(plan.operations.map((operation) => operation.id));
-        for (const event of rawEvents) {
-          try {
-            await assertEventValid(event);
-          } catch (error) {
-            return blocked("resume", `a recorded event for operation ${operationId} does not satisfy its own schema - refusing to trust it: ${error instanceof Error ? error.message : error}`);
-          }
-          if (event.operationId !== operationId) {
-            return blocked("resume", `a recorded event claims operationId ${event.operationId}, but this resume is for ${operationId} - refusing to trust it`);
-          }
-          if (!knownStepIds.has(event.step)) {
-            return blocked("resume", `a recorded event references step ${event.step}, which isn't part of the approved plan's own operations - refusing to trust it`);
-          }
-        }
-        eventsByStep = groupByStep(rawEvents);
-      }
+      // eventsByStep was already read and validated (schema, operationId,
+      // known-step membership, physical append order, plan-dispatch-order
+      // gap check - see readAndValidateEvents()) up in the resume branch
+      // itself, before it was ever trusted for the succeeded-journal fast
+      // path either - never re-read here. Stays the empty Map its outer
+      // declaration defaults to on a fresh (non-resume) apply.
       const imageTrustByUnit = new Map();
 
       for (const operation of plan.operations) {
@@ -1009,7 +1119,16 @@ export async function runApply(options) {
 
       const committedJournal = await withJournalStatus(journal, { status: "succeeded", committedGeneration: generation });
       await m.updateJournalStatus(mutateConn, committedJournal);
-      await m.releaseLock(mutateConn, operationId);
+      const release = await tryReleaseLock(m, mutateConn, operationId);
+      if (!release.released) {
+        // The operation itself genuinely did succeed - state committed,
+        // journal marked succeeded - but claiming blocked: false here
+        // anyway would silently misreport a target that might still be
+        // locked. A further, 2026-08-31 review found this exact call
+        // used to discard its own return value outright, the same gap
+        // already closed for the resume-side succeeded fast path.
+        return blocked("lock", `operation ${operationId} committed successfully (generation ${generation}), but its lock could not be confirmed released: ${release.note} - the target may still be locked; investigate directly rather than assuming a clean run`);
+      }
       emit({ type: "apply.committed", operationId, committedGeneration: generation });
 
       return { blocked: false, operationId, committedGeneration: generation, planId: plan.planId };
@@ -1042,7 +1161,15 @@ async function loadAndValidateDeploymentWithBytes(options) {
   // its own standalone CLI's option shape) - runApply's own public
   // options use manifestPath, matching runPlan()'s convention, so this
   // remaps the same way plan-command.mjs's own runPlan() already does.
-  const result = await loadAndValidateDeployment({
+  // loadAndValidateDeployment() itself now returns the exact bytes it
+  // read services.yml/catalog/release-lock/render-topology.mjs from -
+  // this function used to independently re-read all three deployment
+  // files a SECOND time here, just for their digests; a further,
+  // 2026-08-31 review found that a real TOCTOU (a file edited on the
+  // workstation between the two reads could mean planning happened
+  // against different bytes than the journal ends up recording a
+  // digest of). Reusing the same read closes it by construction.
+  return loadAndValidateDeployment({
     servicesPath: options.manifestPath,
     catalogPath: options.catalogPath,
     releaseLockPath: options.releaseLockPath,
@@ -1050,11 +1177,4 @@ async function loadAndValidateDeploymentWithBytes(options) {
     releaseLockOidcIssuer: options.releaseLockOidcIssuer,
     skipSignature: false,
   });
-  const catalogPath = options.catalogPath ?? path.join(root, "catalog/services-v1.yaml");
-  const [servicesBytes, catalogBytes, releaseLockBytes] = await Promise.all([
-    readFile(options.manifestPath).catch(() => Buffer.alloc(0)),
-    readFile(catalogPath).catch(() => Buffer.alloc(0)),
-    readFile(options.releaseLockPath).catch(() => Buffer.alloc(0)),
-  ]);
-  return { ...result, servicesBytes, catalogBytes, releaseLockBytes };
 }

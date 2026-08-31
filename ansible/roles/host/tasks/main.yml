@@ -133,8 +133,15 @@
     state: present
     update_cache: true
 
+# Deliberately unconditional - a further, 2026-08-31 review found this
+# gated on `hof_docker_check.rc != 0` (Engine genuinely absent before
+# this run), silently leaving an already-installed-but-disabled-or-
+# stopped Docker service untouched (a real, plausible case: an image
+# with docker.service masked, or a prior manual `systemctl disable
+# docker`). `ansible.builtin.systemd` with enabled/state already
+# reports changed: false when nothing needed doing, so running this
+# unconditionally costs nothing on the common already-fine case.
 - name: Docker service is enabled and running
-  when: hof_docker_check.rc != 0
   ansible.builtin.systemd:
     name: docker
     enabled: true

@@ -364,7 +364,12 @@ test("a real, full bootstrap apply against the real, published, signed v0.1.3 re
   // own emit() callback happened to produce - the same gap the journal
   // check just above closed, for every individual durable event.
   const eventSchema = JSON.parse(await readFile(path.join(root, "schemas/operation-event-v1.schema.json"), "utf8"));
-  const eventAjv = new Ajv2020({ allErrors: true, strict: true });
+  // strictRequired: false - operation-event-v1's own conditional
+  // (allOf[0].then.required: ["error"]) requires a property declared in
+  // the schema's OUTER properties block, not repeated locally in
+  // `then` - the same pattern test/apply-contracts.test.mjs's own
+  // validatorFor() already documents needing this for.
+  const eventAjv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false });
   addFormats(eventAjv);
   const validateEvent = eventAjv.compile(eventSchema);
   for (const event of durableEvents) {

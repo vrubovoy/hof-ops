@@ -91,6 +91,8 @@ const ACTION_TO_ROLE = {
   "config.write": "config",
   "database.migrate": "database",
   "service.start": "service",
+  "service.stop": "service",
+  "service.remove": "service",
   "readiness.wait": "readiness",
   "state.commit": "state",
 };
@@ -153,8 +155,23 @@ function buildExtraVars(operation, { commitGeneration, imageTrustByUnit, install
       vars.hof_migrate_schema = operation.schema;
       break;
     case "service.start":
+      vars.hof_service_action = "start";
       vars.hof_service_unit = operation.resource;
       vars.hof_service_image = operation.image;
+      break;
+    // Item 9 (ADR 0005): applied-mode-only, never dispatched for a
+    // bootstrap plan (bootstrap-actions.mjs's own whitelist has neither
+    // action at all). installationId here is the exact same value this
+    // whole apply is bound to (bootstrap's own fresh operationId, or an
+    // already-applied installation's own permanent id) - discovery in
+    // the service role's own tasks must scope to exactly this
+    // installation, never a foreign one sharing the same host and unit
+    // name.
+    case "service.stop":
+    case "service.remove":
+      vars.hof_service_action = operation.action === "service.stop" ? "stop" : "remove";
+      vars.hof_service_unit = operation.resource;
+      vars.hof_installation_id = installationId;
       break;
     case "readiness.wait":
       vars.hof_readiness_unit = operation.resource;
@@ -1016,10 +1033,16 @@ export async function runApply(options) {
       // computed once, above, by computeExpectedCommittedState() - the
       // exact same construction resume's own succeeded-journal
       // verification uses, so the two can never drift apart.
+      // Item 9 (ADR 0005): release-lock.json - the exact release lock
+      // this commit was actually applied under, written alongside
+      // current.json/topology.json for the state role's own immutable
+      // per-generation snapshot (generations/NNNNNN/*) - a later item
+      // (10/11) reads this history back; item 9 itself never does.
       const stateDir = path.join(workDir, "state");
       await mkdir(stateDir, { recursive: true });
       await writeFile(path.join(stateDir, "current.json"), JSON.stringify(currentState));
       await writeFile(path.join(stateDir, "topology.json"), JSON.stringify(appliedRendered));
+      await writeFile(path.join(stateDir, "release-lock.json"), JSON.stringify(releaseLock));
 
       // executionEnvironmentImageOverride is a narrow testing seam only
       // (see test/apply-acceptance.mjs) - a real `docker run` of the

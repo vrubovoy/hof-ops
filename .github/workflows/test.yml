@@ -76,6 +76,7 @@ jobs:
                   hof_migrate_argv: ["true"]
                   hof_migrate_volume: "x"
                   hof_migrate_schema: { from: 1, to: 2, rollbackCompatible: true }
+                  hof_service_action: "start"
                   hof_service_unit: "x"
                   hof_service_image: "x"
                   hof_readiness_unit: "x"

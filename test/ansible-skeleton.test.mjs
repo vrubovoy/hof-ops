@@ -139,6 +139,24 @@ test("service role starts exactly one Compose unit, scoped with --no-deps and ne
   assert.match(tasksYaml, /hof_service_unit/);
 });
 
+// Item 9 (ADR 0005): stop/remove discover their own target container by
+// the exact same four labels a real ownership check needs - never just
+// project+service (that pair alone can't distinguish two DIFFERENT
+// installations' same-named unit on a shared host), zero matches is
+// idempotent, more than one is refused as corruption, and neither
+// action ever runs `compose down` or touches a volume.
+test("service role's stop/remove actions discover by hof.managed + installationId + unit + Compose project, treat zero matches as idempotent, and refuse more than one", () => {
+  const { tasksYaml } = loadRoleFiles("service");
+  for (const label of ["label=hof.managed=true", "label=hof.installation-id=", "label=hof.unit=", "label=com.docker.compose.project=hof"]) {
+    assert.ok(tasksYaml.includes(label), `service role's stop/remove discovery is missing ${label}`);
+  }
+  assert.match(tasksYaml, /docker\s*\n\s*-\s*stop/, "stop must dispatch a real `docker stop`");
+  assert.match(tasksYaml, /docker\s*\n\s*-\s*rm/, "remove must dispatch a real `docker rm`, never `compose down`");
+  assert.doesNotMatch(tasksYaml, /compose\s*\n\s*-\s*down/, "service role must never run a project-wide `compose down`");
+  assert.doesNotMatch(tasksYaml, /--volumes|docker volume rm/, "service role must never remove a volume");
+  assert.match(tasksYaml, /length > 1/, "more than one discovered container must be refused, not guessed at");
+});
+
 test("readiness role discovers the container by its own real Compose labels and polls docker inspect's JSON, never a Go-template format string", () => {
   const { tasksYaml } = loadRoleFiles("readiness");
   assert.match(tasksYaml, /com\.docker\.compose\.project=hof/);
@@ -154,7 +172,41 @@ test("state role writes topology.json before current.json, both via ansible.buil
   assert.ok(topologyIndex > 0 && currentIndex > 0, "both files must be written");
   assert.ok(topologyIndex < currentIndex, "topology.json must be written before current.json - see ADR 0004 and state.mjs's own resolveBaseline() corruption check");
   const copyCount = (tasksYaml.match(/ansible\.builtin\.copy:/g) ?? []).length;
-  assert.equal(copyCount, 2, "both writes must use copy's own atomic semantics, no hand-rolled temp-file dance");
+  // Item 9 (ADR 0005) added three more copies - the immutable per-
+  // generation snapshot (state.json, topology.json, release-lock.json)
+  // - on top of the original two pointer-file writes.
+  assert.equal(copyCount, 5, "5 copies: 3 immutable generation-snapshot files + 2 pointer files, all via copy's own atomic semantics");
+});
+
+// Item 9 (ADR 0005): the immutable per-generation snapshot -
+// {state,topology,release-lock}.json under generations/NNNNNN/ - must
+// be fully published BEFORE either pointer file is touched, and a
+// generation number that already has a snapshot on disk must never be
+// silently overwritten with different content.
+test("state role publishes the immutable per-generation snapshot before either pointer file, and refuses to overwrite one with different content", () => {
+  const { tasksYaml } = loadRoleFiles("state");
+  for (const filename of ["state.json", "topology.json", "release-lock.json"]) {
+    assert.ok(tasksYaml.includes(`generations/`) && tasksYaml.includes(`/${filename}`), `generation snapshot must include ${filename}`);
+  }
+  const snapshotStateIndex = tasksYaml.indexOf("hof_state_generation_dir }}/state.json");
+  const snapshotTopologyIndex = tasksYaml.indexOf("hof_state_generation_dir }}/topology.json");
+  const snapshotReleaseLockIndex = tasksYaml.indexOf("hof_state_generation_dir }}/release-lock.json");
+  const pointerTopologyIndex = tasksYaml.indexOf("dest: /var/lib/hof/state/topology.json");
+  const pointerCurrentIndex = tasksYaml.indexOf("dest: /var/lib/hof/state/current.json");
+  assert.ok(
+    snapshotStateIndex > 0 && snapshotTopologyIndex > 0 && snapshotReleaseLockIndex > 0,
+    "all three immutable snapshot files must be written",
+  );
+  assert.ok(
+    snapshotStateIndex < pointerTopologyIndex && snapshotTopologyIndex < pointerTopologyIndex && snapshotReleaseLockIndex < pointerTopologyIndex,
+    "the immutable generation snapshot must be fully published before either pointer file",
+  );
+  assert.ok(pointerTopologyIndex < pointerCurrentIndex, "the pointer files themselves keep ADR 0004's own ordering unchanged");
+  // Zero-padded, arbitrary positive generation - never a fixed constant.
+  assert.match(tasksYaml, /'%06d'\s*\|\s*format\(hof_state_generation\s*\|\s*int\)/, "the snapshot directory name must be zero-padded from the real generation, not hardcoded");
+  // Idempotent-if-identical, blocked-if-different, appliedAt excluded.
+  assert.match(tasksYaml, /appliedAt/, "the identical-content check must exclude appliedAt - never expected to match across a genuine retry");
+  assert.match(tasksYaml, /hof_state_generation_existing == hof_state_generation_incoming/, "an existing snapshot's content must be compared, not assumed");
 });
 
 test("ansible/requirements.yml pins the exact collections the roles' own README/defaults comments promise", () => {
@@ -173,6 +225,36 @@ test("ansible/requirements.yml pins the exact collections the roles' own README/
       /^\d+\.\d+\.\d+$/,
       `${collection.name} must pin an exact version, not a range`,
     );
+  }
+});
+
+// The CI "ansible" job's own --syntax-check fixture (.github/workflows/
+// test.yml) carries ONE shared vars block across all 10 roles - a var a
+// role's own defaults/main.yml declares but this shared block never
+// mentions would leave that variable None under the fixture's own
+// include_role loop, exactly the shape of gap this item 9's own new
+// hof_service_action var could have silently reintroduced. Every
+// role's own key (other than hof_operation_id, whose single shared
+// value already covers every role) must appear in the fixture's vars.
+test("the CI workflow's own --syntax-check fixture declares every var every role's defaults/main.yml actually needs", () => {
+  const workflow = readFileSync(path.join(repoRoot, ".github", "workflows", "test.yml"), "utf8");
+  const fixtureMatch = workflow.match(/cat > \/tmp\/hof-role-syntax-check\.yml << 'PLAYBOOK'\n([\s\S]*?)\n[ \t]*PLAYBOOK/);
+  assert.ok(fixtureMatch, "could not locate the embedded --syntax-check fixture playbook in .github/workflows/test.yml");
+  // The embedded heredoc carries the workflow YAML's own common leading
+  // indentation on every line (it's nested inside a `run: |` block) -
+  // stripped here so the extracted text parses as a standalone document.
+  const rawLines = fixtureMatch[1].split("\n");
+  const commonIndent = Math.min(...rawLines.filter((line) => line.trim().length > 0).map((line) => line.match(/^ */)[0].length));
+  const dedented = rawLines.map((line) => line.slice(commonIndent)).join("\n");
+  const fixturePlaybook = YAML.parse(dedented);
+  const fixtureVars = fixturePlaybook[0].tasks[0].vars;
+  assert.ok(fixtureVars && typeof fixtureVars === "object", "fixture playbook's own vars block must parse as an object");
+
+  for (const role of roles) {
+    const { defaults } = loadRoleFiles(role);
+    for (const key of Object.keys(defaults)) {
+      assert.ok(key in fixtureVars, `${role} role's defaults/main.yml declares ${key}, but the CI syntax-check fixture never sets it`);
+    }
   }
 });
 

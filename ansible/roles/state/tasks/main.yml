@@ -30,6 +30,88 @@
       current.json's own generation ({{ hof_state_current_generation }})
       does not match this operation's own hof_state_generation ({{ hof_state_generation }})
 
+# Item 9 (ADR 0005): an immutable, permanent per-generation snapshot -
+# {state,topology,release-lock}.json - published under
+# /var/lib/hof/state/generations/NNNNNN/ BEFORE either pointer file
+# below is touched (the pointer files' own ADR-0004 ordering -
+# topology.json first, current.json last - is otherwise unchanged).
+# Zero-padded to 6 digits; the generation itself is arbitrary and
+# positive (bootstrap always commits 1, an applied commit always N+1
+# for whatever N was already on disk - never a fixed constant here).
+- name: Compute this generation's own immutable snapshot directory
+  ansible.builtin.set_fact:
+    hof_state_generation_dir: "/var/lib/hof/state/generations/{{ '%06d' | format(hof_state_generation | int) }}"
+
+- name: Check whether this generation's own snapshot directory already exists
+  ansible.builtin.stat:
+    path: "{{ hof_state_generation_dir }}/state.json"
+  register: hof_state_generation_snapshot_stat
+
+# A repeat of the exact same commit (a retried/resumed operation) must
+# be idempotent; an existing generation number with genuinely DIFFERENT
+# content is corruption - a generation number must never be reused for
+# two different real commits - and is a hard failure here, never a
+# silent overwrite of an immutable record. appliedAt is excluded from
+# the comparison, exactly like apply.mjs's own succeeded-journal
+# recovery check (scripts/apply.mjs) - it is never expected to be
+# identical across two separate attempts at committing the SAME
+# generation, and comparing it would make a genuine, harmless retry
+# fail this check for the wrong reason.
+- name: Compare an already-existing snapshot's own state.json against what this operation is about to write
+  when: hof_state_generation_snapshot_stat.stat.exists
+  block:
+    - name: Read the already-existing snapshot's own state.json (appliedAt excluded)
+      ansible.builtin.set_fact:
+        hof_state_generation_existing: "{{ (lookup('file', hof_state_generation_dir + '/state.json') | from_json) | combine({'appliedAt': 'ignored-for-this-comparison'}) }}"
+    - name: Read what this operation is about to write (appliedAt excluded)
+      ansible.builtin.set_fact:
+        hof_state_generation_incoming: "{{ (lookup('file', hof_state_dir + '/current.json') | from_json) | combine({'appliedAt': 'ignored-for-this-comparison'}) }}"
+    - name: Refuse to overwrite an existing generation snapshot with different content
+      ansible.builtin.assert:
+        that:
+          - hof_state_generation_existing == hof_state_generation_incoming
+        fail_msg: >-
+          generation {{ hof_state_generation }} already has an immutable snapshot on this target, and its
+          content (excluding appliedAt, which never matches across a retry) does not match what this
+          operation is about to commit - a generation number must never be reused for two different
+          commits; this is refused, never overwritten
+
+- name: Create this generation's own immutable snapshot directory
+  when: not hof_state_generation_snapshot_stat.stat.exists
+  ansible.builtin.file:
+    path: "{{ hof_state_generation_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write this generation's own immutable state.json snapshot
+  when: not hof_state_generation_snapshot_stat.stat.exists
+  ansible.builtin.copy:
+    src: "{{ hof_state_dir }}/current.json"
+    dest: "{{ hof_state_generation_dir }}/state.json"
+    owner: root
+    group: root
+    mode: "0444"
+
+- name: Write this generation's own immutable topology.json snapshot
+  when: not hof_state_generation_snapshot_stat.stat.exists
+  ansible.builtin.copy:
+    src: "{{ hof_state_dir }}/topology.json"
+    dest: "{{ hof_state_generation_dir }}/topology.json"
+    owner: root
+    group: root
+    mode: "0444"
+
+- name: Write this generation's own immutable release-lock.json snapshot
+  when: not hof_state_generation_snapshot_stat.stat.exists
+  ansible.builtin.copy:
+    src: "{{ hof_state_dir }}/release-lock.json"
+    dest: "{{ hof_state_generation_dir }}/release-lock.json"
+    owner: root
+    group: root
+    mode: "0444"
+
 # ansible.builtin.copy's own src: reads the file's exact bytes directly
 # (on the control node, where hof_state_dir was mounted) and writes
 # atomically (a same-filesystem temp file, then an atomic rename into

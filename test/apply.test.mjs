@@ -293,7 +293,16 @@ async function realCommittedState({ plan, operationId, inputDigests }) {
 // id and its last-committed generation would be. Mirrors
 // plan-command.test.mjs's own identical "genuine applied no-op"
 // fixture construction.
-async function appliedSnapshotFor({ contracts, installationId, generation, inputDigests }) {
+// retainedServices (item 9, ADR 0005): a chained multi-step lifecycle
+// test threads the PREVIOUS step's own approved plan.desired.retainedServices
+// straight into the NEXT step's own "before" snapshot here - exactly
+// what a real target's current.json would actually carry forward,
+// thanks to computeExpectedCommittedState()'s own fix (see apply.mjs).
+// Without it, a retained service's own volume would incorrectly look
+// "missing" from baseline.volumes, and a later re-enable would
+// incorrectly plan a fresh volume.ensure/migration instead of reusing
+// the real, already-existing one.
+async function appliedSnapshotFor({ contracts, installationId, generation, inputDigests, retainedServices = {} }) {
   const rendered = renderTopology({ ...contracts, installationId, generation });
   const state = topologyToServiceState(rendered, contracts.catalog);
   const current = {
@@ -302,7 +311,7 @@ async function appliedSnapshotFor({ contracts, installationId, generation, input
     release: state.release,
     manifestDigest: inputDigests.manifestDigest, releaseLockDigest: inputDigests.releaseLockDigest,
     catalogDigest: inputDigests.catalogDigest, composeTemplateDigest: inputDigests.composeTemplateDigest,
-    topologyDigest: state.topologyDigest, generatedArtifacts: {},
+    topologyDigest: state.topologyDigest, generatedArtifacts: {}, retainedServices,
   };
   const resources = Object.entries(state.services).flatMap(([service, definition]) =>
     definition.enabled
@@ -310,12 +319,16 @@ async function appliedSnapshotFor({ contracts, installationId, generation, input
       : [],
   );
   const asResourceRecord = (name, kind) => ({ resource: name, name, managed: true, installationId, kind, composeProject: "hof" });
+  // A retained service's own volume is genuinely still present in
+  // Docker even though it renders no compose entry at all while
+  // disabled - mirrors resolveBaseline()'s own identical fold.
+  const volumeNames = [...new Set([...state.volumes, ...Object.values(retainedServices).map((entry) => entry.volume)])].sort();
   const snapshot = cleanSnapshot({
     managedState: { currentStatus: "present", current, topologyStatus: "present", topology: rendered },
     docker: {
       engineStatus: "available", composeAvailable: true,
       containersStatus: "available", resources,
-      volumesStatus: "available", volumes: state.volumes.map((name) => asResourceRecord(name, "volume")),
+      volumesStatus: "available", volumes: volumeNames.map((name) => asResourceRecord(name, "volume")),
       networksStatus: "available", networks: state.networks.map((name) => asResourceRecord(name, "network")),
     },
   });
@@ -1827,5 +1840,342 @@ test("applied: a stale plan (the target changes AFTER the pre-lock check but BEF
   assert.equal(result.reason, "stale-plan");
   assert.match(result.diagnostics[0], /changed underneath this plan since it was locked/);
   assert.equal(mutate.state.lock, null, "the freshly-acquired lock is released after a failed recheck");
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+// --- Item 9 (ADR 0005): local integration and recovery matrix - a real
+// bootstrap, followed by a chain of real applied runs against the SAME
+// simulated installation, each one's own approved plan.desired.retainedServices
+// threaded into the next step's own "before" snapshot exactly like a
+// real target's current.json would carry it forward (see
+// appliedSnapshotFor's own comment, and computeExpectedCommittedState's
+// own fix in apply.mjs). No privileged local mutations anywhere - dockerRun
+// stays a stub throughout, matching every other test in this file. -----
+
+test("applied lifecycle: bootstrap -> no-op -> enable -> disable-with-retain -> repeated disable (no-op) -> re-enable, generation progresses 1,1,2,3,3,4, reusing the SAME retained volume with no migration on re-enable", async () => {
+  const mutate = makeFakeMutate();
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-lifecycle-"));
+  const manifestPath = path.join(scratchDir, "services.yml");
+  const runOptions = () => baseApplyOptions({ mutate, manifestPath, dockerRun: async () => ({ stdout: "", stderr: "" }) });
+
+  async function writeManifest(mutator) {
+    const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+    mutator(manifest);
+    await writeFile(manifestPath, YAML.stringify(manifest));
+    const contracts = structuredClone(await loadContracts());
+    contracts.manifest = manifest;
+    return contracts;
+  }
+
+  // Step 0: bootstrap - schrank starts disabled, so enabling it later is
+  // a real, deliberate diff, not just examples/services.yml's own
+  // default.
+  const bootstrapContracts = await writeManifest((m) => { m.services.schrank.enabled = false; });
+  const bootstrapOptions = { ...runOptions(), inspect: async () => cleanSnapshot() };
+  const { plan: bootstrapPlan, planPath: bootstrapPlanPath } = await computeApprovedPlan(bootstrapOptions);
+  assert.equal(bootstrapPlan.mode, "bootstrap");
+  const bootstrapResult = await withFakeCosign("success", () => runApply({ ...bootstrapOptions, approvePlanId: bootstrapPlan.planId, planPath: bootstrapPlanPath }));
+  assert.equal(bootstrapResult.blocked, false, JSON.stringify(bootstrapResult));
+  assert.equal(bootstrapResult.committedGeneration, 1);
+  const installationId = bootstrapResult.operationId;
+
+  const inputDigests = await realInputDigests();
+  let generation = 1;
+  let retainedServices = {};
+  let contracts = bootstrapContracts;
+
+  // Step 1: a genuine no-op - unchanged manifest, unchanged generation.
+  {
+    const inputDigestsHere = { ...inputDigests, manifestDigest: sha256(await readFile(manifestPath)) };
+    const { snapshot } = await appliedSnapshotFor({ contracts, installationId, generation, inputDigests: inputDigestsHere, retainedServices });
+    const options = { ...runOptions(), inspect: async () => snapshot };
+    const { plan, planPath } = await computeApprovedPlan(options);
+    assert.equal(plan.mode, "applied");
+    assert.deepEqual(plan.operations, [], "fixture assumption: an unchanged manifest against its own just-bootstrapped baseline is a genuine no-op");
+    const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+    assert.equal(result.blocked, false, JSON.stringify(result));
+    assert.equal(result.noOp, true);
+    assert.equal(result.committedGeneration, 1, "a no-op never bumps generation");
+  }
+
+  // Step 2: enable schrank - a genuinely new, optional, persistent
+  // service - generation 1 -> 2.
+  {
+    const inputDigestsHere = { ...inputDigests, manifestDigest: sha256(await readFile(manifestPath)) };
+    const { snapshot } = await appliedSnapshotFor({ contracts, installationId, generation, inputDigests: inputDigestsHere, retainedServices });
+    contracts = await writeManifest((m) => { m.services.schrank.enabled = true; });
+    const options = { ...runOptions(), inspect: async () => snapshot };
+    const { plan, planPath } = await computeApprovedPlan(options);
+    assert.equal(plan.summary.create, 2, "schrank-backend + schrank-frontend");
+    assert.equal(plan.summary.migrate, 1, "schrank's own database, initialized for the first time");
+    const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+    assert.equal(result.blocked, false, JSON.stringify(result));
+    assert.equal(result.committedGeneration, 2, "generation 1 -> 2");
+    generation = 2;
+    retainedServices = plan.desired.retainedServices;
+    assert.deepEqual(retainedServices, {}, "schrank is live now, not retained");
+  }
+
+  // Step 3: disable schrank WITH retain - generation 2 -> 3, its own
+  // volume/schema recorded in retainedServices for a future re-enable.
+  {
+    const inputDigestsHere = { ...inputDigests, manifestDigest: sha256(await readFile(manifestPath)) };
+    const { snapshot } = await appliedSnapshotFor({ contracts, installationId, generation, inputDigests: inputDigestsHere, retainedServices });
+    contracts = await writeManifest((m) => { m.services.schrank.enabled = false; m.services.schrank.dataRetention = "retain"; });
+    const options = { ...runOptions(), inspect: async () => snapshot };
+    const { plan, planPath } = await computeApprovedPlan(options);
+    assert.equal(plan.summary.remove, 2);
+    assert.ok(!plan.operations.some((o) => o.action === "backup.create"));
+    const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+    assert.equal(result.blocked, false, JSON.stringify(result));
+    assert.equal(result.committedGeneration, 3, "generation 2 -> 3");
+    generation = 3;
+    retainedServices = plan.desired.retainedServices;
+    assert.ok(retainedServices.schrank, "schrank's own volume/schema is now recorded as retained");
+    assert.equal(retainedServices.schrank.volume, "schrank-data");
+  }
+
+  // Step 4: repeated disable (already disabled+retained, manifest
+  // unchanged) - a genuine no-op again, generation stays 3.
+  {
+    const inputDigestsHere = { ...inputDigests, manifestDigest: sha256(await readFile(manifestPath)) };
+    const { snapshot } = await appliedSnapshotFor({ contracts, installationId, generation, inputDigests: inputDigestsHere, retainedServices });
+    const options = { ...runOptions(), inspect: async () => snapshot };
+    const { plan, planPath } = await computeApprovedPlan(options);
+    assert.deepEqual(plan.operations, [], "fixture assumption: re-planning an already-retained-disable is a genuine no-op");
+    const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+    assert.equal(result.blocked, false, JSON.stringify(result));
+    assert.equal(result.noOp, true);
+    assert.equal(result.committedGeneration, 3, "still 3 - a repeated no-op never bumps generation");
+  }
+
+  // Step 5: re-enable schrank - generation 3 -> 4, reusing the SAME
+  // retained volume (no volume.ensure) with no migration at all (the
+  // retained schema already matches what's desired).
+  {
+    const inputDigestsHere = { ...inputDigests, manifestDigest: sha256(await readFile(manifestPath)) };
+    const { snapshot } = await appliedSnapshotFor({ contracts, installationId, generation, inputDigests: inputDigestsHere, retainedServices });
+    contracts = await writeManifest((m) => { m.services.schrank.enabled = true; });
+    const dockerCalls = [];
+    const options = { ...runOptions(), inspect: async () => snapshot, dockerRun: async (command, args) => { dockerCalls.push(args); return { stdout: "", stderr: "" }; } };
+    const { plan, planPath } = await computeApprovedPlan(options);
+    assert.equal(plan.summary.create, 2, "schrank-backend + schrank-frontend, started again");
+    assert.equal(plan.summary.migrate, 0, "the retained schema already matches - no migration needed");
+    assert.equal(plan.desired.retainedServices.schrank, undefined, "no longer retained once re-enabled");
+    const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+    assert.equal(result.blocked, false, JSON.stringify(result));
+    assert.equal(result.committedGeneration, 4, "generation 3 -> 4");
+    assert.notEqual(result.operationId, installationId, "this run's own fresh operationId is never the permanent installationId");
+
+    const dispatchedVars = dockerCalls.map(extraVarsFrom);
+    assert.ok(!dispatchedVars.some((v) => v.hof_role === "volume" && v.hof_volume_name === "schrank-data"), "the retained volume is reused, never recreated");
+    assert.ok(!dispatchedVars.some((v) => v.hof_role === "database"), "no migration is dispatched on a retained re-enable at the already-current schema");
+    const startCalls = dispatchedVars.filter((v) => v.hof_role === "service" && v.hof_service_unit?.startsWith("schrank"));
+    assert.equal(startCalls.length, 2, "schrank-backend + schrank-frontend both restart");
+  }
+
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+test("applied: an operation interrupted partway through (some steps already genuinely succeeded, state.commit not yet reached) resumes and completes without re-dispatching what already ran", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const baselineContracts = structuredClone(await loadContracts());
+  const { snapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation: 4, inputDigests });
+
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-partial-"));
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.services.schrank.enabled = true; // a genuinely new, multi-operation diff
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+
+  const dockerCalls = [];
+  const options = baseApplyOptions({
+    mutate, manifestPath, inspect: async () => snapshot,
+    dockerRun: async (command, args) => { dockerCalls.push(args); return { stdout: "", stderr: "" }; },
+  });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  assert.ok(plan.operations.some((o) => o.action === "state.commit"));
+  assert.ok(plan.operations.length > 3, "fixture assumption: enabling schrank is a genuinely multi-operation plan");
+
+  const inputDigestsHere = { ...inputDigests, manifestDigest: sha256(await readFile(manifestPath)) };
+  const operationId = "bbbbbbbb-1111-1111-1111-111111111111";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests: inputDigestsHere, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+  // Every step up to (but not including) config.write already resolved
+  // to a genuine success - a real prefix of the plan's own dispatch
+  // order, well before state.commit is even reached.
+  const configWriteIndex = plan.operations.findIndex((o) => o.action === "config.write");
+  const alreadyDone = plan.operations.slice(0, configWriteIndex);
+  mutate.state.events.set(operationId, alreadyDone.flatMap((op) => [
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: op.id, attempt: 1, phase: "started", at: "2026-08-27T09:00:00Z" },
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: op.id, attempt: 1, phase: "succeeded", at: "2026-08-27T09:00:01Z" },
+  ]));
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, false, JSON.stringify(result));
+  assert.equal(result.committedGeneration, 5, "generation 4 -> 5");
+
+  const dispatchedActions = dockerCalls.map(extraVarsFrom);
+  for (const op of alreadyDone) {
+    assert.ok(!dispatchedActions.some((v) => v.hof_operation_id === op.id), `${op.id} already succeeded before resume - it must never be re-dispatched`);
+  }
+  assert.ok(dispatchedActions.some((v) => v.hof_operation_id === plan.operations[configWriteIndex].id), "config.write itself, not yet resolved, must actually be dispatched");
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+test("applied: post-commit/pre-event recovery - state.commit's own real effect already landed on the target but the succeeded event never made it durably, resume recovers instead of blocking forever", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+  const baselineContracts = structuredClone(await loadContracts());
+  const { snapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation: 7, inputDigests });
+
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-postcommit-"));
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.backup.schedule = "09:00";
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+  const inputDigestsHere = { ...inputDigests, manifestDigest: sha256(await readFile(manifestPath)) };
+
+  const options = baseApplyOptions({ mutate, manifestPath, inspect: async () => snapshot });
+  const { plan } = await computeApprovedPlan(options);
+  assert.ok(plan.operations.length > 0);
+
+  const operationId = "bbbbbbbb-2222-2222-2222-222222222222";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests: inputDigestsHere, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+  const stateCommitOp = plan.operations.find((op) => op.action === "state.commit");
+  const otherOps = plan.operations.filter((op) => op.action !== "state.commit");
+  mutate.state.events.set(operationId, [
+    ...otherOps.flatMap((op) => [
+      { apiVersion: "hof.dev/operation-event/v1", operationId, step: op.id, attempt: 1, phase: "started", at: "2026-08-27T09:00:00Z" },
+      { apiVersion: "hof.dev/operation-event/v1", operationId, step: op.id, attempt: 1, phase: "succeeded", at: "2026-08-27T09:00:01Z" },
+    ]),
+    // state.commit itself: only "started" - the real crash window this
+    // recovers from is dispatch succeeding but the succeeded event
+    // never making it durably.
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: stateCommitOp.id, attempt: 1, phase: "started", at: "2026-08-27T09:01:00Z" },
+  ]);
+
+  const { current, topology } = await appliedCommittedStateFor({
+    contracts: { ...baselineContracts, manifest }, plan, operationId, installationId, generation: 8, inputDigests: inputDigestsHere,
+  });
+  mutate.state.current = current;
+  mutate.state.topology = topology;
+  mutate.state.generationSnapshots.set(8, current);
+
+  const dockerCalls = [];
+  const result = await withFakeCosign("success", () => runApply({
+    ...options, resume: true, dockerRun: async (command, args) => { dockerCalls.push(args); return { stdout: "", stderr: "" }; },
+  }));
+  assert.equal(result.blocked, false, JSON.stringify(result));
+  assert.equal(result.committedGeneration, 8, "generation 7 -> 8");
+  assert.ok(!dockerCalls.map(extraVarsFrom).some((v) => v.hof_operation_id === stateCommitOp.id), "state.commit is recovered from its own independent target-side record, never re-dispatched");
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+test("applied: a foreign installation's own same-named unit is a hard blocker, never silently ignored or adopted, and apply never dispatches anything against it", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-cccc-cccc-cccc-cccccccccccc";
+  const foreignInstallationId = "ffffffff-cccc-cccc-cccc-cccccccccccc";
+  const baselineContracts = structuredClone(await loadContracts());
+  const { snapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation: 4, inputDigests });
+  // A foreign installation's own container, sharing the same service/
+  // unit name and Compose project on a shared host - a real, if
+  // unusual, scenario drift-detection must never mistake for ours
+  // (plan.mjs's own computeDrift refuses this outright - see
+  // "drift: a resource with a matching service/unit but a foreign
+  // installationId is never treated as ours" in plan.test.mjs).
+  const foreignSnapshot = {
+    ...snapshot,
+    docker: {
+      ...snapshot.docker,
+      resources: [
+        ...snapshot.docker.resources,
+        { service: "kuvert", unit: "kuvert-backend", artifact: "kuvert-backend", image: "ghcr.io/foreign/kuvert-backend@sha256:" + "9".repeat(64), state: "running", managed: true, installationId: foreignInstallationId },
+      ],
+    },
+  };
+
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-foreign-"));
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.backup.schedule = "10:30";
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+
+  // Can't use computeApprovedPlan() here - it asserts success, and this
+  // plan is genuinely expected to be blocked. Any OTHER schema-valid,
+  // self-consistent plan-v2 document satisfies the CLI-level --plan/
+  // --approve-plan-id requirement instead - the real blocker fires
+  // inside computeLivePlanV2's own live recompute, before that
+  // recomputed plan is ever compared against whatever was approved.
+  const { plan: unrelatedPlan, planPath: unrelatedPlanPath } = await computeApprovedPlan(baseApplyOptions({ mutate, inspect: async () => snapshot }));
+
+  let dockerRunCalls = 0;
+  const options = baseApplyOptions({
+    mutate, manifestPath, inspect: async () => foreignSnapshot,
+    dockerRun: async () => { dockerRunCalls++; return { stdout: "", stderr: "" }; },
+  });
+  const result = await withFakeCosign("success", () => runApply({
+    ...options, approvePlanId: unrelatedPlan.planId, planPath: unrelatedPlanPath,
+  }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "plan");
+  assert.match(result.diagnostics[0], new RegExp(foreignInstallationId), "the diagnostic names the foreign installation, not just a bare refusal");
+  assert.equal(dockerRunCalls, 0, "never dispatches anything at all against a blocked plan");
+  assert.equal(mutate.state.lock, null, "never takes the lock for a plan that's already blocked");
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+test("applied: a release change on an existing installation is blocked by computeLivePlanV2 itself, never silently applied - items 10/11's own scope", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-dddd-dddd-dddd-dddddddddddd";
+  const baselineContracts = structuredClone(await loadContracts());
+  const { snapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation: 4, inputDigests });
+
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-upgrade-"));
+  // renderTopology() itself cross-checks manifest.release against
+  // releaseLock.release (a real, EARLIER gate than the upgrade blocker
+  // this test actually means to exercise) - both are bumped together
+  // here so that check passes cleanly, and the live recompute reaches
+  // computeUpgradeBlockers with a genuinely different desired.release
+  // than the (unchanged) applied baseline's own recorded release.
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.release = "99.0.0";
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+
+  const releaseLock = JSON.parse(await readFile(examplesReleaseLock, "utf8"));
+  releaseLock.release = "99.0.0";
+  const releaseLockPath = path.join(scratchDir, "release-lock.json");
+  await writeFile(releaseLockPath, JSON.stringify(releaseLock));
+  await writeFile(`${releaseLockPath}.sig`, "fake-signature\n");
+  await writeFile(`${releaseLockPath}.pem`, "fake-certificate\n");
+
+  // Any schema-valid, self-consistent plan-v2 document satisfies the
+  // CLI-level --plan/--approve-plan-id requirement here - the real
+  // blocker fires inside computeLivePlanV2's own live recompute, BEFORE
+  // that recomputed plan is ever compared against whatever was
+  // approved (`if (firstResult.blocked) return firstResult;`).
+  const { plan: unrelatedPlan, planPath: unrelatedPlanPath } = await computeApprovedPlan(baseApplyOptions({ mutate, inspect: async () => snapshot }));
+
+  const options = baseApplyOptions({ mutate, manifestPath, releaseLockPath, inspect: async () => snapshot });
+  const result = await withFakeCosign("success", () => runApply({
+    ...options, approvePlanId: unrelatedPlan.planId, planPath: unrelatedPlanPath,
+  }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "plan");
+  assert.match(result.diagnostics[0], /release change.*out of item 9's own scope/);
+  assert.equal(mutate.state.lock, null, "never takes the lock for a plan that's already blocked");
   await rm(scratchDir, { recursive: true, force: true });
 });

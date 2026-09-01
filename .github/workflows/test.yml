@@ -11,7 +11,15 @@ permissions:
 jobs:
   contracts:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Item 9 (ADR 0005): bumped from 15 - test/apply-acceptance.mjs's own
+    # single real test now covers a real bootstrap AND a real 5-step
+    # applied-mode reconciliation lifecycle (enable/no-op/disable-with-
+    # retain/no-op/re-enable) against the same disposable target, each
+    # mutating step dispatching its own real Execution Environment
+    # container runs over real SSH - genuinely more wall-clock work, not
+    # a hang (confirmed for real: the bootstrap-only half alone already
+    # took ~4.5 minutes on its own before this).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

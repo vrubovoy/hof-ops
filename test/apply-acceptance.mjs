@@ -529,6 +529,11 @@ test("a real, full bootstrap apply against the real, published, signed v0.2.0 re
   // present and schema-valid on the target. Never run locally - see
   // this file's own top comment. ===================================
 
+  // before()'s own `manifest` local is scoped there, not to this test()
+  // callback - read fresh off the same real file it already wrote,
+  // exactly like every other real caller of servicesPath does.
+  const manifest = YAML.parse(await readFile(servicesPath, "utf8"));
+
   // Enable kuvert (an optional, persistent, database-owning service) -
   // a real, deliberate diff on top of the mandatory-core-only baseline
   // bootstrap above.

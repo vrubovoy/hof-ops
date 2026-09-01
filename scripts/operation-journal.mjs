@@ -214,11 +214,25 @@ export function decideStepResumption(events) {
 // journal-level gate, checked once before any per-step resumption logic
 // even runs - a journal that already reached a terminal state is never
 // resumed, regardless of what its individual step events say.
+//
+// Item 9 (ADR 0005): the diagnosis-then-retry language is chosen by the
+// embedded plan's own mode - "a fresh bootstrap" never made sense for
+// an applied reconciliation attempt (there is already a real
+// installation there; nothing about a failed applied operation calls
+// for treating the host as a clean slate again), so a failed applied
+// operation instead points at a fresh `hofctl plan`/`hofctl apply`
+// reconciliation attempt against the same, already-applied
+// installation.
 export function assertJournalResumable(journal) {
+  const isBootstrap = journal.plan?.mode !== "applied";
   if (journal.status === "succeeded") {
     throw new Error(`operation ${journal.operationId} already succeeded (committed generation ${journal.committedGeneration}) - nothing to resume`);
   }
   if (journal.status === "failed") {
-    throw new Error(`operation ${journal.operationId} already failed - resume is refused, a fresh bootstrap is required after the target is manually diagnosed (see ADR 0004)`);
+    throw new Error(
+      isBootstrap
+        ? `operation ${journal.operationId} already failed - resume is refused, a fresh bootstrap is required after the target is manually diagnosed (see ADR 0004)`
+        : `operation ${journal.operationId} already failed - resume is refused; diagnose the target manually, then run a fresh hofctl plan/hofctl apply reconciliation against this same installation (see ADR 0005)`,
+    );
   }
 }

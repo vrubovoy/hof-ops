@@ -23,7 +23,7 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { acquireLock, acquireLockAndJournal, appendEvent, readCurrentState, readEvents, readJournal, readLock, readTopology, releaseLock, updateJournalStatus, writeJournal } from "../scripts/target-mutate.mjs";
+import { acquireLock, acquireLockAndJournal, appendEvent, readCurrentState, readEvents, readGenerationSnapshot, readJournal, readLock, readTopology, releaseLock, updateJournalStatus, writeJournal } from "../scripts/target-mutate.mjs";
 
 const exec = promisify(execFile);
 
@@ -281,6 +281,26 @@ test("readTopology: present/absent both parse, targeting the fixed topology.json
   assert.match(calls.find((c) => c.command === "ssh").input, /\/var\/lib\/hof\/state\/topology\.json/);
   const absent = await readTopology({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run });
   assert.deepEqual(absent, { status: "absent", topology: null });
+});
+
+// Item 9 (ADR 0005): readGenerationSnapshot - the state role's own
+// immutable per-generation snapshot, zero-padded to 6 digits, the
+// SAME path the Ansible state role writes to (see
+// ansible/roles/state/tasks/main.yml).
+test("readGenerationSnapshot: present/absent both parse, targeting the zero-padded generations/NNNNNN/state.json path", async () => {
+  const snapshot = { apiVersion: "hof.dev/state/v1", installationId: OPERATION_ID, generation: 3 };
+  const { run, calls } = mockRun({ sshStdout: `HOF_MUTATE_PRESENT\n${JSON.stringify(snapshot)}` });
+  const present = await readGenerationSnapshot({ ...SSH_TARGET, run }, 3);
+  assert.deepEqual(present, { status: "present", snapshot });
+  assert.match(calls.find((c) => c.command === "ssh").input, /\/var\/lib\/hof\/state\/generations\/000003\/state\.json/);
+  const absent = await readGenerationSnapshot({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run }, 3);
+  assert.deepEqual(absent, { status: "absent", snapshot: null });
+});
+
+test("readGenerationSnapshot: refuses a non-positive-integer generation before ever building a script", async () => {
+  await assert.rejects(() => readGenerationSnapshot({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run }, 0), /positive integer/);
+  await assert.rejects(() => readGenerationSnapshot({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run }, 1.5), /positive integer/);
+  await assert.rejects(() => readGenerationSnapshot({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run }, "3; rm -rf /"), /positive integer/);
 });
 
 test("local mode: runs `sudo -n sh -s` directly, with no SSH/known_hosts machinery at all", async () => {

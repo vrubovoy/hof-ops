@@ -418,6 +418,29 @@ export async function readTopology(conn) {
   return { status, topology: value };
 }
 
+// Item 9 (ADR 0005): the state role's own immutable, permanent per-
+// generation snapshot (generations/NNNNNN/state.json - see
+// ansible/roles/state/tasks/main.yml) - a THIRD independent oracle,
+// alongside current.json/topology.json, that apply.mjs's own succeeded-
+// journal recovery reads back to confirm a claimed commit actually
+// landed. generation must already be a genuine positive integer (the
+// same invariant plan-v2.schema.json's own baselineGeneration/generation
+// fields already enforce before this is ever called) - never accepted
+// as free-form text, the same "no caller-built shell string" discipline
+// every other path in this module follows.
+function generationSnapshotPath(generation) {
+  if (!Number.isInteger(generation) || generation < 1) {
+    throw new Error(`readGenerationSnapshot requires a positive integer generation, got ${JSON.stringify(generation)}`);
+  }
+  return `/var/lib/hof/state/generations/${String(generation).padStart(6, "0")}/state.json`;
+}
+
+export async function readGenerationSnapshot(conn, generation) {
+  const stdout = await runScript(conn, readScript(generationSnapshotPath(generation)));
+  const { status, value } = parseReadResponse(stdout);
+  return { status, snapshot: value };
+}
+
 // Atomic write-then-rename (ADR 0004: "only ever atomically") - the
 // caller always hands the FULL, already-schema-valid updated document
 // (see operation-journal.mjs's own withJournalStatus), never a partial

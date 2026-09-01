@@ -60,7 +60,18 @@
 // spot-checked field by field; topology.json's own full snapshot is
 // read and sanity-checked; and a second real `hofctl apply` reusing the
 // same approved bootstrap plan against the now-applied host is
-// confirmed refused (reason: "scope"), not just a second `hofctl plan`.
+// confirmed refused (reason: "stale-plan") - never re-applying a stale
+// bootstrap approval against a host that has already moved on. Item 9
+// (ADR 0005) removed the categorical "apply only supports a bootstrap
+// plan" scope refusal this used to hit (an applied target is now a
+// real, legitimate `hofctl apply` target of its own) - a bootstrap
+// plan reused against an already-applied host is still refused, just
+// because it's genuinely stale (the live recompute now correctly comes
+// back mode: "applied", never matching the old bootstrap plan's own
+// planId), not because applied targets are out of scope. Item 9's own
+// real applied-mode acceptance (enable/disable/re-enable against a
+// disposable target) is a separate, later CI-only acceptance test - see
+// ADR 0005's own delivery plan.
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -459,10 +470,14 @@ test("a real, full bootstrap apply against the real, published, signed v0.1.4 re
   // successful run used - is correctly refused, never re-applying a
   // bootstrap plan against a host that already has one (PLATFORM-OPS-
   // PLAN.md's own PR #33 promise; under-delivered - only a second PLAN
-  // was checked - until a 2026-08-28 review named it). apply's own live
-  // recompute hits this before ever comparing plan documents: a
-  // bootstrap plan is only ever valid against a genuinely clean host.
+  // was checked - until a 2026-08-28 review named it). Item 9 (ADR
+  // 0005) generalized apply's own live recompute to cover an applied
+  // target for real - a bootstrap-only "scope" refusal no longer
+  // exists, but the OLD bootstrap plan is still refused, now correctly
+  // as "stale-plan": the live recompute against this now-applied host
+  // comes back mode: "applied", which can never match the old
+  // bootstrap plan's own planId.
   const secondApply = await runApply({ ...baseOptions(), approvePlanId: plan.planId, planPath });
   assert.equal(secondApply.blocked, true, "a second bootstrap apply against an already-applied host must be refused");
-  assert.equal(secondApply.reason, "scope");
+  assert.equal(secondApply.reason, "stale-plan");
 });

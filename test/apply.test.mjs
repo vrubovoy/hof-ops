@@ -40,6 +40,7 @@ import { runPlan } from "../scripts/plan-command.mjs";
 import { computePlanId } from "../scripts/plan-v2.mjs";
 import { enabledServiceIds, renderedFilesContents, renderTopology } from "../scripts/render-topology.mjs";
 import { requiredSecrets } from "../scripts/secrets.mjs";
+import { topologyToServiceState } from "../scripts/state.mjs";
 import { loadContracts } from "../scripts/contracts.mjs";
 
 const exec = promisify(execFile);
@@ -114,7 +115,7 @@ function cleanSnapshot(overrides = {}) {
 // target-mutate.test.mjs's own job; this just needs to behave like a
 // real target would.
 function makeFakeMutate() {
-  const state = { lock: null, journals: new Map(), events: new Map(), current: null, topology: null };
+  const state = { lock: null, journals: new Map(), events: new Map(), current: null, topology: null, generationSnapshots: new Map() };
   return {
     state,
     async acquireLock(_conn, lockDocument) {
@@ -162,6 +163,15 @@ function makeFakeMutate() {
     },
     async readTopology() {
       return state.topology ? { status: "present", topology: state.topology } : { status: "absent", topology: null };
+    },
+    // Item 9 (ADR 0005): the state role's own immutable per-generation
+    // snapshot - a test that wants a resume recovery path to actually
+    // succeed populates state.generationSnapshots.set(generation, ...)
+    // itself, exactly like state.current/state.topology above.
+    async readGenerationSnapshot(_conn, generation) {
+      return state.generationSnapshots.has(generation)
+        ? { status: "present", snapshot: state.generationSnapshots.get(generation) }
+        : { status: "absent", snapshot: null };
     },
     async pinnedKnownHosts() {
       return { file: "/dev/null", cleanup: async () => {} };
@@ -264,6 +274,83 @@ async function realCommittedState({ plan, operationId, inputDigests }) {
     catalogDigest: inputDigests.catalogDigest, composeTemplateDigest: inputDigests.composeTemplateDigest,
     topologyDigest: plan.desired.topologyDigest,
     generatedArtifacts: Object.fromEntries(Object.entries(generatedFiles).map(([name, contents]) => [name, sha256(Buffer.from(contents))])),
+    // Item 9 (ADR 0005): every bootstrap test fixture in this file uses
+    // examples/services.yml as-is - no retained service (nothing could
+    // have been disabled-with-retain before a bootstrap even ran) and
+    // acme-http01 tls (never "supplied"), so these three always match
+    // computeExpectedCommittedState()'s own real output exactly.
+    retainedServices: {}, suppliedTlsCertificateFingerprint: null, suppliedTlsPrivateKeyFingerprint: null,
+  };
+  return { current, topology };
+}
+
+// Item 9 (ADR 0005): a real, schema-matching "already applied"
+// inspectTarget() snapshot - genuinely no-op against `contracts` as
+// given (an unmodified loadContracts() copy renders a genuine no-op;
+// a caller-mutated one, or a run against a DIFFERENT manifest file,
+// produces a real diff). installationId/generation are the caller's
+// own fixed choice, exactly like a real installation's own permanent
+// id and its last-committed generation would be. Mirrors
+// plan-command.test.mjs's own identical "genuine applied no-op"
+// fixture construction.
+async function appliedSnapshotFor({ contracts, installationId, generation, inputDigests }) {
+  const rendered = renderTopology({ ...contracts, installationId, generation });
+  const state = topologyToServiceState(rendered, contracts.catalog);
+  const current = {
+    apiVersion: "hof.dev/state/v1", installationId, generation,
+    lastSuccessfulOperationId: "seed-operation", appliedAt: "2026-08-27T08:00:00Z",
+    release: state.release,
+    manifestDigest: inputDigests.manifestDigest, releaseLockDigest: inputDigests.releaseLockDigest,
+    catalogDigest: inputDigests.catalogDigest, composeTemplateDigest: inputDigests.composeTemplateDigest,
+    topologyDigest: state.topologyDigest, generatedArtifacts: {},
+  };
+  const resources = Object.entries(state.services).flatMap(([service, definition]) =>
+    definition.enabled
+      ? Object.entries(definition.units).map(([unit, entry]) => ({ service, unit, artifact: entry.artifact, image: entry.image, state: "running", managed: true, installationId }))
+      : [],
+  );
+  const asResourceRecord = (name, kind) => ({ resource: name, name, managed: true, installationId, kind, composeProject: "hof" });
+  const snapshot = cleanSnapshot({
+    managedState: { currentStatus: "present", current, topologyStatus: "present", topology: rendered },
+    docker: {
+      engineStatus: "available", composeAvailable: true,
+      containersStatus: "available", resources,
+      volumesStatus: "available", volumes: state.volumes.map((name) => asResourceRecord(name, "volume")),
+      networksStatus: "available", networks: state.networks.map((name) => asResourceRecord(name, "network")),
+    },
+  });
+  return { rendered, state, current, snapshot };
+}
+
+// Pulls the -e extra-vars JSON payload back out of one dockerRun() call's
+// own args array (see apply.mjs's own dispatchOperation - always
+// `args.push("-e", JSON.stringify(extraVars))`).
+function extraVarsFrom(args) {
+  return JSON.parse(args[args.indexOf("-e") + 1]);
+}
+
+// Item 9 (ADR 0005): the exact current.json/topology.json a real
+// applied state.commit dispatch for this exact plan/operationId/
+// installationId/generation would itself produce - the applied-mode
+// counterpart to realCommittedState() above (which stays bootstrap-only,
+// unchanged, still used by its own 3 existing call sites). Takes the
+// full contracts explicitly (never re-fetches loadContracts() itself)
+// so a caller using a custom manifestPath/mutated contracts controls
+// exactly what this renders against.
+async function appliedCommittedStateFor({ contracts, plan, operationId, installationId, generation, inputDigests }) {
+  const { manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema } = contracts;
+  const topology = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId, generation });
+  const generatedFiles = renderedFilesContents(topology);
+  const current = {
+    apiVersion: "hof.dev/state/v1", installationId, generation, lastSuccessfulOperationId: operationId,
+    appliedAt: "2026-08-27T09:01:00Z", release: releaseLock.release,
+    manifestDigest: inputDigests.manifestDigest, releaseLockDigest: inputDigests.releaseLockDigest,
+    catalogDigest: inputDigests.catalogDigest, composeTemplateDigest: inputDigests.composeTemplateDigest,
+    topologyDigest: plan.desired.topologyDigest,
+    generatedArtifacts: Object.fromEntries(Object.entries(generatedFiles).map(([name, contents]) => [name, sha256(Buffer.from(contents))])),
+    retainedServices: plan.desired.retainedServices ?? {},
+    suppliedTlsCertificateFingerprint: plan.desired.suppliedTlsCertificateFingerprint ?? null,
+    suppliedTlsPrivateKeyFingerprint: plan.desired.suppliedTlsPrivateKeyFingerprint ?? null,
   };
   return { current, topology };
 }
@@ -799,6 +886,7 @@ test("resume: an already-succeeded journal completes cleanly - finishing the one
   const { current, topology } = await realCommittedState({ plan, operationId, inputDigests });
   mutate.state.current = current;
   mutate.state.topology = topology;
+  mutate.state.generationSnapshots.set(1, current);
   const events = [];
   const result = await withFakeCosign("success", () => runApply({ ...options, resume: true, emit: (event) => events.push(event) }));
   assert.equal(result.blocked, false, JSON.stringify(result));
@@ -829,6 +917,7 @@ test("resume: an already-succeeded journal whose lock release fails is reported 
   const { current, topology } = await realCommittedState({ plan, operationId, inputDigests });
   mutate.state.current = current;
   mutate.state.topology = topology;
+  mutate.state.generationSnapshots.set(1, current);
   mutate.releaseLock = async () => { throw new Error("simulated transport failure"); };
   const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
   assert.equal(result.blocked, true);
@@ -1039,6 +1128,7 @@ test("resume: state.commit's own real effect already landed on the target (curre
   const { current, topology } = await realCommittedState({ plan, operationId, inputDigests });
   mutate.state.current = current;
   mutate.state.topology = topology;
+  mutate.state.generationSnapshots.set(1, current);
 
   const dockerCalls = [];
   const result = await withFakeCosign("success", () => runApply({
@@ -1343,4 +1433,399 @@ test("supplied TLS delivery-time TOCTOU: a certificate swapped between approval 
   assert.match(result.diagnostics[0], /no longer match the fingerprints/);
   assert.equal(mutate.state.lock?.operationId, operationId, "the lock stays held - a blocked resume never releases it");
   await rm(certDir, { recursive: true, force: true });
+});
+
+// --- Item 9 (ADR 0005): applied-mode reconciliation - runApply()'s own
+// generalized, mode-aware flow. The lock/journal/event mechanics
+// themselves (resume recovery, stale-plan rejection, lock-release
+// failures, an operation failure never committing state) are SHARED
+// code with bootstrap, already exercised exhaustively above; the tests
+// below focus on what's genuinely NEW or mode-DEPENDENT: the no-op
+// short-circuit, generation/installationId derivation, the applied
+// action whitelist, and mode-aware diagnostics. -----------------------
+
+test("applied: a genuine no-op invokes zero mutation methods (no lock, no journal, no Execution Environment) and reports noOp: true, never bumping generation", async () => {
+  const mutate = makeFakeMutate();
+  let acquireCalls = 0;
+  const originalAcquire = mutate.acquireLockAndJournal;
+  mutate.acquireLockAndJournal = async (...args) => { acquireCalls++; return originalAcquire(...args); };
+  let dockerRunCalls = 0;
+
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-1111-1111-1111-111111111111";
+  const contracts = structuredClone(await loadContracts());
+  const { snapshot } = await appliedSnapshotFor({ contracts, installationId, generation: 4, inputDigests });
+
+  const options = baseApplyOptions({ mutate, inspect: async () => snapshot, dockerRun: async () => { dockerRunCalls++; return { stdout: "", stderr: "" }; } });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  assert.equal(plan.mode, "applied");
+  assert.deepEqual(plan.operations, [], "fixture assumption: unmodified contracts against their own rendered baseline must be a genuine no-op");
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+
+  assert.equal(result.blocked, false, JSON.stringify(result));
+  assert.equal(result.noOp, true);
+  assert.equal(result.committedGeneration, 4, "never bumps generation for a no-op");
+  assert.equal(result.operationId, undefined, "no lock/journal was ever created - there is no operationId for a no-op");
+  assert.equal(acquireCalls, 0, "a no-op takes no lock");
+  assert.equal(dockerRunCalls, 0, "a no-op runs no Execution Environment");
+  assert.equal(mutate.state.journals.size, 0, "a no-op creates no journal");
+  assert.equal(mutate.state.lock, null);
+});
+
+test("applied: disabling a persistent service with retain commits baseline.generation + 1, dispatches service.stop/service.remove bound to the exact permanent installationId (never the fresh operationId), and never touches the volume or dispatches backup.create", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-2222-2222-2222-222222222222";
+  const baselineContracts = structuredClone(await loadContracts());
+  const { snapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation: 4, inputDigests });
+
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-retain-"));
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.services.kuvert.enabled = false;
+  manifest.services.kuvert.dataRetention = "retain";
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+
+  const dockerCalls = [];
+  const options = baseApplyOptions({
+    mutate, manifestPath, inspect: async () => snapshot,
+    dockerRun: async (command, args) => { dockerCalls.push(args); return { stdout: "", stderr: "" }; },
+  });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  assert.equal(plan.mode, "applied");
+  assert.equal(plan.summary.remove, 2, "fixture assumption: kuvert-backend + kuvert-frontend");
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+  assert.equal(result.blocked, false, JSON.stringify(result));
+  assert.equal(result.committedGeneration, 5, "generation 4 -> 5, exactly once");
+
+  const dispatchedVars = dockerCalls.map(extraVarsFrom);
+  const removeCalls = dispatchedVars.filter((v) => v.hof_role === "service" && v.hof_service_action === "remove");
+  const stopCalls = dispatchedVars.filter((v) => v.hof_role === "service" && v.hof_service_action === "stop");
+  assert.equal(removeCalls.length, 2, "kuvert-backend + kuvert-frontend, the only two units actually being removed");
+  // Every unit removed gets its own stop first (2), PLUS every OTHER
+  // unit whose own config cascades from kuvert's removal (its CORS
+  // origins shifting) gets stopped and restarted too - a real
+  // cascading update, not just the two units actually going away.
+  assert.ok(stopCalls.length > removeCalls.length, "at least one cascaded config-only unit is stopped too, beyond the two actually removed");
+  for (const vars of [...removeCalls, ...stopCalls]) {
+    assert.equal(vars.hof_installation_id, installationId, "the service role's own discovery is bound to the baseline's own PERMANENT installationId");
+    assert.notEqual(vars.hof_installation_id, result.operationId, "never the fresh operationId used only for this run's own lock/journal bookkeeping");
+  }
+  assert.ok(!dispatchedVars.some((v) => v.hof_role === "backup"), "backup.create is never in the applied whitelist - never dispatched");
+  assert.ok(!dispatchedVars.some((v) => v.hof_role === "volume" && v.hof_volume_name === "kuvert-data"), "retain-only removal never touches the volume itself");
+
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+test("resume: a journal whose embedded plan claims mode: applied but still carries a bootstrap-only action (host.prepare) fails the applied whitelist, not silently trusted", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan: bootstrapPlan } = await computeApprovedPlan(options);
+  assert.ok(bootstrapPlan.operations.some((o) => o.action === "host.prepare"), "fixture assumption: a real bootstrap plan always carries host.prepare");
+  // recovery is required for bootstrap and FORBIDDEN for applied (see
+  // plan-v2.schema.json's own allOf) - dropped here so the tampered
+  // document stays schema-valid under its new claimed mode, isolating
+  // the whitelist check itself (never the schema gate) as what actually
+  // catches this.
+  const { recovery: _recovery, ...withoutRecovery } = bootstrapPlan;
+  const tampered = {
+    ...withoutRecovery, mode: "applied",
+    target: { ...bootstrapPlan.target, installationId: "aaaaaaaa-5555-5555-5555-555555555555", baselineGeneration: 4 },
+  };
+  const tamperedWithId = { ...tampered, planId: computePlanId(tampered) };
+
+  const inputDigests = await realInputDigests();
+  const operationId = "99999999-1111-1111-1111-111111111111";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: tamperedWithId.planId, target: tamperedWithId.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: tamperedWithId.planId, target: tamperedWithId.target, plan: tamperedWithId,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /fails the applied action whitelist/);
+});
+
+test("resume: a journal whose embedded plan claims mode: bootstrap but carries an applied-only action (service.stop) fails the bootstrap whitelist, not silently trusted", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan: bootstrapPlan } = await computeApprovedPlan(options);
+  const startOp = bootstrapPlan.operations.find((o) => o.action === "service.start");
+  assert.ok(startOp, "fixture assumption: a real bootstrap plan always starts at least one service");
+  const tampered = {
+    ...bootstrapPlan,
+    operations: bootstrapPlan.operations.map((op) => (op.id === startOp.id ? { ...op, action: "service.stop" } : op)),
+  };
+  const tamperedWithId = { ...tampered, planId: computePlanId(tampered) };
+
+  const inputDigests = await realInputDigests();
+  const operationId = "99999999-2222-2222-2222-222222222222";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: tamperedWithId.planId, target: tamperedWithId.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: tamperedWithId.planId, target: tamperedWithId.target, plan: tamperedWithId,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /fails the bootstrap action whitelist/);
+});
+
+test("applied: resume of an interrupted reconciliation attempt completes it, committing baseline.generation + 1 against the SAME installation", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-3333-3333-3333-333333333333";
+  const baselineContracts = structuredClone(await loadContracts());
+  const { snapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation: 6, inputDigests });
+
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-resume-"));
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.backup.schedule = "04:30"; // a real, minimal config-only change
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+  const changedInputDigests = { ...inputDigests, manifestDigest: sha256(await readFile(manifestPath)) };
+
+  const options = baseApplyOptions({ mutate, manifestPath, inspect: async () => snapshot, dockerRun: async () => ({ stdout: "", stderr: "" }) });
+  const { plan } = await computeApprovedPlan(options);
+  assert.equal(plan.mode, "applied");
+  assert.ok(plan.operations.length > 0, "fixture assumption: a backup-schedule change is a real diff");
+
+  const operationId = "99999999-3333-3333-3333-333333333333";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests: changedInputDigests, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+  // No events at all - nothing has been dispatched yet, resume must run
+  // the whole plan from the start.
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, false, JSON.stringify(result));
+  assert.equal(result.operationId, operationId);
+  assert.equal(result.committedGeneration, 7, "generation 6 -> 7");
+  const journal = mutate.state.journals.get(operationId);
+  assert.equal(journal.status, "succeeded");
+  assert.equal(journal.committedGeneration, 7);
+  assert.equal(mutate.state.lock, null, "the lock is released once the resumed run genuinely completes");
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+test("applied: the succeeded fast path recovers cleanly at an arbitrary (non-1) generation, confirming current.json, topology.json, AND the immutable generation snapshot all independently agree", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-4444-4444-4444-444444444444";
+  const baselineContracts = structuredClone(await loadContracts());
+  const { snapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation: 9, inputDigests });
+
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-succeeded-"));
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.backup.schedule = "05:15";
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+  const changedInputDigests = { ...inputDigests, manifestDigest: sha256(await readFile(manifestPath)) };
+
+  const options = baseApplyOptions({ mutate, manifestPath, inspect: async () => snapshot });
+  const { plan } = await computeApprovedPlan(options);
+  assert.ok(plan.operations.length > 0, "fixture assumption: a backup-schedule change is a real diff");
+
+  const operationId = "99999999-4444-4444-4444-444444444444";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests: changedInputDigests, startedAt: "2026-08-27T09:00:00Z", status: "succeeded", committedGeneration: 10,
+  });
+  mutate.state.events.set(operationId, fullySucceededEvents(operationId, plan));
+
+  const { current, topology } = await appliedCommittedStateFor({
+    contracts: { ...baselineContracts, manifest }, plan, operationId, installationId, generation: 10, inputDigests: changedInputDigests,
+  });
+  mutate.state.current = current;
+  mutate.state.topology = topology;
+  mutate.state.generationSnapshots.set(10, current);
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, false, JSON.stringify(result));
+  assert.equal(result.committedGeneration, 10);
+  assert.equal(mutate.state.lock, null);
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+test("applied: the succeeded fast path refuses when the immutable generation snapshot doesn't match, even though current.json/topology.json both do", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-6666-6666-6666-666666666666";
+  const baselineContracts = structuredClone(await loadContracts());
+  const { snapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation: 3, inputDigests });
+
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-snapshot-mismatch-"));
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.backup.schedule = "06:45";
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+  const changedInputDigests = { ...inputDigests, manifestDigest: sha256(await readFile(manifestPath)) };
+
+  const options = baseApplyOptions({ mutate, manifestPath, inspect: async () => snapshot });
+  const { plan } = await computeApprovedPlan(options);
+  assert.ok(plan.operations.length > 0);
+
+  const operationId = "99999999-6666-6666-6666-666666666666";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests: changedInputDigests, startedAt: "2026-08-27T09:00:00Z", status: "succeeded", committedGeneration: 4,
+  });
+  mutate.state.events.set(operationId, fullySucceededEvents(operationId, plan));
+
+  const { current, topology } = await appliedCommittedStateFor({
+    contracts: { ...baselineContracts, manifest }, plan, operationId, installationId, generation: 4, inputDigests: changedInputDigests,
+  });
+  mutate.state.current = current;
+  mutate.state.topology = topology;
+  // The generation snapshot itself is simply never written (a real gap:
+  // the state role's own three snapshot writes happen BEFORE the two
+  // pointer files - see ansible/roles/state/tasks/main.yml - so any
+  // crash between them and the two pointer writes leaves exactly this
+  // shape on a real target).
+  mutate.state.generationSnapshots.clear();
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /immutable snapshot could not be confirmed present/);
+  assert.notEqual(mutate.state.lock, null, "never releases the lock on an unconfirmed recovery");
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+test("applied: supplied TLS delivery-time TOCTOU - a certificate swapped between approval and resume is refused, never delivered, on an already-applied installation too", async () => {
+  const mutate = makeFakeMutate();
+  const certDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-tls-toctou-"));
+  const certificatePath = path.join(certDir, "cert.pem");
+  const privateKeyPath = path.join(certDir, "key.pem");
+
+  async function generateCert() {
+    await exec("openssl", [
+      "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+      "-keyout", privateKeyPath, "-out", certificatePath,
+      "-days", "1", "-subj", "/CN=example.com",
+      "-addext", "subjectAltName=DNS:example.com,DNS:*.example.com",
+    ]);
+  }
+  await generateCert();
+
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.tls = { mode: "supplied", certificatePath, privateKeyPath };
+  const manifestPath = path.join(certDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+
+  const inputDigests = { ...(await realInputDigests()), manifestDigest: sha256(await readFile(manifestPath)) };
+  const installationId = "aaaaaaaa-7777-7777-7777-777777777777";
+  const baselineContracts = structuredClone(await loadContracts());
+  baselineContracts.manifest = manifest;
+  const { snapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation: 2, inputDigests });
+
+  const options = baseApplyOptions({ mutate, manifestPath, inspect: async () => snapshot });
+  const { plan } = await computeApprovedPlan(options);
+  assert.ok(plan.suppliedTls, "fixture assumption: a supplied-TLS manifest must actually produce plan.suppliedTls");
+
+  const operationId = "99999999-7777-7777-7777-777777777777";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+
+  // Swap in a DIFFERENT, still-valid certificate/key pair (same SAN)
+  // after the plan was already approved and journaled - the exact TOCTOU
+  // window the delivery-time fingerprint check exists to close, now
+  // proven for an applied target too, not just bootstrap.
+  await generateCert();
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "tls");
+  assert.match(result.diagnostics[0], /no longer match the fingerprints/);
+  assert.equal(mutate.state.lock?.operationId, operationId, "the lock stays held - a blocked resume never releases it");
+  await rm(certDir, { recursive: true, force: true });
+});
+
+test("applied: a stale plan (the target already moved on before this run even starts) is rejected pre-lock, before ever taking the lock", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-8888-8888-8888-888888888888";
+  const baselineContracts = structuredClone(await loadContracts());
+  const { snapshot: approvedSnapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation: 4, inputDigests });
+
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-stale-"));
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.backup.schedule = "07:30";
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+
+  // Approve a plan against the target as it looked a moment ago...
+  const approveOptions = baseApplyOptions({ mutate, manifestPath, inspect: async () => approvedSnapshot });
+  const { plan, planPath } = await computeApprovedPlan(approveOptions);
+  assert.ok(plan.operations.length > 0);
+
+  // ...but by the time apply actually runs, the target has ALREADY moved
+  // on to a later generation - a real concurrent change (a different
+  // operator, a different tool) this plan was never computed against.
+  const laterManifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  laterManifest.backup.schedule = "07:30";
+  laterManifest.services.wachter.enabled = false;
+  const { manifest: _m, ...restBaselineContracts } = baselineContracts;
+  const laterContracts = { ...restBaselineContracts, manifest: laterManifest };
+  const { snapshot: laterSnapshot } = await appliedSnapshotFor({ contracts: laterContracts, installationId, generation: 5, inputDigests });
+
+  const runOptions = baseApplyOptions({ mutate, manifestPath, inspect: async () => laterSnapshot, dockerRun: async () => ({ stdout: "", stderr: "" }) });
+  const result = await withFakeCosign("success", () => runApply({ ...runOptions, approvePlanId: plan.planId, planPath }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "stale-plan");
+  assert.equal(mutate.state.lock, null, "a pre-lock stale-plan rejection never takes the lock at all");
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+test("applied: a stale plan (the target changes AFTER the pre-lock check but BEFORE the post-lock recheck) is caught by the recheck, and the freshly-acquired lock is released", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-9999-9999-9999-999999999999";
+  const baselineContracts = structuredClone(await loadContracts());
+  const { snapshot: approvedSnapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation: 4, inputDigests });
+
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-stale-recheck-"));
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.backup.schedule = "08:15";
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+
+  const approveOptions = baseApplyOptions({ mutate, manifestPath, inspect: async () => approvedSnapshot });
+  const { plan, planPath } = await computeApprovedPlan(approveOptions);
+  assert.ok(plan.operations.length > 0);
+
+  // The first inspect() call (the pre-lock recompute) still sees the
+  // exact target this plan was approved against; only the SECOND call
+  // (the post-lock stale-plan recheck) sees a target that has already
+  // moved on - a real concurrent change landing in the narrow window
+  // between this run's own pre-lock check and its lock actually being
+  // acquired.
+  let call = 0;
+  const laterManifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  laterManifest.backup.schedule = "08:15";
+  laterManifest.services.wachter.enabled = false;
+  const { manifest: _m, ...restBaselineContracts } = baselineContracts;
+  const laterContracts = { ...restBaselineContracts, manifest: laterManifest };
+  const { snapshot: laterSnapshot } = await appliedSnapshotFor({ contracts: laterContracts, installationId, generation: 5, inputDigests });
+  const inspect = async () => (call++ === 0 ? approvedSnapshot : laterSnapshot);
+
+  const runOptions = baseApplyOptions({ mutate, manifestPath, inspect, dockerRun: async () => ({ stdout: "", stderr: "" }) });
+  const result = await withFakeCosign("success", () => runApply({ ...runOptions, approvePlanId: plan.planId, planPath }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "stale-plan");
+  assert.match(result.diagnostics[0], /changed underneath this plan since it was locked/);
+  assert.equal(mutate.state.lock, null, "the freshly-acquired lock is released after a failed recheck");
+  await rm(scratchDir, { recursive: true, force: true });
 });

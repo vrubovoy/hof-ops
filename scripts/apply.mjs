@@ -32,6 +32,7 @@ import {
   currentOperator, decideStepResumption, newOperationId, withJournalStatus,
 } from "./operation-journal.mjs";
 import { checkArchitecture, checkManagedStateReadable, checkOs, observationFromSnapshot } from "./preflight.mjs";
+import { validateAppliedActions } from "./applied-actions.mjs";
 import { validateBootstrapActions } from "./bootstrap-actions.mjs";
 import { buildPlanV2, computePlanId, planV2Validator } from "./plan-v2.mjs";
 import { BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER } from "./plan-command.mjs";
@@ -112,7 +113,7 @@ const ACTION_TO_ROLE = {
 // comment on why: never through extra-vars/argv).
 function buildExtraVars(operation, { commitGeneration, imageTrustByUnit, installationId, generation }) {
   const role = ACTION_TO_ROLE[operation.action];
-  if (!role) throw new Error(`internal error: operation ${operation.id} has action ${operation.action}, which has no known Execution Environment role - this should have been rejected by the bootstrap action whitelist before dispatch`);
+  if (!role) throw new Error(`internal error: operation ${operation.id} has action ${operation.action}, which has no known Execution Environment role - this should have been rejected by the action whitelist (bootstrap-actions.mjs or applied-actions.mjs) before dispatch`);
   const vars = { hof_role: role, hof_operation_id: operation.id };
   switch (operation.action) {
     case "host.prepare":
@@ -297,14 +298,52 @@ function summarizePlanDiff(approved, recomputed) {
     : "every top-level field looks identical despite a different planId - this points at a canonicalization bug, not a real content change";
 }
 
+// Item 9 (ADR 0005): the commit generation a plan document itself
+// implies - never a hardcoded constant, and never re-derived from a
+// SEPARATE live baseline lookup (resume in particular must never do
+// that - see its own comment on why). A bootstrap plan always commits
+// generation 1 (ADR 0004 - unconditional, regardless of what
+// target.baselineGeneration happens to hold for a bootstrap plan, which
+// is always 0 anyway, see plan-v2.mjs's own bootstrap target-binding).
+// An applied plan always commits target.baselineGeneration + 1 - the
+// exact same value plan-command.mjs's own runPlan() used to render this
+// plan's own desired state in the first place, so a plan and the
+// generation it eventually commits can never disagree.
+function commitGenerationFor(planDoc) {
+  return planDoc.mode === "bootstrap" ? 1 : planDoc.target.baselineGeneration + 1;
+}
+
+// Item 9 (ADR 0005): whitelist validation is chosen by the plan's own
+// declared mode, never assumed - a plan that claims "bootstrap" but
+// somehow carries an applied-only action (or vice versa) must fail
+// here, not slip through validated against the wrong vocabulary
+// entirely.
+function validateActionsForPlan(planDoc) {
+  return planDoc.mode === "bootstrap" ? validateBootstrapActions(planDoc) : validateAppliedActions(planDoc);
+}
+
 // The exact current.json/topology.json a real state.commit dispatch for
 // this operationId/generation would itself produce - shared between the
 // real dispatch/commit code and resume's own succeeded-journal
 // verification, so the two can never independently drift out of sync.
-// installationId is always the operationId itself, generation always 1
-// - item 8's own scope (ADR 0004) is bootstrap-only.
-function computeExpectedCommittedState({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, plan, operationId, generation, inputDigests }) {
-  const appliedRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId: operationId, generation });
+//
+// Item 9 (ADR 0005): installationId and operationId are no longer
+// always the same value - a bootstrap plan still uses the fresh
+// operationId as the first, permanent installation id (unchanged, ADR
+// 0004); an applied plan reuses the baseline's own already-permanent
+// installationId, which never changes again for the life of the
+// installation (lastSuccessfulOperationId still always records the
+// REAL operationId that performed this particular commit, whichever
+// mode). retainedServices and the supplied-TLS fingerprints are carried
+// forward from the plan's own already-computed desired state (see
+// plan.mjs's own computeRetainedServices/buildPlan) - without this, a
+// retained service's own volume/schema-version record would be lost
+// the moment the very next generation committed, and a supplied-TLS
+// installation's own baseline fingerprint would revert to null on the
+// next resolveBaseline() (see state.mjs's own resolveBaseline() comment
+// on why that would silently break every later no-op).
+function computeExpectedCommittedState({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, plan, operationId, installationId, generation, inputDigests }) {
+  const appliedRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId, generation });
   const generatedFiles = renderedFilesContents(appliedRendered);
   // topologyDigest is deliberately the plan's own already-computed
   // value, not recomputed from appliedRendered here - that digest's own
@@ -314,7 +353,7 @@ function computeExpectedCommittedState({ manifest, catalog, releaseLock, service
   // what buildPlanV2 already validated.
   const currentState = {
     apiVersion: "hof.dev/state/v1",
-    installationId: operationId,
+    installationId,
     generation,
     lastSuccessfulOperationId: operationId,
     appliedAt: new Date().toISOString(),
@@ -325,6 +364,9 @@ function computeExpectedCommittedState({ manifest, catalog, releaseLock, service
     composeTemplateDigest: inputDigests.composeTemplateDigest,
     topologyDigest: plan.desired.topologyDigest,
     generatedArtifacts: Object.fromEntries(Object.entries(generatedFiles).map(([name, contents]) => [name, sha256(Buffer.from(contents))])),
+    retainedServices: plan.desired.retainedServices ?? {},
+    suppliedTlsCertificateFingerprint: plan.desired.suppliedTlsCertificateFingerprint ?? null,
+    suppliedTlsPrivateKeyFingerprint: plan.desired.suppliedTlsPrivateKeyFingerprint ?? null,
   };
   return { currentState, appliedRendered, generatedFiles };
 }
@@ -412,6 +454,44 @@ async function tryReleaseLock(m, mutateConn, operationId) {
   }
 }
 
+// Item 9 (ADR 0005): secrets are decrypted only once the actual plan is
+// known to be a real, non-no-op run - moved out of the old unconditional
+// "always decrypt whenever this deployment needs any secrets at all"
+// gate, which ran BEFORE the target was ever inspected or a plan ever
+// computed. That used to mean a deployment that genuinely needs secrets
+// would fail on a missing --secrets-store even for what turns out to be
+// a genuine applied no-op - nothing would ever have been delivered.
+// required is still the full deployment-wide set (plan.mjs's own
+// secret.ensure is unconditional on anyChange, never scoped to just the
+// touched service - see its own comment: "keep every required secret
+// current, including any this change newly needs"), so this still
+// validates against exactly what a real secret.ensure dispatch would
+// need, just no longer eagerly for a run that will never reach one.
+async function ensureSecretsAvailable({ manifest, enabledIds, options }) {
+  const required = requiredSecrets(manifest, enabledIds);
+  if (required.length === 0) return { secretValues: {} };
+  if (!options.secretsStorePath) {
+    return { blockedResult: blocked("secrets", `this deployment needs ${required.length} secret(s) (${required.map((s) => s.name).join(", ")}) but --secrets-store was not given`) };
+  }
+  let decrypted;
+  try {
+    const readStore = options.readSecretsStore ?? readSecretsStore;
+    decrypted = await readStore({ storePath: options.secretsStorePath, identityFile: options.secretsAgeIdentityFile });
+  } catch (error) {
+    return { blockedResult: blocked("secrets", `could not decrypt ${options.secretsStorePath}: ${error instanceof Error ? error.message : error}`) };
+  }
+  const missing = required.filter((s) => !(s.name in decrypted)).map((s) => s.name);
+  if (missing.length > 0) {
+    return { blockedResult: blocked("secrets", `${options.secretsStorePath} is missing required secret(s): ${missing.join(", ")} - run "hofctl secrets ensure" first`) };
+  }
+  // Only the subset this deployment actually needs - a store that also
+  // carries secrets for an unrelated, disabled service must never leak
+  // those into the Execution Environment container too.
+  const secretValues = {};
+  for (const { name } of required) secretValues[name] = decrypted[name];
+  return { secretValues };
+}
+
 // The one real plan-v2 computation a fresh (non-resume) apply run needs
 // twice: once before the lock is ever acquired (so a plan that's
 // already stale doesn't cost a wasted lock round trip), and once again
@@ -441,13 +521,19 @@ async function computeLivePlanV2({ snapshot, manifest, catalog, releaseLock, ser
   if (incompleteDocker.length > 0) return blocked("docker", `Docker's ${incompleteDocker.join("/")} listing could not be read - refusing to apply against an incomplete observation`);
   if (observation.generatedArtifactsStatus !== "available") return blocked("artifacts", "generated-artifact checksums could not be read - refusing to apply against an incomplete observation");
 
+  // Item 9 (ADR 0005): resolveBaseline() itself already covers both
+  // modes - the bootstrap-only guard this used to have right here is
+  // gone. Everything below now mirrors plan-command.mjs's own runPlan()
+  // step 5v2 exactly (the exact same document `hofctl plan` itself
+  // already prints, for either mode) - the two must never independently
+  // drift apart, since an operator approves whatever `hofctl plan`
+  // showed them.
   let baseline;
   try {
     baseline = resolveBaseline({ managedState: snapshot.managedState, catalog, observation });
   } catch (error) {
     return blocked("state", error instanceof Error ? error.message : String(error));
   }
-  if (baseline.mode !== "bootstrap") return blocked("scope", "hofctl apply only supports a bootstrap plan in this delivery item (see ADR 0004) - this target already has an applied installation");
 
   let suppliedTls;
   try {
@@ -455,14 +541,19 @@ async function computeLivePlanV2({ snapshot, manifest, catalog, releaseLock, ser
   } catch (error) {
     return blocked("tls", error instanceof Error ? error.message : String(error));
   }
-  if (!recoveryAgeRecipient) {
+  // recoveryAgeRecipient stays required for bootstrap only - an applied
+  // plan never re-derives a fresh secrets.sops.yaml recovery recipient,
+  // it already has one, untouched by an ordinary applied change (see
+  // ADR 0005, and plan-v2.mjs's own identical check).
+  if (baseline.mode === "bootstrap" && !recoveryAgeRecipient) {
     return blocked("recovery", "--recovery-age-recipient is required (a bootstrap plan always needs one, see ADR 0004)");
   }
 
-  const generation = 1;
+  const installationId = baseline.mode === "bootstrap" ? BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER : baseline.installationId;
+  const generation = baseline.mode === "bootstrap" ? 1 : baseline.generation + 1;
   let desiredRendered;
   try {
-    desiredRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId: BOOTSTRAP_INSTALLATION_ID_PLACEHOLDER, generation });
+    desiredRendered = renderTopology({ manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema, installationId, generation });
   } catch (error) {
     return blocked("render", error instanceof Error ? error.message : String(error));
   }
@@ -484,8 +575,13 @@ async function computeLivePlanV2({ snapshot, manifest, catalog, releaseLock, ser
   if (!validatePlanV2(plan)) return blocked("internal", `buildPlanV2 produced a result that does not satisfy schemas/plan-v2.schema.json: ${JSON.stringify(validatePlanV2.errors)}`);
   if (!plan.executable) return blocked("plan", `plan has blockers, refusing to apply: ${plan.blockers.join("; ")}`);
 
-  const whitelistErrors = validateBootstrapActions(plan);
-  if (whitelistErrors.length > 0) return blocked("bootstrap-actions", whitelistErrors.join("; "));
+  // Item 9 (ADR 0005): whitelist validation is chosen by the plan's own
+  // declared mode - a bootstrap plan is validated against
+  // bootstrap-actions.mjs's own whitelist, an applied plan against
+  // applied-actions.mjs's own (never backup.create, never host.prepare -
+  // see that module's own comment).
+  const whitelistErrors = validateActionsForPlan(plan);
+  if (whitelistErrors.length > 0) return blocked(plan.mode === "bootstrap" ? "bootstrap-actions" : "applied-actions", whitelistErrors.join("; "));
 
   return { plan };
 }
@@ -557,33 +653,23 @@ export async function runApply(options) {
   }
 
   // Fails fast, before ever touching the network, when this deployment
-  // needs secrets but wasn't given a store to read them from - the same
-  // real `sops --decrypt` scripts/secrets.mjs's own hofctl secrets
-  // ensure already uses, never a second, independently-maintained
-  // decryption path.
+  // needs secrets but wasn't given a store to read them from (or the
+  // store doesn't actually have them) - the same real `sops --decrypt`
+  // scripts/secrets.mjs's own hofctl secrets ensure already uses, never
+  // a second, independently-maintained decryption path. Deliberately
+  // unconditional on what the live plan eventually turns out to be
+  // (including a genuine applied no-op) - an operator running apply
+  // against a deployment that declares it needs secrets is expected to
+  // have a working store ready, regardless of what this particular
+  // invocation's own diff happens to be; ensureSecretsAvailable() is
+  // still factored out as its own function purely so the resume branch
+  // below (which never reaches this point at all, having started before
+  // it - see its own comment) can't independently drift from this exact
+  // logic if it ever needs the same check for a different reason.
   const enabledIds = enabledServiceIds(manifest, catalog);
-  const required = requiredSecrets(manifest, enabledIds);
-  let secretValues = {};
-  if (required.length > 0) {
-    if (!options.secretsStorePath) {
-      return blocked("secrets", `this deployment needs ${required.length} secret(s) (${required.map((s) => s.name).join(", ")}) but --secrets-store was not given`);
-    }
-    let decrypted;
-    try {
-      const readStore = options.readSecretsStore ?? readSecretsStore;
-      decrypted = await readStore({ storePath: options.secretsStorePath, identityFile: options.secretsAgeIdentityFile });
-    } catch (error) {
-      return blocked("secrets", `could not decrypt ${options.secretsStorePath}: ${error instanceof Error ? error.message : error}`);
-    }
-    const missing = required.filter((s) => !(s.name in decrypted)).map((s) => s.name);
-    if (missing.length > 0) {
-      return blocked("secrets", `${options.secretsStorePath} is missing required secret(s): ${missing.join(", ")} - run "hofctl secrets ensure" first`);
-    }
-    // Only the subset this deployment actually needs - a store that
-    // also carries secrets for an unrelated, disabled service must
-    // never leak those into the Execution Environment container too.
-    for (const { name } of required) secretValues[name] = decrypted[name];
-  }
+  const secretsResult = await ensureSecretsAvailable({ manifest, enabledIds, options });
+  if (secretsResult.blockedResult) return secretsResult.blockedResult;
+  let secretValues = secretsResult.secretValues;
 
   // Fails fast, before ever touching the network: --plan is loaded and
   // matched against --approve-plan-id up front, on a fresh (non-resume)
@@ -645,8 +731,11 @@ export async function runApply(options) {
   const mutateRun = options.run;
   const mutateConn = { mode: "ssh", host, port, user, hostKeySha256: snapshot.transport.trustDigest, identityFile: options.identityFile, connectTimeoutSeconds, run: mutateRun };
 
-  const generation = 1; // apply only ever supports a bootstrap plan (ADR 0004) - a bootstrap always commits generation 1.
-
+  // Item 9 (ADR 0005): the commit generation is no longer a hardcoded
+  // constant - derived per-branch below (commitGenerationFor()), from
+  // whichever plan document this run actually trusts (a fresh live
+  // recompute, or the journal's own embedded plan on resume), never
+  // from a second, independent baseline lookup.
   let operationId;
   let plan;
   let journal;
@@ -734,9 +823,12 @@ export async function runApply(options) {
     if (computePlanId(existing.plan) !== existing.plan.planId || existing.plan.planId !== existing.approvedPlanId || existing.plan.planId !== lock.approvedPlanId) {
       return blocked("resume", `the journal for operation ${operationId} carries a plan whose own planId does not match its content, its own approvedPlanId, or the lock's approvedPlanId - refusing to trust it`);
     }
-    const embeddedWhitelistErrors = validateBootstrapActions(existing.plan);
+    // Item 9 (ADR 0005): chosen by the embedded plan's own declared
+    // mode - never assumed bootstrap just because that used to be the
+    // only mode this function ever saw.
+    const embeddedWhitelistErrors = validateActionsForPlan(existing.plan);
     if (embeddedWhitelistErrors.length > 0) {
-      return blocked("resume", `the journal for operation ${operationId} carries a plan that fails the bootstrap action whitelist - refusing to trust it: ${embeddedWhitelistErrors.join("; ")}`);
+      return blocked("resume", `the journal for operation ${operationId} carries a plan that fails the ${existing.plan.mode} action whitelist - refusing to trust it: ${embeddedWhitelistErrors.join("; ")}`);
     }
     if (JSON.stringify(existing.plan.target) !== JSON.stringify(existing.target) || JSON.stringify(existing.target) !== JSON.stringify(lock.target)) {
       return blocked("resume", `the journal for operation ${operationId} carries a plan/journal/lock whose own target bindings disagree - refusing to trust it`);
@@ -805,9 +897,20 @@ export async function runApply(options) {
       if (!allStepsResolved) {
         return blocked("resume", `the journal for operation ${operationId} claims status "succeeded", but its own recorded event history doesn't show every operation actually resolved - refusing to trust a completion claim its own evidence doesn't support`);
       }
+      // Item 9 (ADR 0005): derived from the journal's own embedded plan,
+      // never a hardcoded constant or a fresh baseline lookup - the
+      // exact same derivation the fresh path used to arrive at this
+      // plan's own commit in the first place (commitGenerationFor/
+      // plan.target.installationId), so this can never disagree with
+      // what the plan itself implies.
+      const commitGeneration = commitGenerationFor(existing.plan);
+      const commitInstallationId = existing.plan.mode === "bootstrap" ? operationId : existing.plan.target.installationId;
+      if (existing.committedGeneration !== undefined && existing.committedGeneration !== commitGeneration) {
+        return blocked("resume", `the journal for operation ${operationId} claims committedGeneration ${existing.committedGeneration}, but its own embedded plan implies ${commitGeneration} - refusing to trust a completion claim its own evidence doesn't support`);
+      }
       const { currentState: expectedCurrentState, appliedRendered: expectedTopology } = computeExpectedCommittedState({
         manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema,
-        plan: existing.plan, operationId, generation, inputDigests: currentDigests,
+        plan: existing.plan, operationId, installationId: commitInstallationId, generation: commitGeneration, inputDigests: currentDigests,
       });
       const { status: liveCurrentStatus, current: liveCurrent } = await m.readCurrentState(mutateConn);
       if (liveCurrentStatus !== "present") {
@@ -830,6 +933,20 @@ export async function runApply(options) {
       if (liveTopologyStatus !== "present" || JSON.stringify(liveTopology) !== JSON.stringify(expectedTopology)) {
         return blocked("resume", `the journal for operation ${operationId} claims status "succeeded", but the target's own topology.json could not be confirmed to match - refusing to trust a completion claim its own evidence doesn't support`);
       }
+      // Item 9 (ADR 0005): a THIRD independent oracle - the state role's
+      // own immutable per-generation snapshot (see
+      // ansible/roles/state/tasks/main.yml and target-mutate.mjs's own
+      // readGenerationSnapshot) - confirmed to exist and match too, not
+      // just the two mutable pointer files above. appliedAt excluded
+      // from this comparison for the exact same reason as above.
+      const { status: liveSnapshotStatus, snapshot: liveSnapshot } = await m.readGenerationSnapshot(mutateConn, commitGeneration);
+      if (liveSnapshotStatus !== "present") {
+        return blocked("resume", `the journal for operation ${operationId} claims status "succeeded", but generation ${commitGeneration}'s own immutable snapshot could not be confirmed present on the target - refusing to trust a completion claim its own evidence doesn't support`);
+      }
+      const { appliedAt: _snapshotAppliedAt, ...liveSnapshotWithoutTimestamp } = liveSnapshot ?? {};
+      if (JSON.stringify(liveSnapshotWithoutTimestamp) !== JSON.stringify(expectedWithoutTimestamp)) {
+        return blocked("resume", `the journal for operation ${operationId} claims status "succeeded", but generation ${commitGeneration}'s own immutable snapshot doesn't match what this exact operation would have committed - refusing to trust a completion claim its own evidence doesn't support`);
+      }
 
       const release = await tryReleaseLock(m, mutateConn, operationId);
       if (!release.released) {
@@ -839,10 +956,10 @@ export async function runApply(options) {
         // old code did exactly that: a bare `.catch(() => {})` discarded
         // a real transport failure, and even a clean { released: false }
         // response was never looked at.
-        return blocked("resume", `operation ${operationId} already succeeded (committed generation ${existing.committedGeneration}), but its lock could not be confirmed released: ${release.note} - the target may still be locked; investigate directly rather than retrying`);
+        return blocked("resume", `operation ${operationId} already succeeded (committed generation ${commitGeneration}), but its lock could not be confirmed released: ${release.note} - the target may still be locked; investigate directly rather than retrying`);
       }
-      emit({ type: "apply.committed", operationId, committedGeneration: existing.committedGeneration });
-      return { blocked: false, operationId, committedGeneration: existing.committedGeneration, planId: existing.approvedPlanId };
+      emit({ type: "apply.committed", operationId, committedGeneration: commitGeneration });
+      return { blocked: false, operationId, committedGeneration: commitGeneration, planId: existing.approvedPlanId };
     }
     assertJournalResumable(existing);
 
@@ -861,6 +978,21 @@ export async function runApply(options) {
       return blocked("stale-plan", `the plan recomputed from the target's current live state (${firstResult.plan.planId}) does not match the approved plan (${approvedPlan.planId}, ${options.planPath}) - refusing to apply: ${summarizePlanDiff(approvedPlan, firstResult.plan)}`);
     }
     plan = firstResult.plan;
+
+    // Item 9 (ADR 0005): a genuine applied no-op - requires the exact
+    // approved plan (already confirmed above), takes no lock, creates
+    // no journal, runs no Execution Environment, never bumps generation.
+    // Bootstrap is deliberately excluded here - it always mutates a
+    // clean host (ADR 0004's own always-locked contract, already
+    // reviewed, stays untouched); only an applied plan can legitimately
+    // have zero operations at all.
+    if (plan.mode === "applied" && plan.operations.length === 0) {
+      // No lock/journal was ever created, so there is no operationId
+      // for this run either - CLI result shape:
+      // {"type": "apply.result", "noOp": true, "committedGeneration": N, "planId": "sha256:..."}
+      // (see hofctl.mjs's own final print of the returned result).
+      return { blocked: false, noOp: true, committedGeneration: plan.target.baselineGeneration, planId: plan.planId };
+    }
 
     inputDigests = {
       manifestDigest: sha256(servicesBytes),
@@ -930,22 +1062,36 @@ export async function runApply(options) {
 
   emit({ type: "apply.locked", operationId, resumed: Boolean(options.resume), planId: plan.planId });
 
+  // Item 9 (ADR 0005): derived from the plan this run actually trusts
+  // (a fresh live recompute, or the journal's own embedded plan on
+  // resume) - never a hardcoded constant, and never re-derived from a
+  // second, independent baseline lookup (resume in particular must
+  // never do that - see its own comment further up on why).
+  const generation = commitGenerationFor(plan);
+
   // The REAL installation id every actually-dispatched operation labels
-  // real Docker resources with, and state.commit finally records -
-  // deliberately never the planning-time placeholder above (see its own
-  // comment on why that one is fixed and shared with `hofctl plan`).
-  // Deterministically reusing this run's own operationId (rather than a
-  // second, separately-generated random value) needs no extra durable
-  // storage at all to stay correct across a resume: a resume already
-  // recovers the exact same operationId from the target's own lock, so
-  // it recomputes the exact same real installation id too, without ever
-  // having to persist it anywhere new.
-  const realInstallationId = operationId;
+  // real Docker resources with, and state.commit finally records.
+  // Bootstrap: deliberately never the planning-time placeholder above
+  // (see its own comment on why that one is fixed and shared with
+  // `hofctl plan`) - a fresh operationId becomes the first, PERMANENT
+  // installation id (ADR 0004). Deterministically reusing this run's
+  // own operationId (rather than a second, separately-generated random
+  // value) needs no extra durable storage at all to stay correct across
+  // a resume: a resume already recovers the exact same operationId from
+  // the target's own lock, so it recomputes the exact same real
+  // installation id too, without ever having to persist it anywhere new.
+  // Applied (ADR 0005): installationId is permanent forever - this run's
+  // own operationId never replaces it, whatever mode. Reused directly
+  // from the plan's own target binding (baseline.installationId,
+  // already resolved once by resolveBaseline/computeLivePlanV2, or by
+  // plan-command.mjs's own runPlan for a --plan file an operator
+  // approved) - never re-derived from a second, independent lookup.
+  const realInstallationId = plan.mode === "bootstrap" ? operationId : plan.target.installationId;
   let appliedRendered, currentState, generatedFiles;
   try {
     ({ appliedRendered, currentState, generatedFiles } = computeExpectedCommittedState({
       manifest, catalog, releaseLock, servicesSchema, catalogSchema, releaseLockSchema,
-      plan, operationId: realInstallationId, generation, inputDigests,
+      plan, operationId, installationId: realInstallationId, generation, inputDigests,
     }));
   } catch (error) {
     if (!options.resume) await m.releaseLock(mutateConn, operationId).catch(() => {});
@@ -1116,7 +1262,17 @@ export async function runApply(options) {
               const { status: topologyStatus, topology: actualTopology } = await m.readTopology(mutateConn);
               topologyMatches = topologyStatus === "present" && JSON.stringify(actualTopology) === JSON.stringify(appliedRendered);
             }
+            // Item 9 (ADR 0005): the state role's own immutable per-
+            // generation snapshot, confirmed too - the same third
+            // independent oracle the succeeded-journal fast path checks
+            // further up.
+            let snapshotMatches = false;
             if (currentMatches && topologyMatches) {
+              const { status: snapshotStatus, snapshot } = await m.readGenerationSnapshot(mutateConn, generation);
+              const { appliedAt: _snapshotAppliedAt, ...snapshotWithoutTimestamp } = snapshot ?? {};
+              snapshotMatches = snapshotStatus === "present" && JSON.stringify(snapshotWithoutTimestamp) === JSON.stringify(expectedWithoutTimestamp);
+            }
+            if (currentMatches && topologyMatches && snapshotMatches) {
               const recovered = await buildEvent({ operationId, step: operation.id, attempt: 1, phase: "succeeded" });
               await m.appendEvent(mutateConn, operationId, recovered);
               emit(recovered);
@@ -1150,7 +1306,16 @@ export async function runApply(options) {
           const failedJournal = await withJournalStatus(journal, { status: "failed" });
           await m.updateJournalStatus(mutateConn, failedJournal);
           await m.releaseLock(mutateConn, operationId).catch(() => {});
-          return blocked("operation", `operation ${operation.id} failed: ${failed.error} - a fresh bootstrap is required after diagnosis, this operation cannot be resumed (see ADR 0004)`);
+          // Item 9 (ADR 0005): a failed applied reconciliation attempt
+          // never talks about "a fresh bootstrap" - there's already a
+          // real installation on this target; a failure here calls for
+          // manual diagnosis, then a fresh reconciliation attempt
+          // against the SAME installation, never treating it as a clean
+          // slate again.
+          const diagnosis = plan.mode === "bootstrap"
+            ? "a fresh bootstrap is required after diagnosis, this operation cannot be resumed (see ADR 0004)"
+            : "diagnose the target manually, then run a fresh hofctl plan/hofctl apply reconciliation against this same installation - this operation cannot be resumed (see ADR 0005)";
+          return blocked("operation", `operation ${operation.id} failed: ${failed.error} - ${diagnosis}`);
         }
 
         const succeeded = await buildEvent({ operationId, step: operation.id, attempt, phase: "succeeded" });

@@ -29,8 +29,11 @@ application source directly on the target.
 
 It owns the desired-state manifest, the release-owned service catalog, the
 immutable release lock, and a deterministic `hofctl render` topology compiler.
-Ansible host reconciliation, restic backup/restore, and a
-local installer UI. It contains no application source code of its own and
+It also owns Ansible host reconciliation - both a fresh bootstrap and, as of
+item 9, applied-mode reconciliation against an already-applied installation
+(config/topology/drift, retain-only removal, enable/disable/re-enable of an
+optional service). restic backup/restore and a local installer UI remain
+later delivery items. It contains no application source code of its own and
 does not extend any service with generic host access: Schlüssel, Schloss,
 and Wächter never receive a Docker socket, an SSH key, or a shell from
 this repo. See [ADR 0001](docs/adr/0001-scope-and-trust-boundaries.md) for
@@ -56,40 +59,60 @@ hardened SSH transport (disk/RAM/CPU/clock/DNS/ports/Docker); `hofctl plan`
 chains both, resolves the last-applied state (or a synthetic bootstrap
 baseline on a genuinely clean host), computes drift against what's actually
 running, and prints one typed, ordered operation list to stdout - never
-writing anything, anywhere. Against a genuinely clean (bootstrap) target it
-prints the real `plan-v2` document `hofctl apply` itself requires
-`--approve-plan-id`/`--plan` to match byte for byte (the exact target
-binding, recovery recipient, and supplied-TLS fingerprint `apply` will
-recompute and check under the lock - see ADR 0004's own errata note); an
-already-applied target (item 9, not yet implemented) still prints the
-historical `plan-v1` shape, informational only.
+writing anything, anywhere. It always prints the real `plan-v2` document
+`hofctl apply` itself requires `--approve-plan-id`/`--plan` to match byte for
+byte (the exact target binding, and - for a bootstrap target - recovery
+recipient, plus a supplied-TLS fingerprint for either mode - `apply` will
+recompute and check the whole document again under the lock - see ADR 0004's
+own errata note), for EITHER a genuinely clean (bootstrap) target or an
+already-applied one (item 9, ADR 0005) - the historical, informational-only
+`plan-v1` shape for an applied target is gone; `plan-v1`/`buildPlan()` (the
+pure core `plan-v2` wraps) stay unchanged as their own historical contract.
 
-`hofctl apply` is implemented for delivery item 8's own scope - a bootstrap
-onto a genuinely clean host (see ADR 0004): exact SSH target binding,
-`--plan`/`--approve-plan-id` (approving a plan approves that exact content,
-matched against the file you actually reviewed via a canonical-JSON
-planId - recursively sorted keys, so a reordered-but-otherwise-identical
-document still matches, but never "whatever recomputes to the same short
-ID"), an exclusive durable target lock, a durable
-operation journal (bounded NDJSON progress on stdout) that embeds the full
-approved plan itself, a full canonical-document stale-plan recheck under
-the lock (not just the target's own identity fields),
-Cosign verification of the pinned Ansible Execution Environment image before
-it ever runs, a fixed bootstrap-only action whitelist dispatched into that
+`hofctl apply` covers both delivery item 8's own scope (a bootstrap onto a
+genuinely clean host, ADR 0004) and item 9's own (applied-mode
+reconciliation against an already-applied installation, ADR 0005): exact SSH
+target binding, `--plan`/`--approve-plan-id` (approving a plan approves that
+exact content, matched against the file you actually reviewed via a
+canonical-JSON planId - recursively sorted keys, so a reordered-but-
+otherwise-identical document still matches, but never "whatever recomputes
+to the same short ID"), an exclusive durable target lock (a genuine applied
+no-op takes none at all, creates no journal, never bumps the generation), a
+durable operation journal (bounded NDJSON progress on stdout) that embeds
+the full approved plan itself, a full canonical-document stale-plan recheck
+under the lock (not just the target's own identity fields), Cosign
+verification of the pinned Ansible Execution Environment image before it
+ever runs, an action whitelist chosen by the plan's own mode (bootstrap vs.
+applied - `backup.create` is in neither, item 9 never backs anything up on
+removal or upgrade, that stays item 10's own scope) dispatched into that
 image (never local Ansible, never a generic command), and safe, bounded
-resume after an interruption. The Execution Environment's own ten roles
-(`ansible/roles/`) all have their real implementation now - host preparation
+resume after an interruption. `installationId` is permanent forever once a
+bootstrap assigns it; an applied commit always advances the generation by
+exactly one (`N -> N+1`), never re-derived from anywhere but the plan
+actually being applied. The Execution Environment's own ten roles
+(`ansible/roles/`) all have their real implementation - host preparation
 (python3/Docker bootstrap), secret delivery, volume/network creation, image
 verification (Cosign, delegated to the control node) and pull, generated-file
-delivery, database migration, service startup, readiness polling, and the
-final atomic state commit - see `ansible/README.md` for exactly what's
-verified for real in CI versus locally. The Execution Environment image
-itself has been cut and published for real
-(`ghcr.io/vrubovoy/hof-ops-ee:v0.1.0`, real keyless Cosign signature and
-SBOM/provenance attestations - see `ansible/README.md`'s own
-Versioning section). Item 8 itself closes with this: a bootstrap onto a
-genuinely clean host, start to finish. Applied-mode
-reconciliation (update/remove), backup/restore, upgrade/rollback,
+delivery, database migration, service start/stop/remove (start|stop|remove
+- item 9 added the latter two, scoped to an exact `hof.managed` + exact
+installationId + exact unit + exact Compose project match), readiness
+polling, and the final atomic state commit, which now also publishes an
+immutable per-generation snapshot (`generations/NNNNNN/*`) before either
+mutable pointer file - see `ansible/README.md` for exactly what's verified
+for real in CI versus locally. The Execution Environment image itself has
+been cut and published for real multiple times as the pipeline grew - most
+recently `ghcr.io/vrubovoy/hof-ops-ee:v0.1.4` for item 9 (real keyless
+Cosign signature and SBOM/provenance attestations, independently
+re-verified - see `ansible/README.md`'s own Versioning section), selected by
+platform release `v0.2.0`. Item 8 closed with a bootstrap onto a genuinely
+clean host, start to finish; item 9 closes with reconciliation against an
+already-applied one, real end to end in CI (bootstrap, enable an optional
+persistent service, an applied no-op, disable-with-retain, another no-op,
+re-enable, the retained volume and its real data surviving the whole round
+trip) - though, given item 8's own five premature closure calls on this
+exact same lock/journal/event foundation, item 9's own independent review is
+still outstanding as of this writing; treat it as the currently-best-
+verified state, not a guarantee. Backup/restore, upgrade/rollback,
 first-admin bootstrap, and the installer UI are later delivery items - see
 the Delivery Order in the plan linked above.
 
@@ -191,11 +214,11 @@ listing, an unreadable state file, missing generated-artifact checksums),
 resolves the last-applied state (or a synthetic bootstrap baseline on a
 genuinely clean host), and prints one typed, ordered operation list to
 stdout as a single JSON document — nothing else ever reaches stdout, so it
-composes cleanly with `jq` or any other tool. Against a genuinely clean
-host it's `plan-v2` (the exact document `hofctl apply` will need
-`--plan`/`--approve-plan-id` to match, so `--recovery-age-recipient` is
-required there too); against an already-applied host (item 9, not yet
-implemented) it's still the historical `plan-v1`.
+composes cleanly with `jq` or any other tool. It's always `plan-v2` now
+(the exact document `hofctl apply` will need `--plan`/`--approve-plan-id`
+to match) — a genuinely clean host still needs `--recovery-age-recipient`
+too, but an already-applied host (item 9, ADR 0005) no longer prints the
+historical, informational-only `plan-v1` shape it used to.
 
 ```sh
 node scripts/hofctl.mjs plan \
@@ -218,12 +241,12 @@ or auto-recreated, `--repair-drift` or not).
 
 ## Applying a deployment
 
-`hofctl apply` runs a bootstrap plan for real, onto a genuinely clean host
-(see ADR 0004 - applied-mode reconciliation is a later delivery item). The
-plan you approve is the exact document `hofctl plan` printed against a
-bootstrap target (a real `plan-v2` document there too, not `plan-v1` -
-see ADR 0004's own errata note): save it, review it, then hand both its
-own file and its `planId` to `apply` - `--approve-plan-id` must match
+`hofctl apply` runs a plan for real - a bootstrap onto a genuinely clean
+host (ADR 0004), or applied-mode reconciliation against an already-applied
+one (ADR 0005). The plan you approve is the exact `plan-v2` document
+`hofctl plan` already printed for that same target (see ADR 0004's own
+errata note): save it, review it, then hand both its own file and its
+`planId` to `apply` - `--approve-plan-id` must match
 `--plan`'s own `planId` (a canonical-JSON hash: recursively sorted
 object keys, so it's the content that must match exactly, not any one
 particular byte sequence), and `apply` then recomputes the plan itself
@@ -267,11 +290,17 @@ catalog/renderer/Execution-Environment digests it was journaled against
 haven't changed) - it reclaims the same target lock and journal, skips
 every step that already recorded a real `succeeded` event, and refuses
 outright (never guesses) if a step's own outcome can't be determined from
-the journal. `--target-mode local` is not supported for `apply` (unlike
-`plan`/`preflight`) - the Execution Environment runs as a container, and a
-local Ansible connection inside it would mutate that container's own
-filesystem, never the real host's; a loopback SSH target is the way to
-exercise `apply` locally (see `test/apply-acceptance.mjs`).
+the journal. `--recovery-age-recipient` stays required for a bootstrap
+target (a fresh `secrets.sops.yaml` needs one); an already-applied target
+never re-derives its own, so it's optional there. A genuine applied no-op
+(the live recompute comes back with zero operations) takes no lock, creates
+no journal, and reports `{"noOp": true, "committedGeneration": N}` with no
+`operationId` at all - there was nothing to lock or resume. `--target-mode
+local` is not supported for `apply` (unlike `plan`/`preflight`) - the
+Execution Environment runs as a container, and a local Ansible connection
+inside it would mutate that container's own filesystem, never the real
+host's; a loopback SSH target is the way to exercise `apply` locally (see
+`test/apply-acceptance.mjs`).
 
 ## Cutting a release
 

@@ -322,8 +322,14 @@ if (command === "render") {
   if (options) {
     resolvePaths(options, ["services", "releaseLock", "catalog", "knownHosts", "identityFile", "secretsStore", "secretsAgeIdentityFile", "plan"]);
     const hasResume = options.resume === true;
-    if (!options.services || !options.releaseLock || !options.releaseLockIdentity || !options.identityFile || !options.recoveryAgeRecipient) {
-      usage("apply requires --services, --release-lock, --release-lock-identity, --identity-file, and --recovery-age-recipient");
+    // Item 9 (ADR 0005): --recovery-age-recipient is no longer required
+    // at the CLI-argument level - it stays required for a bootstrap
+    // target, optional for an already-applied one, but which this run
+    // turns out to be is never knowable before the target is actually
+    // inspected. runApply()'s own mode-aware check (mirroring
+    // buildPlanV2's identical one) enforces this instead, once it knows.
+    if (!options.services || !options.releaseLock || !options.releaseLockIdentity || !options.identityFile) {
+      usage("apply requires --services, --release-lock, --release-lock-identity, and --identity-file");
     } else if (Boolean(options.knownHosts) === Boolean(options.hostKeySha256)) {
       usage("apply requires exactly one of --known-hosts or --host-key-sha256");
     } else if (hasResume ? (options.approvePlanId || options.plan) : (!options.approvePlanId || !options.plan)) {
@@ -356,7 +362,14 @@ if (command === "render") {
           for (const line of result.diagnostics) console.error(line);
           process.exitCode = 1;
         } else {
-          console.log(JSON.stringify({ type: "apply.result", operationId: result.operationId, committedGeneration: result.committedGeneration, planId: result.planId }));
+          // Item 9 (ADR 0005): a genuine applied no-op carries noOp: true
+          // and no operationId at all (no lock/journal was ever created -
+          // see runApply()'s own comment) - result.operationId/result.noOp
+          // are simply undefined for every other (ordinary, mutating) run,
+          // and JSON.stringify drops an undefined-valued key entirely, so
+          // this line's own output is byte-for-byte unchanged for every
+          // run this codebase already prints today.
+          console.log(JSON.stringify({ type: "apply.result", operationId: result.operationId, noOp: result.noOp, committedGeneration: result.committedGeneration, planId: result.planId }));
         }
       } catch (error) {
         if (/must be a positive integer/.test(error?.message ?? "")) {

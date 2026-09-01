@@ -91,3 +91,15 @@ checks, not skipped) and confirmed to carry both attestations
 (`https://spdx.dev/Document/v2.3` and `https://slsa.dev/provenance/v1`).
 `ee-v0.1.0`'s own image stays published, a historical artifact, not
 deleted.
+
+Item 9 (applied-mode reconciliation, ADR 0005) baked its own new
+service-role `start|stop|remove` actions and the state role's own
+immutable per-generation snapshots (`generations/NNNNNN/*`) into a real
+pinned image the same way: `ee-v0.1.4`, cut once PRs #48-52 landed,
+independently re-verified here exactly like every prior cut -
+`ghcr.io/vrubovoy/hof-ops-ee@sha256:75e93b8afdd01a9279a62d9e5d98811c3402ac443e9774a5f916c88245ebf0a7`,
+real `cosign verify` against the exact workflow identity above, both
+attestations (`https://spdx.dev/Document/v2.3` and
+`https://slsa.dev/provenance/v1`) confirmed present. Platform release
+`v0.2.0` (`releases/0.2.0.yml`) selects it - the first release able to
+apply against an already-applied installation, not just bootstrap one.

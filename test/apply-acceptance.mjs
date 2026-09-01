@@ -8,19 +8,19 @@
 // inspectTarget() over real SSH, a real plan-v2 build, real
 // target-mutate lock/journal/event writes over real SSH (with sudo), a
 // real `docker run` of the real, published, independently-signed
-// ee-v0.1.3 Execution Environment image for every operation (no local
-// build, no signature bypass, no image override - see baseOptions()
-// below), reaching the real target over a real SSH connection FROM
-// inside that container, running every one of item 8's ten real role
+// Execution Environment image for every operation (no local build, no
+// signature bypass, no image override - see baseOptions() below),
+// reaching the real target over a real SSH connection FROM inside that
+// container, running every one of item 8's ten real role
 // implementations against real application images.
 //
 // This is the "full disposable-VM acceptance" PLATFORM-OPS-PLAN.md's
 // "Item 8 reopened" entry named as missing (finding #9): earlier
 // versions of this file stopped at a real, expected image-pull failure
 // (examples/release-lock.json's own images were illustrative). This one
-// uses the real, published, real-Cosign-signed v0.1.4 platform release
-// lock instead - downloaded fresh in before() via `gh release download`
-// - so every image reference in it is genuinely pullable and genuinely
+// uses the real, published, real-Cosign-signed platform release lock
+// instead - downloaded fresh in before() via `gh release download` - so
+// every image reference in it is genuinely pullable and genuinely
 // signed. The manifest enables only the platform's own mandatory core
 // (schlussel, schloss - see catalog/services-v1.yaml's own `mandatory:
 // true` entries; every optional service disabled, matching
@@ -68,10 +68,18 @@
 // plan reused against an already-applied host is still refused, just
 // because it's genuinely stale (the live recompute now correctly comes
 // back mode: "applied", never matching the old bootstrap plan's own
-// planId), not because applied targets are out of scope. Item 9's own
-// real applied-mode acceptance (enable/disable/re-enable against a
-// disposable target) is a separate, later CI-only acceptance test - see
-// ADR 0005's own delivery plan.
+// planId), not because applied targets are out of scope.
+//
+// Item 9's own real applied-mode acceptance - the actual "PR6" promise
+// of ADR 0005's own delivery plan - continues in the SAME test, against
+// the SAME already-bootstrapped target, once the bootstrap half above
+// finishes: enable an optional persistent service, write a real marker
+// into its own real volume, a genuine applied no-op, disable with
+// dataRetention: retain, another no-op, re-enable, confirming the exact
+// same marker/volume survive the whole round trip, real readiness, and
+// every immutable per-generation snapshot the state role now writes
+// (ansible/roles/state/tasks/main.yml, item 9's own new behavior baked
+// into ee-v0.1.4 - see PR #53's real, independently-verified cut).
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -92,14 +100,17 @@ import { runPlan } from "../scripts/plan-command.mjs";
 
 const RECOVERY_AGE_RECIPIENT = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
 // The real platform release this test downloads and applies - see
-// releases/0.1.4.yml (reuses releases/0.1.3.yml's own app-component
-// selections unchanged; only ansibleEnvironment moves to ee-v0.1.3, the
-// build that actually carries the Docker-service-enable fix - #43/#44).
-// `workflow_dispatch` signs with the DISPATCHING branch's own ref, never
-// a tag (confirmed for real by inspecting the v0.1.1 release's own
-// certificate - `@refs/heads/main`, not `@refs/tags/v0.1.1`), unlike
-// execution-environment.yml's own tag-triggered identity below.
-const RELEASE_VERSION = "0.1.4";
+// releases/0.2.0.yml (reuses releases/0.1.4.yml's own app-component
+// selections unchanged; only ansibleEnvironment moves to ee-v0.1.4, item
+// 9's own real, independently-verified cut - PR #53 - baking in the new
+// service-role start|stop|remove actions and the state role's own
+// immutable per-generation snapshots this file's own applied-lifecycle
+// half below exercises for real). `workflow_dispatch` signs with the
+// DISPATCHING branch's own ref, never a tag (confirmed for real by
+// inspecting the v0.1.1 release's own certificate - `@refs/heads/main`,
+// not `@refs/tags/v0.1.1`), unlike execution-environment.yml's own
+// tag-triggered identity below.
+const RELEASE_VERSION = "0.2.0";
 const RELEASE_LOCK_IDENTITY = "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/heads/main";
 
 const exec = promisify(execFile);
@@ -287,8 +298,8 @@ function baseOptions() {
     recoveryAgeRecipient: RECOVERY_AGE_RECIPIENT,
     dockerRun: loggingDockerRun,
     // No executionEnvironmentImageOverride, no verifyEeSignature stub -
-    // the real, published ee-v0.1.3 image referenced by the real
-    // release lock above, with its real Cosign signature genuinely
+    // the real, published Execution Environment image referenced by the
+    // real release lock above, with its real Cosign signature genuinely
     // verified.
     //
     // The target only exists on this test's own private Docker bridge
@@ -300,7 +311,33 @@ function baseOptions() {
   };
 }
 
-test("a real, full bootstrap apply against the real, published, signed v0.1.4 release - every real role, start to finish, to a genuine generation-1 commit", async () => {
+// Item 9 (ADR 0005): the exact same runPlan() call every plan below this
+// point makes - manifestPath/servicesPath is re-read fresh off disk each
+// time (this file's own applied-lifecycle steps rewrite it in place
+// between calls), so this always reflects whatever the manifest
+// currently says, never a stale in-memory copy.
+function planOptions() {
+  return {
+    manifestPath: servicesPath, releaseLockPath, releaseLockIdentity: RELEASE_LOCK_IDENTITY,
+    hostKeySha256: hostKeyFingerprint, identityFile: userKeyPath, connectTimeoutSeconds: 30,
+  };
+}
+
+// A single, real, independent SSH round trip to the target - `docker
+// exec` into the SAME real container this whole file already
+// bootstraps, bypassing this codebase's own target-mutate.mjs/
+// target-inspector.mjs transports entirely, so a real assertion here
+// can never be fooled by a bug in either of those.
+async function onTarget(...args) {
+  const { stdout } = await exec("docker", ["exec", containerName, ...args]);
+  return stdout;
+}
+
+async function readCurrentState() {
+  return JSON.parse(await onTarget("cat", "/var/lib/hof/state/current.json"));
+}
+
+test("a real, full bootstrap apply against the real, published, signed v0.2.0 release, then a real applied-mode reconciliation lifecycle against the same target - every real role, start to finish, generation 1 through 4", async () => {
   // The real operator workflow, exercised for real: a genuine `hofctl
   // plan` run (real inspectTarget() over the real SSH transport this
   // whole fixture already sets up, real cosign verification of the
@@ -480,4 +517,143 @@ test("a real, full bootstrap apply against the real, published, signed v0.1.4 re
   const secondApply = await runApply({ ...baseOptions(), approvePlanId: plan.planId, planPath });
   assert.equal(secondApply.blocked, true, "a second bootstrap apply against an already-applied host must be refused");
   assert.equal(secondApply.reason, "stale-plan");
+
+  // === Item 9 (ADR 0005): real applied-mode reconciliation, against
+  // this SAME already-bootstrapped target - enable an optional
+  // persistent service, write a real marker into its own real volume, a
+  // genuine applied no-op, disable-with-retain (containers genuinely
+  // gone, the volume and its marker genuinely survive), another no-op,
+  // re-enable (the SAME volume reused, the SAME marker still there, no
+  // migration, real readiness confirmed), generation progressing
+  // 1 -> 2 -> 3 -> 4, every immutable per-generation snapshot confirmed
+  // present and schema-valid on the target. Never run locally - see
+  // this file's own top comment. ===================================
+
+  // before()'s own `manifest` local is scoped there, not to this test()
+  // callback - read fresh off the same real file it already wrote,
+  // exactly like every other real caller of servicesPath does.
+  const manifest = YAML.parse(await readFile(servicesPath, "utf8"));
+
+  // Enable kuvert (an optional, persistent, database-owning service) -
+  // a real, deliberate diff on top of the mandatory-core-only baseline
+  // bootstrap above.
+  manifest.services.kuvert.enabled = true;
+  await writeFile(servicesPath, YAML.stringify(manifest));
+
+  const enablePlan = await runPlan(planOptions());
+  assert.ok(!enablePlan.blocked, `enabling kuvert was blocked: ${JSON.stringify(enablePlan.diagnostics)}`);
+  assert.equal(enablePlan.plan.mode, "applied");
+  assert.ok(enablePlan.plan.summary.create > 0, "enabling kuvert must create real units");
+  const enablePlanPath = path.join(workDir, "plan-enable-kuvert.json");
+  await writeFile(enablePlanPath, JSON.stringify(enablePlan.plan));
+  const enableResult = await runApply({ ...baseOptions(), approvePlanId: enablePlan.plan.planId, planPath: enablePlanPath });
+  assert.equal(enableResult.blocked, false, `enabling kuvert failed: ${JSON.stringify(enableResult)}`);
+  assert.equal(enableResult.committedGeneration, 2, "generation 1 -> 2");
+
+  const psAfterEnable = await onTarget("docker", "ps", "--format", "{{.Names}}");
+  assert.match(psAfterEnable, /kuvert-backend/);
+  assert.match(psAfterEnable, /kuvert-frontend/);
+
+  // A real marker, written directly into kuvert's own real Docker
+  // volume via a throwaway container on the target - the literal volume
+  // name (render-topology.mjs pins compose.volumes[...].name to the
+  // catalog's own raw name, never Compose's own project-prefixed
+  // default), never anything routed through the application itself.
+  const markerContent = `hof-item9-acceptance-${randomUUID()}`;
+  await onTarget("docker", "run", "--rm", "--volume", "kuvert-data:/hof-marker-check", "alpine", "sh", "-c", `echo -n '${markerContent}' > /hof-marker-check/.hof-acceptance-marker`);
+  const readMarker = () => onTarget("docker", "run", "--rm", "--volume", "kuvert-data:/hof-marker-check", "alpine", "cat", "/hof-marker-check/.hof-acceptance-marker");
+  assert.equal(await readMarker(), markerContent, "fixture assumption: the marker was actually written");
+
+  // A genuine applied no-op - unchanged manifest, must take no lock,
+  // create no journal, never bump generation.
+  const noOpPlan1 = await runPlan(planOptions());
+  assert.ok(!noOpPlan1.blocked, JSON.stringify(noOpPlan1.diagnostics));
+  assert.deepEqual(noOpPlan1.plan.operations, [], "fixture assumption: an unchanged manifest against its own just-committed baseline is a genuine no-op");
+  const noOpPlanPath1 = path.join(workDir, "plan-noop-1.json");
+  await writeFile(noOpPlanPath1, JSON.stringify(noOpPlan1.plan));
+  const noOpResult1 = await runApply({ ...baseOptions(), approvePlanId: noOpPlan1.plan.planId, planPath: noOpPlanPath1 });
+  assert.equal(noOpResult1.blocked, false, JSON.stringify(noOpResult1));
+  assert.equal(noOpResult1.noOp, true);
+  assert.equal(noOpResult1.committedGeneration, 2, "a no-op never bumps generation");
+  assert.equal(noOpResult1.operationId, undefined, "no lock/journal was ever created for a no-op");
+  assert.equal((await readCurrentState()).generation, 2, "current.json's own generation, read fresh, genuinely never moved");
+
+  // Disable kuvert WITH retain - containers gone for real, the volume
+  // and its real marker survive, generation 2 -> 3.
+  manifest.services.kuvert.enabled = false;
+  manifest.services.kuvert.dataRetention = "retain";
+  await writeFile(servicesPath, YAML.stringify(manifest));
+  const disablePlan = await runPlan(planOptions());
+  assert.ok(!disablePlan.blocked, JSON.stringify(disablePlan.diagnostics));
+  assert.equal(disablePlan.plan.summary.remove, 2, "kuvert-backend + kuvert-frontend");
+  assert.ok(!disablePlan.plan.operations.some((o) => o.action === "backup.create"), "item 9 never backs anything up on removal - it isn't even in the applied whitelist");
+  const disablePlanPath = path.join(workDir, "plan-disable-kuvert.json");
+  await writeFile(disablePlanPath, JSON.stringify(disablePlan.plan));
+  const disableResult = await runApply({ ...baseOptions(), approvePlanId: disablePlan.plan.planId, planPath: disablePlanPath });
+  assert.equal(disableResult.blocked, false, `disabling kuvert with retain failed: ${JSON.stringify(disableResult)}`);
+  assert.equal(disableResult.committedGeneration, 3, "generation 2 -> 3");
+
+  const psAfterDisable = await onTarget("docker", "ps", "-a", "--format", "{{.Names}}");
+  assert.doesNotMatch(psAfterDisable, /kuvert-backend/, "kuvert's own containers are genuinely gone, not just stopped");
+  assert.doesNotMatch(psAfterDisable, /kuvert-frontend/, "kuvert's own containers are genuinely gone, not just stopped");
+  const volumesAfterDisable = await onTarget("docker", "volume", "ls", "--format", "{{.Name}}");
+  assert.match(volumesAfterDisable, /^kuvert-data$/m, "the volume itself genuinely survives a retain-disable");
+  assert.equal(await readMarker(), markerContent, "the real data inside the retained volume survives, byte for byte");
+
+  const currentAfterDisable = await readCurrentState();
+  assert.ok(currentAfterDisable.retainedServices?.kuvert, "current.json genuinely records kuvert as retained");
+  assert.equal(currentAfterDisable.retainedServices.kuvert.volume, "kuvert-data");
+
+  // Another no-op - already disabled+retained, manifest unchanged.
+  const noOpPlan2 = await runPlan(planOptions());
+  assert.ok(!noOpPlan2.blocked, JSON.stringify(noOpPlan2.diagnostics));
+  assert.deepEqual(noOpPlan2.plan.operations, [], "fixture assumption: re-planning an already-retained-disable is a genuine no-op");
+  const noOpPlanPath2 = path.join(workDir, "plan-noop-2.json");
+  await writeFile(noOpPlanPath2, JSON.stringify(noOpPlan2.plan));
+  const noOpResult2 = await runApply({ ...baseOptions(), approvePlanId: noOpPlan2.plan.planId, planPath: noOpPlanPath2 });
+  assert.equal(noOpResult2.blocked, false, JSON.stringify(noOpResult2));
+  assert.equal(noOpResult2.noOp, true);
+  assert.equal(noOpResult2.committedGeneration, 3, "still 3 - a repeated no-op never bumps generation");
+
+  // Re-enable - the SAME retained volume and marker, no migration, real
+  // readiness, generation 3 -> 4.
+  manifest.services.kuvert.enabled = true;
+  await writeFile(servicesPath, YAML.stringify(manifest));
+  const reenablePlan = await runPlan(planOptions());
+  assert.ok(!reenablePlan.blocked, JSON.stringify(reenablePlan.diagnostics));
+  assert.equal(reenablePlan.plan.summary.migrate, 0, "the retained schema already matches - no migration needed");
+  assert.ok(!reenablePlan.plan.operations.some((o) => o.action === "volume.ensure" && o.resource === "kuvert-data"), "the retained volume is reused, never recreated");
+  const reenablePlanPath = path.join(workDir, "plan-reenable-kuvert.json");
+  await writeFile(reenablePlanPath, JSON.stringify(reenablePlan.plan));
+  const reenableEvents = [];
+  const reenableResult = await runApply({ ...baseOptions(), approvePlanId: reenablePlan.plan.planId, planPath: reenablePlanPath, emit: (event) => reenableEvents.push(event) });
+  assert.equal(reenableResult.blocked, false, `re-enabling kuvert failed: ${JSON.stringify(reenableResult)}`);
+  assert.equal(reenableResult.committedGeneration, 4, "generation 3 -> 4");
+
+  const reenableOperationEvents = reenableEvents.filter((event) => event.apiVersion === "hof.dev/operation-event/v1");
+  const reenableSucceeded = reenableOperationEvents.filter((event) => event.phase === "succeeded").map((event) => event.step);
+  assert.ok(!reenableSucceeded.some((step) => step.includes(".database.migrate.")), "no migration ran for real on a retained re-enable at the already-current schema");
+  assert.ok(reenableSucceeded.some((step) => step.includes(".readiness.wait.") && step.includes("kuvert")), "kuvert's own readiness (real docker inspect polling) was actually confirmed for real");
+
+  assert.equal(await readMarker(), markerContent, "the exact same real data survives a full disable-with-retain -> re-enable round trip");
+  const psAfterReenable = await onTarget("docker", "ps", "--format", "{{.Names}}");
+  assert.match(psAfterReenable, /kuvert-backend/);
+  assert.match(psAfterReenable, /kuvert-frontend/);
+
+  const currentAfterReenable = await readCurrentState();
+  assert.equal(currentAfterReenable.generation, 4);
+  assert.equal(currentAfterReenable.retainedServices?.kuvert, undefined, "no longer retained once re-enabled");
+
+  // Every immutable per-generation snapshot genuinely exists on the
+  // target, for every real generation this test committed - written
+  // BEFORE the two mutable pointer files, per the state role's own
+  // ordering (see ansible/roles/state/tasks/main.yml).
+  for (const generation of [1, 2, 3, 4]) {
+    const padded = String(generation).padStart(6, "0");
+    const snapshot = JSON.parse(await onTarget("cat", `/var/lib/hof/state/generations/${padded}/state.json`));
+    assert.ok(validateState(snapshot), `generation ${generation}'s own immutable snapshot does not satisfy schemas/state-v1.schema.json: ${JSON.stringify(validateState.errors)}`);
+    assert.equal(snapshot.generation, generation);
+    JSON.parse(await onTarget("cat", `/var/lib/hof/state/generations/${padded}/topology.json`)); // must at least parse
+    JSON.parse(await onTarget("cat", `/var/lib/hof/state/generations/${padded}/release-lock.json`)); // must at least parse
+  }
 });

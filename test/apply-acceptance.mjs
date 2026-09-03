@@ -387,6 +387,29 @@ async function readCurrentState() {
   return JSON.parse(await onTarget("cat", "/var/lib/hof/state/current.json"));
 }
 
+// Item 9 review (network lifecycle finding): discovers a Compose
+// service's own real container by its own compose ownership labels,
+// exactly like ansible/roles/readiness/tasks/main.yml's own real
+// discovery does ("never by guessing Compose's own container-naming
+// convention" - that role's own comment) - NEVER by assuming the bare
+// service key is the container's own name. A real, empirical check
+// against this exact Compose version found containers are actually
+// named `<project>-<service>-<n>` (e.g. "hof-kuvert-backend-1", not
+// "kuvert-backend") - a latent bug in this test file's own PRE-EXISTING
+// exact-name assertions too (see the container-name check further
+// down), never caught before because this whole test had never
+// actually run this far in any real CI attempt until this same round.
+// Returns the container's own id, or null if none is currently running
+// for this unit.
+async function containerIdForUnit(unit) {
+  const stdout = await onTarget(
+    "docker", "ps", "--all", "-q",
+    "--filter", "label=com.docker.compose.project=hof",
+    "--filter", `label=com.docker.compose.service=${unit}`,
+  );
+  return stdout.trim() || null;
+}
+
 test("a real, full bootstrap apply against the real, published, signed v0.2.2 release, then a real applied-mode reconciliation lifecycle against the same target - every real role, start to finish, generation 1 through 4", async () => {
   // The real operator workflow, exercised for real: a genuine `hofctl
   // plan` run (real inspectTarget() over the real SSH transport this
@@ -836,9 +859,8 @@ test("an applied change delivers ONLY the secrets its own scoped set names (neve
   // be the exact same real Docker objects throughout - untouched,
   // unrestarted, never recreated - by an apply that never had any
   // reason to touch either.
-  const kuvertContainerIdsBefore = await Promise.all(
-    ["kuvert-backend", "kuvert-frontend"].map((name) => onTarget("docker", "inspect", "--format", "{{.Id}}", name)),
-  );
+  const kuvertContainerIdsBefore = await Promise.all(["kuvert-backend", "kuvert-frontend"].map(containerIdForUnit));
+  assert.ok(kuvertContainerIdsBefore.every(Boolean), `fixture assumption: kuvert's own containers are already running - ${JSON.stringify(kuvertContainerIdsBefore)}`);
   const hofNetworkIdBefore = await onTarget("docker", "network", "inspect", "--format", "{{.Id}}", HOF_NETWORK_NAME);
 
   const manifest = YAML.parse(await readFile(servicesPath, "utf8"));
@@ -910,18 +932,27 @@ test("an applied change delivers ONLY the secrets its own scoped set names (neve
   assert.ok(agentReadySucceeded && apiStartStarted, "fixture assumption: both events exist in a successful enable");
   assert.ok(new Date(agentReadySucceeded.at).getTime() <= new Date(apiStartStarted.at).getTime(), "the agent must be confirmed ready before the API unit is even started");
 
-  // Item 9 SECOND review fix (finding 10): exact container names, not a
-  // substring/word-boundary regex - /wachter\b/ also matches inside
+  // Item 9 SECOND review fix (finding 10): exact container IDENTITY, not
+  // a substring/word-boundary regex - /wachter\b/ also matches inside
   // "wachter-agent" (the boundary lands on the hyphen), so it could
   // never actually distinguish "the API's own container exists" from
   // "only the agent's does". The real ordering proof is the event-
-  // timestamp assertion above; this is just a liveness confirmation, now
-  // an exact one.
-  const namesAfter = (await onTarget("docker", "ps", "--format", "{{.Names}}")).split("\n").map((name) => name.trim()).filter(Boolean);
+  // timestamp assertion above; this is just a liveness confirmation.
+  //
+  // Item 9 review fix (network lifecycle finding): this used to compare
+  // `docker ps`'s own reported names against the BARE service key
+  // ("wachter-agent", "kuvert-backend", ...) - never actually true for a
+  // real Compose-started container (a real empirical check found
+  // Compose names them `<project>-<service>-<n>`, e.g.
+  // "hof-kuvert-backend-1" - see containerIdForUnit()'s own comment).
+  // This assertion had never actually run before this exact round (every
+  // earlier CI attempt failed before ever reaching it), so the bug was
+  // never caught. Fixed to discover by compose ownership label, exactly
+  // like the real readiness role itself does, never by guessing a name.
   // herold-backend/herold-frontend - catalog/services-v1.yaml's own two
   // artifacts for herold, not a single "herold" unit.
-  for (const expected of ["wachter-agent", "wachter", "herold-backend", "herold-frontend"]) {
-    assert.ok(namesAfter.includes(expected), `expected an exact container named "${expected}" among ${JSON.stringify(namesAfter)}`);
+  for (const unit of ["wachter-agent", "wachter", "herold-backend", "herold-frontend"]) {
+    assert.ok(await containerIdForUnit(unit), `expected a real container for compose service "${unit}"`);
   }
   // kuvert must never have restarted (this apply had no reason to touch
   // it at all - see this test's own comment on the network-race bug
@@ -930,12 +961,7 @@ test("an applied change delivers ONLY the secrets its own scoped set names (neve
   // what the network-lifecycle bug used to do: treating this stable,
   // unrelated infrastructure as if a completely different operation
   // owned it.
-  for (const name of ["kuvert-backend", "kuvert-frontend"]) {
-    assert.ok(namesAfter.includes(name), `kuvert's own ${name} must still be running - this apply never had any reason to touch it`);
-  }
-  const kuvertContainerIdsAfter = await Promise.all(
-    ["kuvert-backend", "kuvert-frontend"].map((name) => onTarget("docker", "inspect", "--format", "{{.Id}}", name)),
-  );
+  const kuvertContainerIdsAfter = await Promise.all(["kuvert-backend", "kuvert-frontend"].map(containerIdForUnit));
   assert.deepEqual(kuvertContainerIdsAfter, kuvertContainerIdsBefore, "kuvert's own containers are the exact same real Docker objects - never restarted or recreated by enabling herold/wachter");
   const hofNetworkIdAfter = await onTarget("docker", "network", "inspect", "--format", "{{.Id}}", HOF_NETWORK_NAME);
   assert.equal(hofNetworkIdAfter, hofNetworkIdBefore, "the \"hof\" network is the exact same real Docker object - Compose never recreated it (item 9 review, network lifecycle finding)");

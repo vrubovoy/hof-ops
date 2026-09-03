@@ -112,11 +112,15 @@ const ACTION_TO_ROLE = {
 // unit (image.pull itself carries no imageTrust field of its own - see
 // plan-v2.schema.json's own comment: "Only for image.verify").
 // installationId/generation are the exact same values renderTopology()
-// was called with - volume.ensure/network.ensure must label a resource
-// identically to how Compose would have labeled it itself. secret.ensure
-// and config.write don't carry their own real content here at all -
-// dispatchOperation() below mounts it in separately (see its own
-// comment on why: never through extra-vars/argv).
+// was called with - volume.ensure must label a resource identically to
+// how Compose would have labeled it itself (network.ensure deliberately
+// no longer does - item 9 review, network lifecycle finding: a network
+// is long-lived, shared infrastructure the Ansible network role now
+// owns exclusively, and never carries a per-generation label - see that
+// role's own comment on why). secret.ensure and config.write don't
+// carry their own real content here at all - dispatchOperation() below
+// mounts it in separately (see its own comment on why: never through
+// extra-vars/argv).
 //
 // Exported (unlike this file's other pure helpers not already exported
 // for test/apply-acceptance.mjs's own use - see computeExpectedCommittedState()'s
@@ -145,7 +149,16 @@ export function buildExtraVars(operation, { commitGeneration, imageTrustByUnit, 
     case "network.ensure":
       vars.hof_network_name = operation.resource;
       vars.hof_installation_id = installationId;
-      vars.hof_generation = generation;
+      // Item 9 review (network lifecycle finding): no hof_generation
+      // here - unlike volume.ensure, this network is long-lived, shared
+      // infrastructure the Ansible network role now owns exclusively
+      // (see that role's own comment on why a per-generation label used
+      // to make Compose fight it for ownership). operation.internal is
+      // only ever true for wachter-internal (plan.mjs's own
+      // network.ensure dispatch); absent (never explicitly false) for
+      // every other network, and the role's own default(false) handles
+      // that.
+      if (operation.internal) vars.hof_network_internal = true;
       break;
     case "image.verify":
       vars.hof_image_action = "verify";

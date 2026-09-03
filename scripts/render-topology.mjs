@@ -9,6 +9,46 @@ import { requiredSecrets } from "./secrets.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP_PORTS = { kuvert: 3001, tafel: 3002, zettel: 3003, glocke: 3004, schrank: 3005, herold: 3006, wachter: 3007 };
+// Item 9 review (network lifecycle finding): the fixed Compose project
+// name every render carries (compose.name below).
+const COMPOSE_PROJECT_NAME = "hof";
+// A network is long-lived, shared, real infrastructure another already-
+// running unit may depend on at the exact moment a completely unrelated
+// operation (say, herold's own migration) runs - unlike every other
+// Compose-managed resource here (services, volumes), it must NEVER be
+// something Compose itself might decide to recreate mid-apply. A real
+// review found exactly that: this network used to be a plain, non-
+// external Compose network carrying hof.generation in its OWN labels
+// (see resourceOwnershipLabels's own comment) - a value that changes on
+// literally every real commit. `docker compose run --no-deps <unit>`
+// still evaluates the WHOLE compose.yml's own `networks:` section (only
+// `depends_on` is what `--no-deps` actually skips), sees this
+// generation's own fresh label value doesn't match what's already
+// running, and tries to remove-then-recreate the network to "fix" the
+// mismatch - which Docker correctly refuses whenever any OTHER unit
+// (one this specific `--no-deps` invocation was never going to touch at
+// all) is still attached to it. Marking the network `external: true`
+// with an explicit, stable physical name (below) tells Compose this
+// network is not its responsibility at all - never created, updated, or
+// reconciled by it, only referenced by name - eliminating this whole
+// class of race. The Ansible network role (ansible/roles/network/) is
+// now this network's ONLY owner; physicalNetworkName() is exported so
+// plan.mjs's own network.ensure dispatch names the exact same physical
+// resource, never a second, independently-hardcoded copy of this same
+// string that could silently drift from this one. Hyphen-joined, never
+// Compose's own default underscore-joined convention
+// (`<project>_<network-key>`) - schemas/plan-v2.schema.json's own
+// $defs/identifier (what plan-v2's own desired.networks/operation
+// resource fields both validate against) is `^[a-z][a-z0-9.-]{0,80}$`,
+// which has no underscore in it at all.
+export function physicalNetworkName(logicalName) {
+  return `${COMPOSE_PROJECT_NAME}-${logicalName}`;
+}
+// The only two networks this renderer ever produces, named once here so
+// plan.mjs can tell (by simple equality, not a fragile string-suffix
+// guess) which one specifically needs internal:true.
+export const HOF_NETWORK_NAME = physicalNetworkName("hof");
+export const WACHTER_INTERNAL_NETWORK_NAME = physicalNetworkName("wachter-internal");
 // The fixed secret names apply.mjs delivers a supplied TLS certificate/
 // private key under, via the same secret.ensure mechanism every other
 // real secret uses (see apply.mjs's own comment: never through extra-
@@ -209,8 +249,15 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
   const trustedOrigins = [origins.schloss, ...browserOrigins.filter((origin) => origin !== origins.schloss)];
   const appFlags = Object.fromEntries(catalog.services.filter((service) => !service.mandatory).map((service) => [service.id, enabled.has(service.id)]));
   const compose = {
-    name: "hof", services: {}, volumes: {}, secrets: {},
-    networks: { hof: { labels: resourceOwnershipLabels({ installationId, generation, kind: "network", resource: "hof" }) } },
+    name: COMPOSE_PROJECT_NAME, services: {}, volumes: {}, secrets: {},
+    // external: true + an explicit name - see physicalNetworkName()'s
+    // own comment on why this network is never Compose's own to create,
+    // update, or reconcile at all (the Ansible network role owns it
+    // exclusively) - no `labels` here for exactly the same reason: an
+    // external network's labels are never applied, read, or compared by
+    // Compose, so carrying render-time ownership labels here would only
+    // misleadingly suggest Compose still has some say over them.
+    networks: { hof: { external: true, name: HOF_NETWORK_NAME } },
   };
 
   compose.services.gateway = composeService(releaseLock.components.gateway.image, { DOMAIN: manifest.domains.base });
@@ -413,10 +460,13 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
     });
     wireSecret(compose, compose.services.wachter, secretNameFor.get("WACHTER_AGENT_TOKEN"), "WACHTER_AGENT_TOKEN");
 
-    compose.networks["wachter-internal"] = {
-      internal: true,
-      labels: resourceOwnershipLabels({ installationId, generation, kind: "network", resource: "wachter-internal" }),
-    };
+    // external: true, same reasoning as the "hof" network above - `internal:
+    // true` (never internet-routable) is now the physical network's own
+    // creation-time property, set by the Ansible network role itself
+    // (plan.mjs's own network.ensure dispatch tells it which network
+    // this is via WACHTER_INTERNAL_NETWORK_NAME), not something Compose
+    // can express or enforce for a resource it never creates.
+    compose.networks["wachter-internal"] = { external: true, name: WACHTER_INTERNAL_NETWORK_NAME };
   }
   for (const id of enabledIds) {
     for (const volume of catalogById.get(id).volumes) {

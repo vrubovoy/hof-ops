@@ -7,7 +7,7 @@ import test from "node:test";
 import YAML from "yaml";
 
 import { loadContracts } from "../scripts/contracts.mjs";
-import { renderFiles, renderTopology } from "../scripts/render-topology.mjs";
+import { HOF_NETWORK_NAME, physicalNetworkName, renderFiles, renderTopology, WACHTER_INTERNAL_NETWORK_NAME } from "../scripts/render-topology.mjs";
 
 async function contractsWith(selection) {
   const contracts = structuredClone(await loadContracts());
@@ -261,7 +261,7 @@ test("every generated service is labeled with hofctl plan's ownership metadata",
   assert.notEqual(rendered.compose.services.wachter.labels["hof.unit"], rendered.compose.services["wachter-agent"].labels["hof.unit"]);
 });
 
-test("every named volume and network is also labeled for orphan detection", async () => {
+test("every named volume is also labeled for orphan detection", async () => {
   const contracts = await contractsWith(["kuvert", "wachter"]);
   const rendered = renderTopology({ ...contracts, installationId: "installation-42", generation: 7 });
 
@@ -273,13 +273,29 @@ test("every named volume and network is also labeled for orphan detection", asyn
     assert.equal(volume.labels["hof.resource"], name, name);
   }
   assert.ok(rendered.compose.volumes["kuvert-data"], "kuvert's own volume is rendered and labeled");
+});
 
-  for (const [name, network] of Object.entries(rendered.compose.networks)) {
-    assert.equal(network.labels["hof.managed"], "true", name);
-    assert.equal(network.labels["hof.kind"], "network", name);
-    assert.equal(network.labels["hof.resource"], name, name);
+// Item 9 review (network lifecycle finding): networks are no longer
+// labeled on the Compose side at all - see physicalNetworkName()'s own
+// comment on why a network's own ownership labels (hof.managed,
+// hof.installation-id, hof.kind, hof.resource - importantly, never
+// hof.generation) now live exclusively on the ACTUAL Docker network
+// resource, applied by the Ansible network role, never by Compose
+// (which only ever references this network by its physical name,
+// external: true, and never creates/updates/reconciles it at all).
+test("every named network is external, referencing its own stable physical name - never labeled or owned by Compose", async () => {
+  const contracts = await contractsWith(["kuvert", "wachter"]);
+  const rendered = renderTopology({ ...contracts, installationId: "installation-42", generation: 7 });
+
+  for (const [key, network] of Object.entries(rendered.compose.networks)) {
+    assert.equal(network.external, true, key);
+    assert.equal(network.name, physicalNetworkName(key), key);
+    assert.equal(network.labels, undefined, `${key}: Compose never labels an external network it doesn't own`);
   }
-  assert.ok(rendered.compose.networks["wachter-internal"], "wachter's own internal network is rendered and labeled");
+  assert.ok(rendered.compose.networks.hof, "the default hof network is rendered");
+  assert.equal(rendered.compose.networks.hof.name, HOF_NETWORK_NAME);
+  assert.ok(rendered.compose.networks["wachter-internal"], "wachter's own internal network is rendered");
+  assert.equal(rendered.compose.networks["wachter-internal"].name, WACHTER_INTERNAL_NETWORK_NAME);
 });
 
 test("ownership labels default to an empty installation id and generation zero when unset", async () => {

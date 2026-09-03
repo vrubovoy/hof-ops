@@ -9,7 +9,7 @@ import addFormats from "ajv-formats";
 import { validateAppliedActions } from "../scripts/applied-actions.mjs";
 import { loadContracts } from "../scripts/contracts.mjs";
 import { buildPlan } from "../scripts/plan.mjs";
-import { renderTopology } from "../scripts/render-topology.mjs";
+import { HOF_NETWORK_NAME, renderTopology } from "../scripts/render-topology.mjs";
 import { emptyBaseline, topologyToServiceState } from "../scripts/state.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
@@ -531,16 +531,45 @@ test("missing volume: a baseline-expected persistent volume that's gone from Doc
 test("missing network: a baseline-expected network that's gone from Docker is safely auto-repaired, never a blocker", async () => {
   const { contracts, rendered } = await fixture();
   const baseline = baselineFrom(rendered, contracts.catalog, 1);
-  assert.ok(baseline.networks.includes("hof"));
+  // The network's own PHYSICAL name (item 9 review, network lifecycle
+  // finding) - "hof", the Compose-internal logical key, is never what
+  // baseline/observation/plan.mjs itself deal in anymore; see
+  // render-topology.mjs's own physicalNetworkName() comment on why.
+  assert.ok(baseline.networks.includes(HOF_NETWORK_NAME));
   const observation = observedMatching(baseline);
-  observation.networks = observation.networks.filter((network) => network.resource !== "hof");
+  observation.networks = observation.networks.filter((network) => network.resource !== HOF_NETWORK_NAME);
 
   const plan = buildDesired({ baseline, rendered, contracts, observation });
   assert.equal(plan.executable, true);
   assert.deepEqual(plan.blockers, []);
-  const repair = plan.operations.find((o) => o.action === "network.ensure" && o.resource === "hof");
+  const repair = plan.operations.find((o) => o.action === "network.ensure" && o.resource === HOF_NETWORK_NAME);
   assert.ok(repair, "a missing network is repaired via its own typed network.ensure operation");
   assert.match(repair.reason, /recreate a missing network/);
+});
+
+// Item 9 review (network lifecycle finding): the OTHER half of the same
+// fix - a network the DESIRED topology needs for the first time
+// (wachter-internal, only rendered once Wachter is enabled) that
+// baseline never expected at all used to get no network.ensure of its
+// own - Compose would then silently auto-create it as a non-external
+// network on whatever unit happened to need it first, exactly the
+// "Compose thinks it owns this network" race the rest of this fix
+// closes for the "hof" network.
+test("new network: a network the desired topology needs for the first time (wachter-internal, enabling Wachter) is created via its own network.ensure, marked internal", async () => {
+  const before = await fixture((contracts) => { contracts.manifest.services.wachter.enabled = false; });
+  const baseline = baselineFrom(before.rendered, before.contracts.catalog, 2);
+  assert.ok(!baseline.networks.some((network) => network.includes("wachter")), "fixture assumption: the baseline has no Wachter-related network yet");
+
+  const after = await fixture((contracts) => { contracts.manifest.services.wachter.enabled = true; });
+  const plan = buildDesired({ baseline, rendered: after.rendered, contracts: after.contracts, observation: observedMatching(baseline) });
+
+  assert.equal(plan.executable, true, JSON.stringify(plan.blockers));
+  const networkEnsures = plan.operations.filter((o) => o.action === "network.ensure");
+  assert.equal(networkEnsures.length, 1, "only the new network gets ensured - the already-existing hof network is untouched");
+  const wachterNetworkEnsure = networkEnsures[0];
+  assert.match(wachterNetworkEnsure.resource, /wachter-internal$/);
+  assert.equal(wachterNetworkEnsure.internal, true, "wachter-internal is the one network that must be created with no default route to the outside world");
+  assert.match(wachterNetworkEnsure.reason, /new network/);
 });
 
 test("generated-file drift: a positively-confirmed-absent generated file is always auto-repaired via config.write, with no blocker either way", async () => {

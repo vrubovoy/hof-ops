@@ -5,16 +5,46 @@
       - hof_operation_id is not none
       - hof_network_name is not none
       - hof_installation_id is not none
-      - hof_generation is not none
-    fail_msg: "network role requires hof_operation_id, hof_network_name, hof_installation_id, hof_generation - never invoked without them"
+    fail_msg: "network role requires hof_operation_id, hof_network_name, hof_installation_id - never invoked without them"
 
+# Item 9 review (network lifecycle finding): hof_generation used to be
+# required here too, and hof.generation was one of this network's own
+# labels - byte-matched, on purpose, against what render-topology.mjs
+# put in compose.yml's own (non-external) network definition for the
+# exact same resource. That symmetry is exactly what broke real applies:
+# this network is long-lived, shared infrastructure - other units can be
+# using it at the very moment some UNRELATED operation runs - but its
+# own hof.generation label changed on every single commit, so Compose
+# (which still considered itself the network's owner) kept trying to
+# remove-then-recreate it to "fix" the mismatch, and Docker correctly
+# refused whenever any other unit was still attached. render-topology.mjs
+# now marks this network `external: true` - Compose never creates,
+# updates, or reconciles it at all, only references it by name - making
+# THIS role, right here, its one and only owner. A network's own real
+# identity (which installation, which physical resource) never needs a
+# generation number to stay meaningful; only the per-generation
+# service containers still carry one (see state.mjs's own
+# renderedTopologyGeneration(), which no longer expects one here).
 - name: Ensure this named, Hof-labeled Docker network exists
   community.docker.docker_network:
     name: "{{ hof_network_name }}"
+    # Only wachter-internal is ever internal (no default route to the
+    # outside world) - see plan.mjs's own network.ensure dispatch and
+    # render-topology.mjs's own WACHTER_INTERNAL_NETWORK_NAME. Absent
+    # (never explicitly false) for every other network, matching
+    # plan-v2.schema.json's own "absent means false" convention for this
+    # same field. default(false, true) - the second, boolean argument -
+    # not a bare default(false): defaults/main.yml's own hof_network_internal
+    # is null (every role default here is, per this codebase's own
+    # convention - see test/ansible-skeleton.test.mjs), and Jinja's
+    # default() filter only ever replaces a genuinely UNDEFINED variable,
+    # never one that is defined-but-None, unless this second argument
+    # says to treat every falsy value (None included) as needing the
+    # default too.
+    internal: "{{ hof_network_internal | default(false, true) }}"
     labels:
       hof.managed: "true"
       hof.installation-id: "{{ hof_installation_id }}"
-      hof.generation: "{{ hof_generation }}"
       hof.kind: network
       hof.resource: "{{ hof_network_name }}"
     state: present

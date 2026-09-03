@@ -99,7 +99,7 @@ import { buildDockerRunArgs, buildExtraVars, buildInventory, computeExpectedComm
 import { sha256 } from "../scripts/digest.mjs";
 import { buildEvent, buildJournalDocument, buildLockDocument, currentOperator, newOperationId } from "../scripts/operation-journal.mjs";
 import { runPlan } from "../scripts/plan-command.mjs";
-import { SUPPLIED_TLS_CERTIFICATE_SECRET_NAME, SUPPLIED_TLS_PRIVATE_KEY_SECRET_NAME } from "../scripts/render-topology.mjs";
+import { HOF_NETWORK_NAME, SUPPLIED_TLS_CERTIFICATE_SECRET_NAME, SUPPLIED_TLS_PRIVATE_KEY_SECRET_NAME } from "../scripts/render-topology.mjs";
 import { generateSecretValue } from "../scripts/secrets.mjs";
 import {
   acquireExecutionLease, acquireLockAndJournal, appendEvent, pinnedKnownHosts,
@@ -814,6 +814,24 @@ test("an applied change delivers ONLY the secrets its own scoped set names (neve
   const heroldValue = generateSecretValue("token");
   const wachterValue = generateSecretValue("token");
 
+  // Item 9 review (network lifecycle finding): kuvert is already
+  // enabled and running here (the bootstrap+lifecycle test above this
+  // one leaves it that way - see this section's own top comment), and
+  // completely unrelated to herold/wachter - this real target is
+  // exactly the scenario that found the bug in the first place:
+  // enabling herold's own database.migrate used to trip Compose into
+  // trying to remove-then-recreate the "hof" network mid-apply, which
+  // Docker correctly refused because kuvert's own containers were still
+  // attached to it. Captured here, before the apply below, and compared
+  // again after it: kuvert's own containers and the network itself must
+  // be the exact same real Docker objects throughout - untouched,
+  // unrestarted, never recreated - by an apply that never had any
+  // reason to touch either.
+  const kuvertContainerIdsBefore = await Promise.all(
+    ["kuvert-backend", "kuvert-frontend"].map((name) => onTarget("docker", "inspect", "--format", "{{.Id}}", name)),
+  );
+  const hofNetworkIdBefore = await onTarget("docker", "network", "inspect", "--format", "{{.Id}}", HOF_NETWORK_NAME);
+
   const manifest = YAML.parse(await readFile(servicesPath, "utf8"));
   manifest.services.herold.enabled = true;
   manifest.services.wachter.enabled = true;
@@ -896,6 +914,22 @@ test("an applied change delivers ONLY the secrets its own scoped set names (neve
   for (const expected of ["wachter-agent", "wachter", "herold-backend", "herold-frontend"]) {
     assert.ok(namesAfter.includes(expected), `expected an exact container named "${expected}" among ${JSON.stringify(namesAfter)}`);
   }
+  // kuvert must never have restarted (this apply had no reason to touch
+  // it at all - see this test's own comment on the network-race bug
+  // this pins), and the "hof" network itself must never have been
+  // recreated. If either drops, some future regression is doing exactly
+  // what the network-lifecycle bug used to do: treating this stable,
+  // unrelated infrastructure as if a completely different operation
+  // owned it.
+  for (const name of ["kuvert-backend", "kuvert-frontend"]) {
+    assert.ok(namesAfter.includes(name), `kuvert's own ${name} must still be running - this apply never had any reason to touch it`);
+  }
+  const kuvertContainerIdsAfter = await Promise.all(
+    ["kuvert-backend", "kuvert-frontend"].map((name) => onTarget("docker", "inspect", "--format", "{{.Id}}", name)),
+  );
+  assert.deepEqual(kuvertContainerIdsAfter, kuvertContainerIdsBefore, "kuvert's own containers are the exact same real Docker objects - never restarted or recreated by enabling herold/wachter");
+  const hofNetworkIdAfter = await onTarget("docker", "network", "inspect", "--format", "{{.Id}}", HOF_NETWORK_NAME);
+  assert.equal(hofNetworkIdAfter, hofNetworkIdBefore, "the \"hof\" network is the exact same real Docker object - Compose never recreated it (item 9 review, network lifecycle finding)");
 
   // A FURTHER, unrelated applied change (another config-only backup
   // edit, touching no secret-consuming unit) must NEVER re-deliver

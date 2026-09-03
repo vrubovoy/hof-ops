@@ -8,6 +8,7 @@
 // exercise directly.
 
 import { sha256 } from "./digest.mjs";
+import { WACHTER_INTERNAL_NETWORK_NAME } from "./render-topology.mjs";
 import { topologyToServiceState } from "./state.mjs";
 
 // Compares two {services: {units}} snapshots unit by unit - keyed by
@@ -476,7 +477,32 @@ function buildOperations({ baseline, desired, create, update, remove, migrations
   // field (an apply executor, an audit log) must be able to tell "make
   // sure this named volume exists" and "make sure this named network
   // exists" apart without also reading `resource`/`reason` text.
-  for (const network of missingNetworks) next(`network.ensure.${network}`, "volume", "network.ensure", network, { reason: "recreate a missing network" });
+  //
+  // Item 9 review (network lifecycle finding): missingNetworks alone
+  // (baseline-expected, but observed absent) used to be the WHOLE story
+  // - a network newly required by the DESIRED topology that baseline
+  // never expected at all (wachter-internal, the very first time
+  // Wachter is enabled) got no network.ensure of its own, ever. Compose
+  // itself then silently auto-created it as a NON-external network on
+  // whatever unit's own `docker compose run` happened to need it first -
+  // exactly the same "Compose thinks it owns this network" class of bug
+  // the rest of this fix closes for the "hof" network. newNetworks below
+  // closes the other half: desired's own network list, minus whatever
+  // baseline already expected.
+  const newNetworks = desired.networks.filter((network) => !baseline.networks.includes(network));
+  const networksToEnsure = [...new Set([...missingNetworks, ...newNetworks])];
+  for (const network of networksToEnsure) {
+    next(`network.ensure.${network}`, "volume", "network.ensure", network, {
+      reason: missingNetworks.includes(network) ? "recreate a missing network" : "new network",
+      // Only wachter-internal is ever internal (no default route to the
+      // outside world) - see render-topology.mjs's own
+      // WACHTER_INTERNAL_NETWORK_NAME/physicalNetworkName() comments.
+      // Omitted (never `false`) for every other network, matching this
+      // schema's own "absent means false" convention for every other
+      // optional operation field.
+      ...(network === WACHTER_INTERNAL_NETWORK_NAME ? { internal: true } : {}),
+    });
+  }
 
   for (const entry of [...create, ...update].filter((entry) => entry.imageChanged)) {
     next(`image.verify.${entry.service}.${entry.unit}`, "image", "image.verify", entry.unit, { image: entry.image ?? entry.toImage, reason: "confirm the release-locked, hofctl validate-approved image" });

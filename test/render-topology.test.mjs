@@ -119,6 +119,21 @@ test("secret-safe rendering: with everything optional disabled, no secrets are r
   for (const service of Object.values(rendered.compose.services)) assert.ok(!("secrets" in service));
 });
 
+test("Wächter's agent unit renders BEFORE its API unit so hofctl plan starts (and waits on) the agent first", async () => {
+  const rendered = renderTopology(await contractsWith(["wachter"]));
+  const unitOrder = Object.keys(rendered.compose.services);
+  // Item 9 review fix (finding 4): the API's /ready health endpoint only
+  // reports healthy once its sampler can reach the agent, and the
+  // service role starts each unit with --no-deps - so the agent must
+  // render (and therefore start + become healthy) first.
+  assert.ok(
+    unitOrder.indexOf("wachter-agent") < unitOrder.indexOf("wachter"),
+    `wachter-agent must precede wachter in compose.services, got ${JSON.stringify(unitOrder)}`,
+  );
+  // The API still declares its dependency on the agent explicitly.
+  assert.deepEqual(rendered.compose.services.wachter.depends_on, { "wachter-agent": { condition: "service_healthy" } });
+});
+
 test("Wächter's two containers get their real port, command, and hardening", async () => {
   const rendered = renderTopology(await contractsWith(["wachter"]));
   const { wachter, "wachter-agent": agent } = rendered.compose.services;

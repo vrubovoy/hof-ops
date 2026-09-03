@@ -118,6 +118,18 @@ test("bootstrap: a clean host plans to create every enabled unit and migrate eve
   assert.equal(otherReadiness.condition, "healthy");
 });
 
+test("Wächter: the agent's own service.start + readiness.wait are ordered before the API's (item 9 review, finding 4)", async () => {
+  const { contracts, rendered } = await fixture();
+  const plan = buildDesired({ baseline: emptyBaseline(), rendered, contracts });
+  const agentStart = plan.operations.findIndex((o) => o.action === "service.start" && o.resource === "wachter-agent");
+  const agentReady = plan.operations.findIndex((o) => o.action === "readiness.wait" && o.resource === "wachter-agent");
+  const apiStart = plan.operations.findIndex((o) => o.action === "service.start" && o.resource === "wachter");
+  const apiReady = plan.operations.findIndex((o) => o.action === "readiness.wait" && o.resource === "wachter");
+  assert.ok(agentStart >= 0 && agentReady >= 0 && apiStart >= 0 && apiReady >= 0, "both units get start + readiness");
+  assert.ok(agentReady < apiStart, "the agent must be started AND ready before the API is started - the API's /ready needs it");
+  assert.ok(apiStart < apiReady);
+});
+
 test("bootstrap migration operations carry their own argv/volume - a plan is self-sufficient, apply never re-reads the catalog", async () => {
   const { contracts, rendered } = await fixture();
   const plan = buildDesired({ baseline: emptyBaseline(), rendered, contracts });
@@ -271,6 +283,76 @@ test("re-enabling a retained service reuses the same volume (no volume.ensure), 
   assert.equal(plan.summary.migrate, 0, "a retained re-enable at the already-current schema needs no migration");
   assert.ok(!plan.operations.some((o) => o.action === "volume.ensure" && o.resource === "kuvert-data"), "the retained volume is reused, never recreated");
   assert.equal(plan.desired.retainedServices.kuvert, undefined, "no longer retained once re-enabled");
+});
+
+// Item 9 review fix (finding 5): re-enabling a retained persistent
+// service whose recorded schema version does NOT match what's now
+// desired would otherwise emit an executable database.migrate with
+// reason "initialize database" - a fresh-install migration run against
+// real, still-existing retained data at a different schema. That is a
+// genuine data migration and belongs to items 10-11.
+test("re-enabling a retained service whose recorded schema version differs from desired is a hard blocker, never a silent 'initialize database' migration", async () => {
+  const before = await fixture();
+  const baseline = {
+    ...baselineFrom(before.rendered, before.contracts.catalog, 5),
+    // Retained at schema 1, but the release now expects schema 2.
+    retainedServices: { kuvert: { volume: "kuvert-data", schemaVersion: 1 } },
+  };
+  baseline.services.kuvert = { enabled: false, units: {}, schemaVersion: null };
+
+  const after = await fixture();
+  after.rendered.topology.databaseSchemas.kuvert = { from: 2, to: 2, rollbackCompatible: true };
+  const observation = observedMatching(baseline);
+  const plan = buildPlan({
+    baseline, desiredRendered: after.rendered, manifest: after.contracts.manifest,
+    releaseLock: after.contracts.releaseLock, catalog: after.contracts.catalog, observation,
+  });
+
+  assert.equal(plan.executable, false);
+  assert.ok(
+    plan.blockers.some((b) => b.includes("kuvert") && b.includes("retained service") && b.includes("items 10-11")),
+    plan.blockers.join("\n"),
+  );
+  const migrate = plan.operations.find((o) => o.action === "database.migrate" && o.resource.includes("kuvert"));
+  assert.ok(!migrate || plan.executable === false, "any migration emitted here is only ever on a non-executable plan");
+});
+
+// Item 9 review fix (finding 6): secret.ensure is scoped to exactly the
+// secrets consumed by the units a plan actually starts or restarts, so
+// an unrelated applied change can never silently overwrite a live secret
+// whose consumers this plan never touches.
+test("secret.ensure carries the scoped secret set: every required secret on bootstrap, only the touched units' secrets on an applied change, and an empty list for a backup-only change", async () => {
+  const bootstrap = await fixture();
+  const bootstrapPlan = buildDesired({ baseline: emptyBaseline(), rendered: bootstrap.rendered, contracts: bootstrap.contracts });
+  const bootstrapSecretEnsure = bootstrapPlan.operations.find((o) => o.action === "secret.ensure");
+  assert.ok(Array.isArray(bootstrapSecretEnsure.secrets) && bootstrapSecretEnsure.secrets.length > 0);
+  assert.deepEqual(
+    [...bootstrapSecretEnsure.secrets].sort(),
+    Object.keys(bootstrap.rendered.compose.secrets).sort(),
+    "bootstrap delivers every file-based secret this topology declares",
+  );
+
+  // Applied: a backup-schedule-only change restarts no unit -> no secret
+  // is in scope, so secret.ensure carries an empty list and apply
+  // delivers nothing.
+  const noOpBaseline = baselineFrom(bootstrap.rendered, bootstrap.contracts.catalog, 4);
+  const backupOnly = await fixture((c) => { c.manifest.backup.schedule = "04:30"; });
+  const backupPlan = buildDesired({ baseline: noOpBaseline, rendered: backupOnly.rendered, contracts: backupOnly.contracts, observation: observedMatching(noOpBaseline) });
+  const backupSecretEnsure = backupPlan.operations.find((o) => o.action === "secret.ensure");
+  assert.ok(backupSecretEnsure, "secret.ensure is still emitted for anyChange");
+  assert.deepEqual(backupSecretEnsure.secrets, [], "a backup-only change delivers no secret at all");
+
+  // Applied: enabling Herold (a secret-consuming service) puts exactly
+  // its own secret in scope, and no unrelated one.
+  const heroldOffBaseline = baselineFrom(
+    (await fixture((c) => { c.manifest.services.herold.enabled = false; })).rendered,
+    bootstrap.contracts.catalog, 4,
+  );
+  const heroldOn = await fixture((c) => { c.manifest.services.herold.enabled = true; });
+  const heroldPlan = buildDesired({ baseline: heroldOffBaseline, rendered: heroldOn.rendered, contracts: heroldOn.contracts, observation: observedMatching(heroldOffBaseline) });
+  const heroldSecretEnsure = heroldPlan.operations.find((o) => o.action === "secret.ensure");
+  assert.ok(heroldSecretEnsure.secrets.includes("herold-credential-encryption-key"));
+  assert.ok(!heroldSecretEnsure.secrets.includes("wachter-agent-token"), "an unrelated service's secret is never pulled in");
 });
 
 test("topology change: re-planning after a disable has already been applied is a true no-op - removed units don't linger as orphan drift", async () => {

@@ -359,26 +359,20 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
 
   if (enabled.has("wachter")) {
     const image = releaseLock.components["wachter-backend"].image;
-    compose.services.wachter = compose.services["wachter-backend"];
+    const wachterApi = compose.services["wachter-backend"];
     delete compose.services["wachter-backend"];
 
-    // Full replacement, not a patch on top of the generic isBackend
-    // branch above - Wächter has no database and isn't a browser-facing
-    // CORS target, so it doesn't take DATABASE_PATH/ALLOWED_ORIGINS, and
-    // it needs its own agent-specific vars the generic branch has no
-    // notion of.
-    Object.assign(compose.services.wachter, {
-      environment: {
-        PORT: String(APP_PORTS.wachter), SCHLUSSEL_JWKS_URL: "http://schlussel:4000/.well-known/jwks.json",
-        JWT_ISSUER: "schlussel", WACHTER_AGENT_URL: "http://wachter-agent:3008",
-      },
-      networks: ["hof", "wachter-internal"],
-      depends_on: { "wachter-agent": { condition: "service_healthy" } },
-      labels: { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "wachter", unit: "wachter", artifact: "wachter-backend" }) },
-      ...wachterHardening(),
-    });
-    wireSecret(compose, compose.services.wachter, secretNameFor.get("WACHTER_AGENT_TOKEN"), "WACHTER_AGENT_TOKEN");
-
+    // Item 9 review fix (finding 4): the agent unit is inserted into
+    // compose.services BEFORE the API unit. hofctl plan walks the
+    // rendered services in object order to emit its service.start +
+    // readiness.wait operations (plan.mjs's buildOperations), and the
+    // service role runs each `docker compose up` with --no-deps - so
+    // whichever unit renders first is started (and waited on) first.
+    // The API's own /ready health endpoint only reports healthy once its
+    // sampler can reach the agent (wachter/backend/src/lib/sampler.ts),
+    // and its Compose depends_on already declares "wachter-agent
+    // service_healthy" - starting the API first made readiness.wait hang
+    // its full retry budget and then fail every enable/repair of Wächter.
     compose.services["wachter-agent"] = {
       ...composeService(image, {
         PORT: "3008",
@@ -400,6 +394,25 @@ export function renderTopology({ manifest, catalog, releaseLock, servicesSchema,
     // pointing the API at the agent, and the agent trusting that one
     // token back).
     wireSecret(compose, compose.services["wachter-agent"], secretNameFor.get("WACHTER_AGENT_TOKEN"), "WACHTER_AGENT_TOKEN");
+
+    compose.services.wachter = wachterApi;
+    // Full replacement, not a patch on top of the generic isBackend
+    // branch above - Wächter has no database and isn't a browser-facing
+    // CORS target, so it doesn't take DATABASE_PATH/ALLOWED_ORIGINS, and
+    // it needs its own agent-specific vars the generic branch has no
+    // notion of.
+    Object.assign(compose.services.wachter, {
+      environment: {
+        PORT: String(APP_PORTS.wachter), SCHLUSSEL_JWKS_URL: "http://schlussel:4000/.well-known/jwks.json",
+        JWT_ISSUER: "schlussel", WACHTER_AGENT_URL: "http://wachter-agent:3008",
+      },
+      networks: ["hof", "wachter-internal"],
+      depends_on: { "wachter-agent": { condition: "service_healthy" } },
+      labels: { ...restartLabels(false), ...ownershipLabels({ installationId, generation, service: "wachter", unit: "wachter", artifact: "wachter-backend" }) },
+      ...wachterHardening(),
+    });
+    wireSecret(compose, compose.services.wachter, secretNameFor.get("WACHTER_AGENT_TOKEN"), "WACHTER_AGENT_TOKEN");
+
     compose.networks["wachter-internal"] = {
       internal: true,
       labels: resourceOwnershipLabels({ installationId, generation, kind: "network", resource: "wachter-internal" }),

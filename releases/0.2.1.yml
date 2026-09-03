@@ -1,0 +1,170 @@
+apiVersion: hof.dev/release-selection/v1
+release: 0.2.1
+minimumHofctlVersion: 0.1.0
+catalog: catalog/services-v1.yaml
+composeTemplate: scripts/render-topology.mjs
+ansibleEnvironment:
+  repository: vrubovoy/hof-ops
+  version: 0.1.5
+  image: ghcr.io/vrubovoy/hof-ops-ee:v0.1.5
+  workflowIdentity: https://github.com/vrubovoy/hof-ops/.github/workflows/execution-environment.yml@refs/tags/ee-v0.1.5
+  oidcIssuer: https://token.actions.githubusercontent.com
+  requiredChecks: [ansible]
+components:
+  gateway:
+    image: docker.io/library/caddy:2.10.2-alpine
+    thirdParty: true
+    trust:
+      policy: digest-only
+      limitation: Upstream image has no Hof workflow identity; only the selected registry digest is trusted.
+  schlussel:
+    repository: vrubovoy/schlussel
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/schlussel:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/schlussel/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [backend, frontend]
+    configSchema: 1
+    databaseArtifact: true
+    database: { from: 1, to: 1, rollbackCompatible: true }
+  schlussel-frontend:
+    repository: vrubovoy/schlussel
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/schlussel-frontend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/schlussel/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [backend, frontend]
+    configSchema: 1
+    databaseArtifact: false
+  schloss:
+    repository: vrubovoy/schloss
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/schloss:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/schloss/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [test]
+    configSchema: 1
+    databaseArtifact: false
+  kuvert-backend:
+    repository: vrubovoy/kuvert
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/kuvert-backend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/kuvert/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [backend, frontend]
+    configSchema: 1
+    databaseArtifact: true
+    database: { from: 1, to: 1, rollbackCompatible: true }
+  kuvert-frontend:
+    repository: vrubovoy/kuvert
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/kuvert-frontend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/kuvert/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [backend, frontend]
+    configSchema: 1
+    databaseArtifact: false
+  tafel-backend:
+    repository: vrubovoy/tafel
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/tafel-backend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/tafel/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [backend, frontend]
+    configSchema: 1
+    databaseArtifact: true
+    database: { from: 1, to: 1, rollbackCompatible: true }
+  tafel-frontend:
+    repository: vrubovoy/tafel
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/tafel-frontend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/tafel/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [backend, frontend]
+    configSchema: 1
+    databaseArtifact: false
+  zettel-backend:
+    repository: vrubovoy/zettel
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/zettel-backend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/zettel/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [backend, frontend]
+    configSchema: 1
+    databaseArtifact: true
+    database: { from: 1, to: 1, rollbackCompatible: true }
+  zettel-frontend:
+    repository: vrubovoy/zettel
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/zettel-frontend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/zettel/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [backend, frontend]
+    configSchema: 1
+    databaseArtifact: false
+  glocke-backend:
+    repository: vrubovoy/glocke
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/glocke-backend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/glocke/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [test]
+    configSchema: 1
+    databaseArtifact: true
+    database: { from: 1, to: 1, rollbackCompatible: true }
+  glocke-frontend:
+    repository: vrubovoy/glocke
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/glocke-frontend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/glocke/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [test]
+    configSchema: 1
+    databaseArtifact: false
+  schrank-backend:
+    repository: vrubovoy/schrank
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/schrank-backend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/schrank/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [backend, frontend]
+    configSchema: 1
+    databaseArtifact: true
+    database: { from: 1, to: 1, rollbackCompatible: true }
+  schrank-frontend:
+    repository: vrubovoy/schrank
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/schrank-frontend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/schrank/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [backend, frontend]
+    configSchema: 1
+    databaseArtifact: false
+  herold-backend:
+    repository: vrubovoy/herold
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/herold-backend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/herold/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [backend, frontend]
+    configSchema: 1
+    databaseArtifact: true
+    database: { from: 1, to: 1, rollbackCompatible: true }
+  herold-frontend:
+    repository: vrubovoy/herold
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/herold-frontend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/herold/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [backend, frontend]
+    configSchema: 1
+    databaseArtifact: false
+  wachter-backend:
+    repository: vrubovoy/wachter
+    version: 0.1.1
+    image: ghcr.io/vrubovoy/wachter-backend:v0.1.1
+    workflowIdentity: https://github.com/vrubovoy/wachter/.github/workflows/test.yml@refs/tags/v0.1.1
+    oidcIssuer: https://token.actions.githubusercontent.com
+    requiredChecks: [backend]
+    configSchema: 1
+    databaseArtifact: false

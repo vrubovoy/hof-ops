@@ -34,7 +34,7 @@ import { promisify } from "node:util";
 
 import YAML from "yaml";
 
-import { runApply } from "../scripts/apply.mjs";
+import { computeExpectedCommittedState, runApply } from "../scripts/apply.mjs";
 import { sha256 } from "../scripts/digest.mjs";
 import { runPlan } from "../scripts/plan-command.mjs";
 import { computePlanId } from "../scripts/plan-v2.mjs";
@@ -114,10 +114,34 @@ function cleanSnapshot(overrides = {}) {
 // exported functions - real script/transport correctness is
 // target-mutate.test.mjs's own job; this just needs to behave like a
 // real target would.
-function makeFakeMutate() {
-  const state = { lock: null, journals: new Map(), events: new Map(), current: null, topology: null, generationSnapshots: new Map() };
+// Item 9 review fix (finding 3): a real target-side flock lease is
+// per-HOST, held for the lifetime of the apply PROCESS. This models that
+// across every fake built from the same `heldLeases` set - two runApply()
+// calls that overlap on the same host genuinely contend, exactly like
+// two real apply processes would.
+function makeFakeMutate({ heldLeases = new Set(), leaseHost = "target-host", leaseLostAfterAcquire = null } = {}) {
+  const state = { lock: null, journals: new Map(), events: new Map(), current: null, topology: null, generationSnapshots: new Map(), generationSnapshotTopologies: new Map(), generationSnapshotReleaseLocks: new Map() };
   return {
     state,
+    async acquireExecutionLease() {
+      if (heldLeases.has(leaseHost)) {
+        throw new Error(`another apply process already holds the execution lease for this target - refusing to run a second, concurrent apply/resume against the same host`);
+      }
+      heldLeases.add(leaseHost);
+      // Item 9 SECOND review fix (finding 1): the real isLost()/
+      // lostReason() shape, so a test can simulate the lease being lost
+      // partway through a real dispatch loop, never just at acquisition
+      // time - leaseLostAfterAcquire is a plain, test-only mutable flag
+      // a caller flips (e.g. from inside its own dockerRun) to simulate
+      // exactly that.
+      let released = false;
+      return {
+        release: async () => { released = true; heldLeases.delete(leaseHost); },
+        isLost: () => !released && Boolean(leaseLostAfterAcquire && leaseLostAfterAcquire()),
+        lostReason: () => "simulated lease loss for this test",
+        onLost: () => {},
+      };
+    },
     async acquireLock(_conn, lockDocument) {
       if (state.lock) return { acquired: false, lock: state.lock };
       state.lock = lockDocument;
@@ -172,6 +196,30 @@ function makeFakeMutate() {
       return state.generationSnapshots.has(generation)
         ? { status: "present", snapshot: state.generationSnapshots.get(generation) }
         : { status: "absent", snapshot: null };
+    },
+    // Item 9 review fix (finding 8): the snapshot directory's other two
+    // files. By default they mirror the mutable topology.json and a
+    // present release-lock whenever a generation snapshot exists at all,
+    // so a test that only cares about the state.json oracle keeps
+    // working; a test exercising an incomplete-directory case populates
+    // state.generationSnapshotTopologies / state.generationSnapshotReleaseLocks
+    // (a null value there means "this file is absent").
+    async readGenerationSnapshotTopology(_conn, generation) {
+      if (!state.generationSnapshots.has(generation)) return { status: "absent", topology: null };
+      const override = state.generationSnapshotTopologies?.get(generation);
+      const topology = override === undefined ? state.topology : override;
+      return topology ? { status: "present", topology } : { status: "absent", topology: null };
+    },
+    async readGenerationSnapshotReleaseLock(_conn, generation) {
+      if (!state.generationSnapshots.has(generation)) return { status: "absent", releaseLock: null };
+      const override = state.generationSnapshotReleaseLocks?.get(generation);
+      if (override === null) return { status: "absent", releaseLock: null };
+      // Item 9 SECOND review fix (finding 3): the default now mirrors
+      // the REAL release-lock document apply.mjs itself expects to find
+      // (see realReleaseLock()'s own comment) - a bare placeholder
+      // object would fail the new content comparison for every test
+      // that never explicitly overrides this.
+      return { status: "present", releaseLock: override ?? await realReleaseLock() };
     },
     async pinnedKnownHosts() {
       return { file: "/dev/null", cleanup: async () => {} };
@@ -236,6 +284,21 @@ async function realInputDigests() {
     };
   })();
   return { ...cachedInputDigests };
+}
+
+// The exact parsed release-lock.json document a real apply run's own
+// `releaseLock` variable holds (signedReleaseLockPath's own content is
+// byte-identical to examplesReleaseLock - see before(), above) - used
+// as makeFakeMutate()'s own default readGenerationSnapshotReleaseLock()
+// answer, so the item 9 SECOND review's own content-comparison fix
+// (readGenerationSnapshotArtifacts() now compares release-lock.json's
+// real content, not just its presence) has something real to match
+// against by default, not a placeholder object that could never equal
+// what apply.mjs itself expects.
+let cachedReleaseLock;
+async function realReleaseLock() {
+  cachedReleaseLock ??= JSON.parse(await readFile(examplesReleaseLock, "utf8"));
+  return cachedReleaseLock;
 }
 
 // The exact current.json/topology.json a real state.commit dispatch
@@ -580,13 +643,20 @@ test("secrets blocked: a deployment needing secrets refuses without --secrets-st
 });
 
 test("secrets blocked: a store missing a required secret refuses, naming which one", async () => {
-  const result = await withFakeCosign("success", () => runApply({
-    ...baseApplyOptions(), readSecretsStore: async () => ({}), inspect: async () => { throw new Error("must never be called"); },
-    approvePlanId: "sha256:" + "0".repeat(64), planPath: "/dev/null",
-  }));
+  // Item 9 review fix (finding 7): the store is DECRYPTED only once the
+  // run is known to be a real, non-no-op apply - so "missing a required
+  // secret" is now discovered after the target is inspected and the
+  // no-op check has passed, not before the network. A real approved plan
+  // and a clean target get this run to that point; the deferred check
+  // then blocks with the same reason and message as before.
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot(), readSecretsStore: async () => ({}) });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  const result = await withFakeCosign("success", () => runApply({ ...options, planPath, approvePlanId: plan.planId }));
   assert.equal(result.blocked, true);
   assert.equal(result.reason, "secrets");
   assert.match(result.diagnostics[0], /missing required secret/);
+  assert.equal(mutate.state.lock, null, "the lock is released when the deferred secrets check blocks a fresh apply");
 });
 
 // Both of the next two tests read the mounted file's content from
@@ -1157,6 +1227,411 @@ test("resume: state.commit's own real effect already landed on the target (curre
   assert.equal(stateCommitEvents.filter((event) => event.phase === "succeeded").length, 1, "the missing succeeded event is synthesized, keeping the durable record honest");
 });
 
+test("resume: an interrupted commit that published the immutable generation snapshot in full but only partially wrote the pointer files is finished by re-dispatching the idempotent state.commit (item 9 review, finding 2)", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const inputDigests = await realInputDigests();
+  const operationId = "b2b2b2b2-0000-0000-0000-00000000ffff";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+  const stateCommitOp = plan.operations.find((op) => op.action === "state.commit");
+  const otherOps = plan.operations.filter((op) => op.action !== "state.commit");
+  mutate.state.events.set(operationId, [
+    ...otherOps.flatMap((op) => [
+      { apiVersion: "hof.dev/operation-event/v1", operationId, step: op.id, attempt: 1, phase: "started", at: "2026-08-27T09:00:00Z" },
+      { apiVersion: "hof.dev/operation-event/v1", operationId, step: op.id, attempt: 1, phase: "succeeded", at: "2026-08-27T09:00:01Z" },
+    ]),
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: stateCommitOp.id, attempt: 1, phase: "started", at: "2026-08-27T09:01:00Z" },
+  ]);
+
+  const { current, topology } = await realCommittedState({ plan, operationId, inputDigests });
+  // The immutable per-generation snapshot landed IN FULL (all three
+  // files)...
+  mutate.state.generationSnapshots.set(1, current);
+  mutate.state.generationSnapshotTopologies.set(1, topology);
+  // ...but the mutable pointer pair did not: current.json is still
+  // absent (the crash was between the topology.json write and the
+  // current.json write).
+  mutate.state.current = null;
+  mutate.state.topology = topology;
+
+  const dockerCalls = [];
+  const result = await withFakeCosign("success", () => runApply({
+    ...options, resume: true,
+    dockerRun: async (command, args) => {
+      const vars = JSON.parse(args.at(-1));
+      dockerCalls.push(vars);
+      // A real state.commit re-dispatch finishes the atomic pointer
+      // writes - the fake reflects that.
+      if (vars.hof_role === "state") { mutate.state.current = current; mutate.state.topology = topology; }
+      return { stdout: "", stderr: "" };
+    },
+  }));
+
+  assert.equal(result.blocked, false, JSON.stringify(result));
+  assert.equal(result.committedGeneration, 1);
+  assert.equal(mutate.state.lock, null, "the lock is released once the commit is finished");
+  assert.equal(mutate.state.journals.get(operationId).status, "succeeded");
+  assert.ok(dockerCalls.some((vars) => vars.hof_role === "state"), "state.commit IS re-dispatched here - only the immutable snapshot was complete, the pointers were not");
+  const stateCommitEvents = mutate.state.events.get(operationId).filter((event) => event.step === stateCommitOp.id);
+  assert.equal(stateCommitEvents.filter((event) => event.phase === "succeeded").length, 1);
+});
+
+test("resume: the succeeded fast path refuses when the immutable generation snapshot's own topology.json/release-lock.json are missing, even though its state.json matches (item 9 review, finding 8)", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const inputDigests = await realInputDigests();
+  const operationId = "f8f8f8f8-0000-0000-0000-00000000aaaa";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "succeeded", committedGeneration: 1,
+  });
+  mutate.state.events.set(operationId, fullySucceededEvents(operationId, plan));
+  const { current, topology } = await realCommittedState({ plan, operationId, inputDigests });
+  mutate.state.current = current;
+  mutate.state.topology = topology;
+  mutate.state.generationSnapshots.set(1, current);        // state.json is fine...
+  mutate.state.generationSnapshotTopologies.set(1, null);  // ...but topology.json is missing
+  mutate.state.generationSnapshotReleaseLocks.set(1, null); // ...and so is release-lock.json
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /snapshot is incomplete or does not match/);
+  assert.match(result.diagnostics[0], /topology\.json.*absent.*release-lock\.json.*absent/);
+  assert.notEqual(mutate.state.lock, null, "the lock is kept - a completion claim its own evidence doesn't fully support is never trusted");
+});
+
+// Item 9 SECOND review fix (finding 3): a further review found
+// readGenerationSnapshotArtifacts() used to discard the actual
+// release-lock.json VALUE it read, checking only its presence - a
+// snapshot whose release-lock.json is present, parseable, and non-empty
+// but belongs to a genuinely DIFFERENT release than the one this
+// operation would have committed used to pass unnoticed. state.json and
+// topology.json both still match here on purpose, isolating the one
+// artifact this test actually cares about.
+test("resume: the succeeded fast path refuses when the immutable generation snapshot's own release-lock.json is present but its CONTENT genuinely differs, even though state.json and topology.json both match", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const inputDigests = await realInputDigests();
+  const operationId = "b1b1b1b1-0000-0000-0000-00000000eeee";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests, startedAt: "2026-08-27T09:00:00Z", status: "succeeded", committedGeneration: 1,
+  });
+  mutate.state.events.set(operationId, fullySucceededEvents(operationId, plan));
+  const { current, topology } = await realCommittedState({ plan, operationId, inputDigests });
+  mutate.state.current = current;
+  mutate.state.topology = topology;
+  mutate.state.generationSnapshots.set(1, current);
+  // state.json and topology.json both match (the default fallbacks) -
+  // only release-lock.json is deliberately wrong: present, real JSON,
+  // simply a different document than the one this operation actually
+  // committed under.
+  mutate.state.generationSnapshotReleaseLocks.set(1, { apiVersion: "hof.dev/release-lock/v1", release: "9.9.9-not-the-real-one" });
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /snapshot is incomplete or does not match/);
+  assert.match(result.diagnostics[0], /content mismatch: release-lock\.json/);
+  assert.notEqual(mutate.state.lock, null, "the lock is kept - a completion claim its own evidence doesn't fully support is never trusted");
+});
+
+test("a second concurrent apply/resume against the same target is refused by the process-lifetime execution lease, WITHOUT touching the durable lock the first one legitimately holds (item 9 review, finding 3)", async () => {
+  const heldLeases = new Set();
+  const inputDigests = await realInputDigests();
+  const installationId = "3e3e3e3e-0000-0000-0000-00000000cccc";
+  const contracts = structuredClone(await loadContracts());
+
+  // A first apply process is already running against this host - it holds
+  // the target-side execution lease for its whole lifetime.
+  heldLeases.add("target-host");
+
+  const mutate = makeFakeMutate({ heldLeases });
+  const { snapshot } = await appliedSnapshotFor({ contracts, installationId, generation: 4, inputDigests });
+  // Force a real (executable, non-no-op) change so this run gets past
+  // the applied no-op return and actually reaches the lease acquisition.
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-lease-"));
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.services.kuvert.enabled = false;
+  manifest.services.kuvert.dataRetention = "retain";
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+
+  const options = baseApplyOptions({ mutate, manifestPath, inspect: async () => snapshot });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lease");
+  assert.match(result.diagnostics[0], /execution lease/);
+  assert.equal(mutate.state.lock, null, "the durable lock is never released by the loser - it belongs to the other live process");
+  assert.ok(heldLeases.has("target-host"), "the other process still holds the lease");
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+// Item 9 THIRD review fix (findings 1 & 2): the PREVIOUS test above only
+// proves the lock ends up null - true either way, whether the lease is
+// acquired before any lock is ever created (the fix) or a lock is
+// created and then correctly released again (the bug the third review
+// actually found: a real target-side lock+journal briefly exists, which
+// a genuinely concurrent legitimate resumer could already be reading by
+// the time this loser's own failure handler releases it out from under
+// it). This test instead spies directly on acquireLockAndJournal() to
+// prove it is never even CALLED when the lease is busy - the only way to
+// tell the fixed ordering (lease first, unconditionally, before either
+// branch begins) apart from the old, buggy one (lease acquired deep
+// inside the fresh branch, after the lock already exists).
+test("a second concurrent FRESH apply refused by the execution lease never even calls acquireLockAndJournal - the lease is acquired before any lock-creating mutation is attempted, not created-then-released (item 9 third review, findings 1 & 2)", async () => {
+  const heldLeases = new Set();
+  heldLeases.add("target-host");
+  const mutate = makeFakeMutate({ heldLeases });
+  let acquireLockAndJournalCalls = 0;
+  const realAcquireLockAndJournal = mutate.acquireLockAndJournal.bind(mutate);
+  mutate.acquireLockAndJournal = async (...args) => { acquireLockAndJournalCalls++; return realAcquireLockAndJournal(...args); };
+
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lease");
+  assert.equal(acquireLockAndJournalCalls, 0, "acquireLockAndJournal() is never even attempted once the lease is known busy - the fresh branch never starts");
+  assert.equal(mutate.state.lock, null);
+});
+
+// Same proof, on the RESUME branch: readLock()/readJournal() (resume's
+// own decision-affecting reads - see runApply()'s own comment on why
+// these specifically must never run before the lease is held) must never
+// even be attempted when the lease is busy.
+test("a second concurrent RESUME apply refused by the execution lease never even calls readLock/readJournal - no decision-affecting read happens before the lease is held (item 9 third review, findings 1 & 2)", async () => {
+  const heldLeases = new Set();
+  heldLeases.add("target-host");
+  const mutate = makeFakeMutate({ heldLeases });
+  let readLockCalls = 0;
+  let readJournalCalls = 0;
+  const realReadLock = mutate.readLock.bind(mutate);
+  const realReadJournal = mutate.readJournal.bind(mutate);
+  mutate.readLock = async (...args) => { readLockCalls++; return realReadLock(...args); };
+  mutate.readJournal = async (...args) => { readJournalCalls++; return realReadJournal(...args); };
+
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lease");
+  assert.equal(readLockCalls, 0, "readLock() is never even attempted once the lease is known busy - resume's own decision-affecting reads never start");
+  assert.equal(readJournalCalls, 0);
+});
+
+// Item 9 SECOND review fix (finding 1): a lease loss discovered AFTER
+// acquisition used to be fail-OPEN - apply.mjs never looked at it again
+// once the lease was first confirmed held, so a real loss mid-run
+// (target-mutate.mjs's own isLost()/onLost()) went completely unnoticed
+// and this dispatch loop kept queuing new operations with no live lease
+// behind them at all. Fixed: checked at the top of every iteration.
+test("a lease lost mid-run (isLost() flips true between two operations) stops the dispatch loop fail-closed before the NEXT operation - never mid-flight, never silently ignored", async () => {
+  const mutate = makeFakeMutate();
+  let dispatchCount = 0;
+  const options = baseApplyOptions({
+    mutate, inspect: async () => cleanSnapshot(),
+    dockerRun: async () => { dispatchCount++; return { stdout: "", stderr: "" }; },
+  });
+  // The lease reports itself lost only once at least one real operation
+  // has already been dispatched - simulating the loss being discovered
+  // strictly BETWEEN two steps of an in-progress run, never before the
+  // first one.
+  mutate.acquireExecutionLease = async () => ({
+    release: async () => {},
+    isLost: () => dispatchCount >= 1,
+    lostReason: () => "simulated: the remote heartbeat loop timed out",
+    onLost: () => {},
+  });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  assert.ok(plan.operations.length > 1, "fixture assumption: a real bootstrap has more than one operation");
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lease");
+  assert.match(result.diagnostics[0], /lost mid-run/);
+  assert.equal(dispatchCount, 1, "exactly one operation was dispatched before the loss was noticed and the loop stopped - never a second one");
+  assert.notEqual(mutate.state.lock, null, "the durable lock is left exactly as it is - a lease loss is never guessed at, the target is investigated directly");
+});
+
+// Item 9 THIRD review fix (finding 3): the PREVIOUS test only proves
+// isLost() is checked again at the TOP of the next iteration - it says
+// nothing about a loss discovered strictly WITHIN one iteration, between
+// that top check and the dispatch call it guards. This test simulates
+// exactly that: isLost() lies (false) on its first call of the run (the
+// very first iteration's own top-of-loop check) and tells the truth
+// (true) on every call after - so if the ONLY check were the one at the
+// top of the loop, this run would sail straight through to a real
+// dispatch on operation #1 itself; if the fix (a second check
+// immediately before the dispatch call, within the SAME iteration) is in
+// place, operation #1 is refused before dockerRun is ever invoked.
+test("a lease lost strictly WITHIN the first iteration (between its own appendEvent(started) and its own dispatch call) still stops that dispatch, not just the next iteration's (item 9 third review, finding 3)", async () => {
+  const mutate = makeFakeMutate();
+  let dispatchCount = 0;
+  let appendEventCalls = 0;
+  const realAppendEvent = mutate.appendEvent.bind(mutate);
+  mutate.appendEvent = async (...args) => { appendEventCalls++; return realAppendEvent(...args); };
+  let isLostCalls = 0;
+  const options = baseApplyOptions({
+    mutate, inspect: async () => cleanSnapshot(),
+    dockerRun: async () => { dispatchCount++; return { stdout: "", stderr: "" }; },
+  });
+  mutate.acquireExecutionLease = async () => ({
+    release: async () => {},
+    // false on the first THREE calls (runApply()'s own immediately-
+    // after-acquisition check - item 9 fourth review, finding 1 -
+    // then operation #1's own top-of-loop check, then operation #1's
+    // own pre-appendEvent(started) check - item 9 fourth review,
+    // finding 2, which must ALSO see a healthy lease here, or this
+    // scenario degenerates into the finding-2 test above and no longer
+    // isolates THIS check at all) - true on every call after, including
+    // the very next one (operation #1's own pre-dispatch check, this
+    // fix's own original target).
+    isLost: () => { isLostCalls++; return isLostCalls > 3; },
+    lostReason: () => "simulated: lost strictly between appendEvent(started) and the dispatch it guards",
+    onLost: () => {},
+  });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  assert.ok(plan.operations.length > 1, "fixture assumption: a real bootstrap has more than one operation");
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lease");
+  assert.match(result.diagnostics[0], /lost mid-run/);
+  assert.equal(appendEventCalls, 1, "fixture check: the started event for operation #1 WAS appended - the lease was still healthy at that earlier check, isolating the later pre-dispatch check as what actually catches this");
+  assert.equal(dispatchCount, 0, "the very first operation is refused before dockerRun is ever invoked - a loss discovered between appendEvent(started) and this dispatch call must stop THIS dispatch too");
+});
+
+// Item 9 FOURTH review fix (finding 1): a further review found runApply()
+// never checked isLost() immediately after acquiring the lease at all -
+// only deep inside the dispatch loop, per the tests above. A lease that
+// somehow resolves already lost (target-mutate.mjs's own
+// acquireExecutionLease() is now fixed to never do this for real - see
+// its own test suite - but this is checked again here too, defensively,
+// for any mutate implementation) used to be accepted and USED: this test
+// proves runApply() refuses it immediately, before resume's own
+// readLock/readJournal or fresh's own acquireLockAndJournal ever runs -
+// not merely before the dispatch loop, several steps later.
+test("a lease that resolves already known lost is refused immediately after acquisition - never used to read/create a lock, not just refused inside the dispatch loop later (item 9 fourth review, finding 1)", async () => {
+  const mutate = makeFakeMutate();
+  let acquireLockAndJournalCalls = 0;
+  const realAcquireLockAndJournal = mutate.acquireLockAndJournal.bind(mutate);
+  mutate.acquireLockAndJournal = async (...args) => { acquireLockAndJournalCalls++; return realAcquireLockAndJournal(...args); };
+  let released = false;
+  mutate.acquireExecutionLease = async () => ({
+    release: async () => { released = true; },
+    isLost: () => true, // already lost the instant acquisition resolves
+    lostReason: () => "simulated: resolved already lost",
+    onLost: () => {},
+  });
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan, planPath } = await computeApprovedPlan(options);
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lease");
+  assert.match(result.diagnostics[0], /resolved already lost/);
+  assert.equal(acquireLockAndJournalCalls, 0, "never even attempted - refused before the fresh branch starts, not merely before the dispatch loop several steps later");
+  assert.equal(released, true, "the already-lost lease is still released, never left dangling");
+  assert.equal(mutate.state.lock, null);
+});
+
+// Item 9 FOURTH review fix (finding 2): a further review found several
+// journal-writing appendEvent() calls in the dispatch loop were only
+// guarded by the checks immediately before dispatchOperation() itself -
+// appendEvent() is its own real target mutation, and building/appending
+// the "started" event happens BEFORE that check, not after. This test
+// proves the lease is checked before appendEvent(started) itself: a loss
+// discovered strictly between the top-of-loop check and that append
+// stops it from ever being written, leaving the target's own journal
+// exactly as it was (no dangling, permanently-ambiguous "started, no
+// resolution" event for an operation that was never actually going to be
+// dispatched anyway).
+test("a lease lost strictly between the top-of-loop check and appendEvent(started) stops that append from ever happening, not just the dispatch after it (item 9 fourth review, finding 2)", async () => {
+  const mutate = makeFakeMutate();
+  let appendEventCalls = 0;
+  const realAppendEvent = mutate.appendEvent.bind(mutate);
+  mutate.appendEvent = async (...args) => { appendEventCalls++; return realAppendEvent(...args); };
+  let isLostCalls = 0;
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  mutate.acquireExecutionLease = async () => ({
+    release: async () => {},
+    // false on the first TWO calls (runApply()'s own immediately-after-
+    // acquisition check - item 9 fourth review, finding 1 - then
+    // operation #1's own top-of-loop check) - true on every call after,
+    // including the very next one (the pre-appendEvent(started) check
+    // this fix adds).
+    isLost: () => { isLostCalls++; return isLostCalls > 2; },
+    lostReason: () => "simulated: lost strictly between the top-of-loop check and appendEvent(started)",
+    onLost: () => {},
+  });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  assert.ok(plan.operations.length > 1, "fixture assumption: a real bootstrap has more than one operation");
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lease");
+  assert.equal(appendEventCalls, 0, "appendEvent() is never even attempted - the started event for operation #1 is never written once the lease is known lost, even before dispatch is reached");
+});
+
+// Item 9 SECOND review fix (finding 7 in the second review's own
+// numbering): mkdtemp() used to run BEFORE the try/finally that
+// releases the lease, so a failure there (rare, but real: disk full, a
+// permissions problem) skipped that finally entirely and leaked the
+// lease helper for the rest of this process's own lifetime. Exercised
+// here via a different, but equally "fails somewhere inside the now-
+// widened try, before any operation is ever dispatched" scenario
+// (pinnedKnownHosts() throwing) - the exact invariant this closes is
+// "anything failing between lease acquisition and the end of this run
+// still releases it", not specifically mkdtemp's own real filesystem
+// behavior, which has no seam to fake here.
+//
+// Item 9 THIRD review fix (finding 8): this same test now also covers a
+// further gap a third review found: the OLD code released the lease as
+// the SECOND of two sequential statements in one finally block (`await
+// rm(workDir, ...)` first, the lease second), so a real failure removing
+// workDir itself (disk full, a permissions problem - `rm`'s own
+// `force: true` swallows ENOENT, but not those) skipped lease release
+// entirely, same class of bug as the mkdtemp one just above, just later
+// in the same function. The fix moved lease release to a wrapping OUTER
+// try/finally around the ENTIRE resume/fresh/dispatch body (this
+// function's own runUnderLease() closure - see apply.mjs), so it now
+// releases on ANY exception propagating out of that closure, from
+// wherever it originates - which is exactly what this test already
+// demonstrates via pinnedKnownHosts() below (workDir's own rm() has no
+// fake-able seam, but the outer-try/finally mechanism this closes does
+// not care which statement inside runUnderLease() actually threw).
+test("the execution lease is released even when something fails immediately after acquisition, before any operation is ever dispatched", async () => {
+  const heldLeases = new Set();
+  const mutate = makeFakeMutate({ heldLeases });
+  mutate.pinnedKnownHosts = async () => { throw new Error("simulated: could not resolve pinned known_hosts"); };
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan, planPath } = await computeApprovedPlan(options);
+
+  await assert.rejects(
+    () => withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath })),
+    /simulated: could not resolve pinned known_hosts/,
+  );
+  assert.ok(!heldLeases.has("target-host"), "the lease must be released even though the run itself failed before ever dispatching an operation - mkdtemp() (and everything after acquisition) now runs inside the same try/finally that releases it");
+});
+
 test("resume: state.commit blocked with no confirming current.json on the target stays blocked - recovery is never guessed, only confirmed", async () => {
   const mutate = makeFakeMutate();
   const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
@@ -1486,6 +1961,31 @@ test("applied: a genuine no-op invokes zero mutation methods (no lock, no journa
   assert.equal(mutate.state.lock, null);
 });
 
+test("applied: a genuine no-op succeeds even when the secrets store cannot be decrypted - it never reads or delivers a secret (item 9 review, finding 7)", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-2222-2222-2222-222222222222";
+  const contracts = structuredClone(await loadContracts());
+  const { snapshot } = await appliedSnapshotFor({ contracts, installationId, generation: 4, inputDigests });
+
+  let readStoreCalls = 0;
+  const options = baseApplyOptions({
+    mutate,
+    inspect: async () => snapshot,
+    // A SOPS/age identity momentarily unavailable - decryption throws.
+    readSecretsStore: async () => { readStoreCalls++; throw new Error("no matching age identity found"); },
+  });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  assert.deepEqual(plan.operations, [], "fixture assumption: a genuine no-op");
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+
+  assert.equal(result.blocked, false, JSON.stringify(result));
+  assert.equal(result.noOp, true);
+  assert.equal(readStoreCalls, 0, "the store is never even read for a no-op");
+  assert.equal(mutate.state.lock, null);
+});
+
 test("applied: disabling a persistent service with retain commits baseline.generation + 1, dispatches service.stop/service.remove bound to the exact permanent installationId (never the fresh operationId), and never touches the volume or dispatches backup.create", async () => {
   const mutate = makeFakeMutate();
   const inputDigests = await realInputDigests();
@@ -1501,9 +2001,18 @@ test("applied: disabling a persistent service with retain commits baseline.gener
   await writeFile(manifestPath, YAML.stringify(manifest));
 
   const dockerCalls = [];
+  let committedCurrent;
+  let deliveredSecrets;
   const options = baseApplyOptions({
     mutate, manifestPath, inspect: async () => snapshot,
-    dockerRun: async (command, args) => { dockerCalls.push(args); return { stdout: "", stderr: "" }; },
+    dockerRun: async (command, args) => {
+      dockerCalls.push(args);
+      const stateMount = args.find((a) => a.endsWith(":/hof/state:ro"));
+      if (stateMount) committedCurrent = JSON.parse(await readFileText(path.join(stateMount.slice(0, -":/hof/state:ro".length), "current.json"), "utf8"));
+      const secretsMount = args.find((a) => a.endsWith(":/hof/secrets.json:ro"));
+      if (secretsMount) deliveredSecrets = JSON.parse(await readFileText(secretsMount.slice(0, -":/hof/secrets.json:ro".length), "utf8"));
+      return { stdout: "", stderr: "" };
+    },
   });
   const { plan, planPath } = await computeApprovedPlan(options);
   assert.equal(plan.mode, "applied");
@@ -1512,6 +2021,22 @@ test("applied: disabling a persistent service with retain commits baseline.gener
   const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
   assert.equal(result.blocked, false, JSON.stringify(result));
   assert.equal(result.committedGeneration, 5, "generation 4 -> 5, exactly once");
+
+  // Item 9 review fix (finding 11): apply stamps retainedAt onto the
+  // entry it is disabling-with-retain, at real commit time.
+  assert.ok(committedCurrent, "state.commit's own current.json was mounted for inspection");
+  assert.ok(committedCurrent.retainedServices.kuvert, "kuvert is now recorded as retained");
+  assert.match(committedCurrent.retainedServices.kuvert.retainedAt, /^\d{4}-\d\d-\d\dT/, "retainedAt is an ISO timestamp, filled in by apply");
+
+  // Item 9 review fix (finding 6): the delivered secrets file carries
+  // exactly the plan's approved, scoped set - never the whole store.
+  const secretEnsureOp = plan.operations.find((o) => o.action === "secret.ensure");
+  assert.ok(Array.isArray(secretEnsureOp.secrets), "the applied secret.ensure carries an explicit scoped list");
+  assert.deepEqual(
+    Object.keys(deliveredSecrets ?? {}).sort(),
+    [...secretEnsureOp.secrets].sort(),
+    "apply delivers exactly the scoped secret set the approved plan names, nothing more",
+  );
 
   const dispatchedVars = dockerCalls.map(extraVarsFrom);
   const removeCalls = dispatchedVars.filter((v) => v.hof_role === "service" && v.hof_service_action === "remove");
@@ -1528,6 +2053,73 @@ test("applied: disabling a persistent service with retain commits baseline.gener
   }
   assert.ok(!dispatchedVars.some((v) => v.hof_role === "backup"), "backup.create is never in the applied whitelist - never dispatched");
   assert.ok(!dispatchedVars.some((v) => v.hof_role === "volume" && v.hof_volume_name === "kuvert-data"), "retain-only removal never touches the volume itself");
+
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+// Item 9 THIRD review fix (finding 6): computeExpectedCommittedState()'s
+// own retainedAt for a service retained for the FIRST time by this
+// commit (no matching plan.baseline.retainedServices entry yet) must be
+// a deterministic function of operationStartedAt, not the wall clock at
+// call time - a real apply.mjs calls this function TWICE for the exact
+// same operation on a real resume of a commit interrupted between the
+// immutable generation snapshot and its two mutable pointer files (once
+// on the original dispatch, again re-rendering current.json for the
+// retry - see ansible/roles/state/tasks/main.yml's own already-published
+// comparison, which excludes appliedAt only and would otherwise wrongly
+// refuse the retry as if the generation had been reused for two
+// different commits).
+test("computeExpectedCommittedState: retainedAt for a newly-retained service is a deterministic function of operationStartedAt, not wall-clock time at call time (item 9 third review, finding 6)", async () => {
+  const contracts = structuredClone(await loadContracts());
+  const manifest = structuredClone(contracts.manifest);
+  manifest.services.kuvert.enabled = false;
+  manifest.services.kuvert.dataRetention = "retain";
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-6666-6666-6666-666666666666";
+  // baseline has no retainedServices at all - kuvert is retained for the
+  // very first time by this plan, exactly the case whose retainedAt used
+  // to come from `now` (see this function's own comment in apply.mjs).
+  const { snapshot } = await appliedSnapshotFor({ contracts, installationId, generation: 4, inputDigests });
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-retainedat-determinism-"));
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+  const options = baseApplyOptions({ mutate: makeFakeMutate(), manifestPath, inspect: async () => snapshot });
+  const { plan } = await computeApprovedPlan(options);
+  assert.ok(plan.desired.retainedServices?.kuvert, "fixture assumption: kuvert is retained by this plan");
+  assert.ok(!plan.baseline?.retainedServices?.kuvert, "fixture assumption: kuvert has no PRIOR retainedAt to carry forward - this is the first-time-retain case finding 6 is about");
+
+  const operationStartedAt = "2026-08-27T09:00:00.000Z"; // fixed, as a real journal.startedAt would be across every retry of the same operation
+  // manifest here is deliberately the LOCAL, kuvert-retained copy (the
+  // one computeApprovedPlan actually planned against via manifestPath) -
+  // never contracts.manifest, which is loadContracts()'s own unmodified
+  // fixture and would desync appliedRendered from what `plan` itself
+  // describes.
+  const call = () => computeExpectedCommittedState({
+    ...contracts, manifest, plan, operationId: "op-a", installationId, generation: 5, inputDigests, operationStartedAt,
+  });
+  const first = call();
+  // A real wall-clock gap between the original dispatch and a later
+  // --resume retry - `now` (appliedAt's own source) genuinely differs;
+  // operationStartedAt (retainedAt's own source) is passed unchanged
+  // both times, exactly like a real resume re-reading the same journal.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const second = call();
+
+  assert.equal(first.currentState.retainedServices.kuvert.retainedAt, operationStartedAt, "retainedAt is derived from operationStartedAt, not the wall clock");
+  assert.equal(
+    first.currentState.retainedServices.kuvert.retainedAt,
+    second.currentState.retainedServices.kuvert.retainedAt,
+    "two calls for the same operation (original dispatch + resume retry) must produce byte-identical retainedAt, or the target-side immutable-snapshot comparison in ansible/roles/state/tasks/main.yml wrongly refuses the retry as corruption",
+  );
+
+  // The required-parameter guard itself (also finding 6): a caller that
+  // forgets operationStartedAt must fail loudly, never silently spread
+  // `retainedAt: undefined` into a schema-checked field.
+  assert.throws(
+    () => computeExpectedCommittedState({ ...contracts, plan, operationId: "op-a", installationId, generation: 5, inputDigests }),
+    /operationStartedAt/,
+    "omitting operationStartedAt throws rather than silently producing an invalid retainedAt",
+  );
 
   await rm(scratchDir, { recursive: true, force: true });
 });
@@ -1709,7 +2301,65 @@ test("applied: the succeeded fast path refuses when the immutable generation sna
   const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
   assert.equal(result.blocked, true);
   assert.equal(result.reason, "resume");
-  assert.match(result.diagnostics[0], /immutable snapshot could not be confirmed present/);
+  assert.match(result.diagnostics[0], /snapshot is incomplete or does not match/);
+  assert.notEqual(mutate.state.lock, null, "never releases the lock on an unconfirmed recovery");
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+// Item 9 THIRD review fix (finding 7): a generation snapshot's own
+// state.json is now schema-checked before it is trusted as a recovery
+// oracle - same shape as the test just above (an incomplete/mismatched
+// snapshot is refused), but here the snapshot's state.json is PRESENT,
+// non-empty, and would otherwise be silently trusted: it is missing a
+// schema-REQUIRED field (lastSuccessfulOperationId) entirely, which - by
+// construction - can never equal the expected value on either side of a
+// naive field-by-field comparison, so this specific corruption would
+// happen to be caught either way; what this test actually proves is that
+// readGenerationSnapshotArtifacts() reports it via its own schema-error
+// path (a distinct, more specific complaint), not merely as an
+// unexplained "content mismatch".
+test("applied: the succeeded fast path refuses when the immutable generation snapshot's own state.json fails its schema, even though it is present, non-empty, and parses as JSON", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-7777-7777-7777-777777777777";
+  const baselineContracts = structuredClone(await loadContracts());
+  const { snapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation: 3, inputDigests });
+
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-snapshot-schema-"));
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.backup.schedule = "07:15";
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+  const changedInputDigests = { ...inputDigests, manifestDigest: sha256(await readFile(manifestPath)) };
+
+  const options = baseApplyOptions({ mutate, manifestPath, inspect: async () => snapshot });
+  const { plan } = await computeApprovedPlan(options);
+  assert.ok(plan.operations.length > 0);
+
+  const operationId = "99999999-7777-7777-7777-777777777777";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests: changedInputDigests, startedAt: "2026-08-27T09:00:00Z", status: "succeeded", committedGeneration: 4,
+  });
+  mutate.state.events.set(operationId, fullySucceededEvents(operationId, plan));
+
+  const { current, topology } = await appliedCommittedStateFor({
+    contracts: { ...baselineContracts, manifest }, plan, operationId, installationId, generation: 4, inputDigests: changedInputDigests,
+  });
+  mutate.state.current = current;
+  mutate.state.topology = topology;
+  // A schema-required field is simply absent from the snapshot's own
+  // state.json - still valid JSON, still non-empty, still "complete" in
+  // the sense the old code checked (present, readable, non-empty) - but
+  // never a document validateStateV1() accepts.
+  const { lastSuccessfulOperationId: _dropped, ...corruptedSnapshot } = current;
+  mutate.state.generationSnapshots.set(4, corruptedSnapshot);
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /does not satisfy schemas\/state-v1\.schema\.json/, "the schema failure is named specifically, not folded into a generic content-mismatch message");
   assert.notEqual(mutate.state.lock, null, "never releases the lock on an unconfirmed recovery");
   await rm(scratchDir, { recursive: true, force: true });
 });
@@ -2079,6 +2729,211 @@ test("applied: post-commit/pre-event recovery - state.commit's own real effect a
   assert.equal(result.blocked, false, JSON.stringify(result));
   assert.equal(result.committedGeneration, 8, "generation 7 -> 8");
   assert.ok(!dockerCalls.map(extraVarsFrom).some((v) => v.hof_operation_id === stateCommitOp.id), "state.commit is recovered from its own independent target-side record, never re-dispatched");
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+// Item 9 FOURTH review fix (finding 2): the exact same post-commit/
+// pre-event recovery scenario as the test just above, but the lease is
+// lost strictly between the recovery block's own top-of-loop check
+// (state.commit's own iteration, which must still see a healthy lease -
+// every earlier already-succeeded operation's own iteration also checks
+// once, at its own top) and the point where it independently confirms
+// current.json/topology.json/the immutable snapshot all already match
+// and is about to append a SYNTHETIC succeeded event recording that. A
+// further review found this exact append had no check of its own -
+// fixed by adding one immediately before it (see apply.mjs's own
+// comment there). Proven here by making isLost() lie exactly once, at
+// the call count corresponding to that specific check, and confirming
+// appendEvent() is never reached for it.
+test("a lease lost strictly between the top-of-loop check and the post-commit recovery block's own synthetic succeeded-event append stops that append too (item 9 fourth review, finding 2)", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-cccc-cccc-cccc-cccccccccccc";
+  const baselineContracts = structuredClone(await loadContracts());
+  const { snapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation: 7, inputDigests });
+
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-postcommit-lease-"));
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.backup.schedule = "09:30";
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+  const inputDigestsHere = { ...inputDigests, manifestDigest: sha256(await readFile(manifestPath)) };
+
+  const options = baseApplyOptions({ mutate, manifestPath, inspect: async () => snapshot });
+  const { plan } = await computeApprovedPlan(options);
+  assert.ok(plan.operations.length > 0);
+
+  const operationId = "cccccccc-2222-2222-2222-222222222222";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests: inputDigestsHere, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+  const stateCommitOp = plan.operations.find((op) => op.action === "state.commit");
+  const stateCommitIndex = plan.operations.findIndex((op) => op.action === "state.commit");
+  const otherOps = plan.operations.filter((op) => op.action !== "state.commit");
+  mutate.state.events.set(operationId, [
+    ...otherOps.flatMap((op) => [
+      { apiVersion: "hof.dev/operation-event/v1", operationId, step: op.id, attempt: 1, phase: "started", at: "2026-08-27T09:00:00Z" },
+      { apiVersion: "hof.dev/operation-event/v1", operationId, step: op.id, attempt: 1, phase: "succeeded", at: "2026-08-27T09:00:01Z" },
+    ]),
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: stateCommitOp.id, attempt: 1, phase: "started", at: "2026-08-27T09:01:00Z" },
+  ]);
+
+  const { current, topology } = await appliedCommittedStateFor({
+    contracts: { ...baselineContracts, manifest }, plan, operationId, installationId, generation: 8, inputDigests: inputDigestsHere,
+  });
+  mutate.state.current = current;
+  mutate.state.topology = topology;
+  mutate.state.generationSnapshots.set(8, current);
+
+  let appendEventCalls = 0;
+  const realAppendEvent = mutate.appendEvent.bind(mutate);
+  mutate.appendEvent = async (...args) => { appendEventCalls++; return realAppendEvent(...args); };
+
+  let isLostCalls = 0;
+  // Call #1 is runApply()'s own immediately-after-acquisition check
+  // (item 9 fourth review, finding 1) - must still see a healthy lease,
+  // or this scenario never even reaches the dispatch loop at all. Every
+  // operation BEFORE state.commit then takes the "skip" fast path (its
+  // own event history already shows it succeeded) - each contributes
+  // exactly one more isLost() call, at its own iteration's top-of-loop
+  // check, and no other. state.commit's own iteration then makes ONE
+  // MORE such call at ITS top - that is call number (stateCommitIndex +
+  // 2), which must still see a healthy lease (false) so this scenario
+  // actually reaches the recovery block being tested. Every call after
+  // that - starting with the new check immediately before the recovery
+  // block's own synthetic succeeded-event append - reports lost (true).
+  mutate.acquireExecutionLease = async () => ({
+    release: async () => {},
+    isLost: () => { isLostCalls++; return isLostCalls > stateCommitIndex + 2; },
+    lostReason: () => "simulated: lost strictly between the top-of-loop check and the post-commit recovery block's own synthetic succeeded-event append",
+    onLost: () => {},
+  });
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lease");
+  assert.equal(appendEventCalls, 0, "the recovery block's own synthetic succeeded event is never appended once the lease is known lost, even though current.json/topology.json/the snapshot all already independently confirm the commit landed");
+  await rm(scratchDir, { recursive: true, force: true });
+});
+
+// Item 9 FIFTH review fix (finding 3): the test above only covers the
+// recovery block's FIRST synthetic-succeeded path (current.json/
+// topology.json/the snapshot ALL already match - the whole commit
+// landed, only the event was lost). A further review found the SECOND
+// synthetic-succeeded path - reached when only the immutable snapshot
+// matches (current.json/topology.json are still one generation behind -
+// the crash window between the snapshot's own atomic publish and the
+// two mutable pointer writes, see ansible/roles/state/tasks/main.yml's
+// own comment), which re-dispatches state.commit for real and THEN
+// appends its own synthetic succeeded event - was never separately
+// exercised at all. This test builds exactly that: the snapshot for the
+// new generation is already published, but current.json/topology.json
+// still show the OLD one; the fake dockerRun for the resulting
+// re-dispatch brings them up to date (simulating the role's own
+// idempotent pointer-write), same as a real target would.
+test("a lease lost strictly between the top-of-loop check and the post-commit recovery block's OWN RE-DISPATCH synthetic succeeded-event append stops that append too (item 9 fifth review, finding 3)", async () => {
+  const mutate = makeFakeMutate();
+  const inputDigests = await realInputDigests();
+  const installationId = "aaaaaaaa-dddd-dddd-dddd-dddddddddddd";
+  const baselineContracts = structuredClone(await loadContracts());
+  const generation = 7;
+  // The OLD, still-current pointer state - current.json/topology.json on
+  // the target have not yet been rewritten to the new generation.
+  const { current: staleCurrent, rendered: staleTopology, snapshot } = await appliedSnapshotFor({ contracts: baselineContracts, installationId, generation, inputDigests });
+
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-apply-applied-postcommit-redispatch-lease-"));
+  const manifest = YAML.parse(await readFile(examplesServices, "utf8"));
+  manifest.backup.schedule = "10:15";
+  const manifestPath = path.join(scratchDir, "services.yml");
+  await writeFile(manifestPath, YAML.stringify(manifest));
+  const inputDigestsHere = { ...inputDigests, manifestDigest: sha256(await readFile(manifestPath)) };
+
+  let dispatchCount = 0;
+  const options = baseApplyOptions({
+    mutate, manifestPath, inspect: async () => snapshot,
+    // The ONLY dispatch this whole scenario ever makes is state.commit's
+    // own re-dispatch (every other operation already has a "succeeded"
+    // event and takes the skip fast path) - simulates the role's own
+    // idempotent pointer writes finally landing.
+    dockerRun: async () => {
+      dispatchCount++;
+      mutate.state.current = newCurrent;
+      mutate.state.topology = newTopology;
+      return { stdout: "", stderr: "" };
+    },
+  });
+  const { plan } = await computeApprovedPlan(options);
+  assert.ok(plan.operations.length > 0);
+
+  const operationId = "dddddddd-2222-2222-2222-222222222222";
+  mutate.state.lock = { apiVersion: "hof.dev/operation-lock/v1", operationId, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-08-27T09:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  mutate.state.journals.set(operationId, {
+    apiVersion: "hof.dev/operation-journal/v1", operationId, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests: inputDigestsHere, startedAt: "2026-08-27T09:00:00Z", status: "in-progress", committedGeneration: null,
+  });
+  const stateCommitOp = plan.operations.find((op) => op.action === "state.commit");
+  const stateCommitIndex = plan.operations.findIndex((op) => op.action === "state.commit");
+  const otherOps = plan.operations.filter((op) => op.action !== "state.commit");
+  mutate.state.events.set(operationId, [
+    ...otherOps.flatMap((op) => [
+      { apiVersion: "hof.dev/operation-event/v1", operationId, step: op.id, attempt: 1, phase: "started", at: "2026-08-27T09:00:00Z" },
+      { apiVersion: "hof.dev/operation-event/v1", operationId, step: op.id, attempt: 1, phase: "succeeded", at: "2026-08-27T09:00:01Z" },
+    ]),
+    { apiVersion: "hof.dev/operation-event/v1", operationId, step: stateCommitOp.id, attempt: 1, phase: "started", at: "2026-08-27T09:01:00Z" },
+  ]);
+
+  const newGeneration = generation + 1;
+  const { current: newCurrent, topology: newTopology } = await appliedCommittedStateFor({
+    contracts: { ...baselineContracts, manifest }, plan, operationId, installationId, generation: newGeneration, inputDigests: inputDigestsHere,
+  });
+  // The immutable snapshot for the NEW generation is already published in
+  // full - but the two mutable pointers still show the OLD one, exactly
+  // the recoverable "snapshotMatches only" window this branch exists
+  // for. generationSnapshotTopologies needs its own explicit override
+  // here: makeFakeMutate()'s own readGenerationSnapshotTopology() falls
+  // back to the CURRENT mutable state.topology when no override is set
+  // for a generation (a convenience default every other snapshot-based
+  // test in this file relies on, since their own mutable/immutable
+  // topology always agree) - here they deliberately do NOT agree yet, so
+  // the immutable snapshot's own topology must be recorded independently
+  // or the fallback would wrongly report it as still matching the STALE
+  // pointer.
+  mutate.state.generationSnapshots.set(newGeneration, newCurrent);
+  mutate.state.generationSnapshotTopologies.set(newGeneration, newTopology);
+  mutate.state.current = staleCurrent;
+  mutate.state.topology = staleTopology;
+
+  let appendEventCalls = 0;
+  const realAppendEvent = mutate.appendEvent.bind(mutate);
+  mutate.appendEvent = async (...args) => { appendEventCalls++; return realAppendEvent(...args); };
+
+  let isLostCalls = 0;
+  // Call #1: runApply()'s own immediately-after-acquisition check. Calls
+  // #2..#(stateCommitIndex+1): each prior (skip-fated) operation's own
+  // top-of-loop check. Call #(stateCommitIndex+2): state.commit's own
+  // top-of-loop check - must stay healthy to enter the recovery block.
+  // Call #(stateCommitIndex+3): the check immediately before THIS
+  // branch's own re-dispatch (item 9 third review, finding 3) - must
+  // ALSO stay healthy, or the re-dispatch (and this test's own target
+  // scenario) never happens at all. Only the call AFTER that - right
+  // before the re-dispatch's own synthetic succeeded-event append - ever
+  // reports lost.
+  mutate.acquireExecutionLease = async () => ({
+    release: async () => {},
+    isLost: () => { isLostCalls++; return isLostCalls > stateCommitIndex + 3; },
+    lostReason: () => "simulated: lost strictly between the re-dispatch and its own synthetic succeeded-event append",
+    onLost: () => {},
+  });
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lease");
+  assert.equal(dispatchCount, 1, "fixture check: state.commit WAS actually re-dispatched (the lease was still healthy for the check guarding that) - this test isolates the LATER append check specifically");
+  assert.equal(appendEventCalls, 0, "the re-dispatch's own synthetic succeeded event is never appended once the lease is known lost, even though the re-dispatch itself already durably committed for real");
   await rm(scratchDir, { recursive: true, force: true });
 });
 

@@ -296,6 +296,12 @@
             "rollbackCompatible": { "type": "boolean" }
           }
         },
+        "secrets": {
+          "description": "Only for secret.ensure (item 9 review, finding 6) - the exact, sorted set of secret names this operation is approved to (re)deliver to the target. A bootstrap lists every required secret (first install); an applied plan lists ONLY the secrets consumed by units this plan actually starts/restarts/migrates, so an unrelated applied change (a backup-schedule edit, say) can never silently overwrite a live secret whose consumers this plan never touches. apply.mjs delivers exactly this subset and no more. An empty array is legitimate (an applied change touching no secret-consuming unit).",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        },
         "reason": { "type": "string" }
       }
     }

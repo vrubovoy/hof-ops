@@ -8,9 +8,9 @@ composeTemplate: scripts/render-topology.mjs
 # why its tag is ee-vX.Y.Z, never plain vX.Y.Z.
 ansibleEnvironment:
   repository: vrubovoy/hof-ops
-  version: 0.1.5
-  image: ghcr.io/vrubovoy/hof-ops-ee:v0.1.5
-  workflowIdentity: https://github.com/vrubovoy/hof-ops/.github/workflows/execution-environment.yml@refs/tags/ee-v0.1.5
+  version: 0.1.6
+  image: ghcr.io/vrubovoy/hof-ops-ee:v0.1.6
+  workflowIdentity: https://github.com/vrubovoy/hof-ops/.github/workflows/execution-environment.yml@refs/tags/ee-v0.1.6
   oidcIssuer: https://token.actions.githubusercontent.com
   requiredChecks: [ansible]
 components:

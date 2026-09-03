@@ -12,11 +12,32 @@ import YAML from "yaml";
 
 import { loadContracts, validateContracts } from "./contracts.mjs";
 import { sha256 as digest } from "./digest.mjs";
-import { enabledServiceIds, renderTopology } from "./render-topology.mjs";
+import { enabledServiceIds, HOF_NETWORK_NAME, renderTopology, WACHTER_INTERNAL_NETWORK_NAME } from "./render-topology.mjs";
 import { generateSecretValue, requiredSecrets, vapidPublicKeyFor } from "./secrets.mjs";
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+// Item 9 review (network lifecycle finding): render-topology.mjs's own
+// two networks are now `external: true`, referencing a fixed physical
+// name a real apply's own Ansible network role creates before Compose
+// ever runs (see that role's own comment on why - Compose must never
+// create, update, or reconcile them itself). This matrix has no
+// Ansible role at all - it drives `docker compose` directly - so it
+// must create the same physical networks itself, exactly once per run
+// (every fixture below still gets its own uniquely-named Compose
+// PROJECT - hof-gate6-<fixtureId> - but they run strictly sequentially,
+// never concurrently, so sharing these two real network objects across
+// fixtures is safe and mirrors how one real target's own long-lived
+// networks are shared across every real apply against it).
+async function ensureNetwork(name) {
+  await exec("docker", ["network", "create", name]).catch((error) => {
+    if (!/already exists/.test(error.stderr ?? "")) throw error;
+  });
+}
+async function removeNetwork(name) {
+  await exec("docker", ["network", "rm", name]).catch(() => {});
+}
 
 function parseArgs(argv) {
   const args = { lock: "examples/release-lock.json", runtime: false };
@@ -54,6 +75,12 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
   }
 
   const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "hof-gate6-"));
+  // Only needed once real containers actually run (`docker compose run`/
+  // `up`) - `config`/`config --images` are static, offline checks that
+  // never touch a real network at all, and the non-runtime matrix
+  // (`pnpm integration`, no `--runtime`) has no docker daemon
+  // requirement to preserve.
+  if (runtime) await ensureNetwork(HOF_NETWORK_NAME);
   try {
     for (const fixtureName of fixtureNames) {
       const manifest = YAML.parse(await readFile(path.join(fixtureDirectory, fixtureName), "utf8"));
@@ -164,6 +191,13 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
         await Promise.all(Object.entries(secretValues).map(([name, value]) => writeFile(path.join(secretsDirectory, name), value, { mode: 0o644 })));
         environment.HOF_SECRETS_DIR = secretsDirectory;
 
+        // Only this fixture's own wachter-agent/wachter reference it
+        // (compose.networks["wachter-internal"] only exists at all when
+        // Wachter is enabled - see render-topology.mjs) - created and
+        // torn down per-fixture, unlike the shared "hof" network above,
+        // since which fixture needs it varies.
+        if (compose.services["wachter-agent"]) await ensureNetwork(WACHTER_INTERNAL_NETWORK_NAME);
+
         await dockerCompose(composePath, compose.name, ["pull", "--quiet"], environment);
         // render-topology.mjs now renders MIGRATE_ON_STARTUP=false - a
         // fresh volume's schema is only ever brought current by an
@@ -193,12 +227,14 @@ export async function runIntegrationMatrix({ lock: lockPath, runtime }) {
           throw new Error(`${fixtureName}: services did not become healthy\n${logs}\n${error.message}`);
         } finally {
           await dockerCompose(composePath, compose.name, ["down", "--remove-orphans", "--volumes"], environment);
+          if (compose.services["wachter-agent"]) await removeNetwork(WACHTER_INTERNAL_NETWORK_NAME);
         }
       }
       console.log(`${fixtureName}: pinned Compose ${runtime ? "config/runtime" : "config"} contract passed`);
     }
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
+    if (runtime) await removeNetwork(HOF_NETWORK_NAME);
   }
 }
 

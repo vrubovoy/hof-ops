@@ -109,17 +109,22 @@ import { loadAndValidateDeployment } from "../scripts/validate-deployment.mjs";
 
 const RECOVERY_AGE_RECIPIENT = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
 // The real platform release this test downloads and applies - see
-// releases/0.2.0.yml (reuses releases/0.1.4.yml's own app-component
-// selections unchanged; only ansibleEnvironment moves to ee-v0.1.4, item
-// 9's own real, independently-verified cut - PR #53 - baking in the new
-// service-role start|stop|remove actions and the state role's own
-// immutable per-generation snapshots this file's own applied-lifecycle
-// half below exercises for real). `workflow_dispatch` signs with the
-// DISPATCHING branch's own ref, never a tag (confirmed for real by
-// inspecting the v0.1.1 release's own certificate - `@refs/heads/main`,
-// not `@refs/tags/v0.1.1`), unlike execution-environment.yml's own
-// tag-triggered identity below.
-const RELEASE_VERSION = "0.2.0";
+// releases/0.2.1.yml (reuses releases/0.2.0.yml's own app-component
+// selections unchanged; only ansibleEnvironment moves to ee-v0.1.5,
+// item 9's own five review rounds - PR #57 - baking in the process-
+// lifetime execution lease, the Wachter startup-ordering fix, and every
+// other real, independently-verified fix that PR's own five ADR 0005
+// errata sections document). Verification PR: 0.2.0's own release-lock
+// pinned the pre-PR-#57 composeTemplateDigest, which PR #57's own
+// Wachter-ordering fix (a compose.services insertion-order change)
+// broke - apply's own supply-chain check correctly refused to run this
+// file's real acceptance against the stale release, exactly as
+// intended; this bump is what re-pins it. `workflow_dispatch` signs
+// with the DISPATCHING branch's own ref, never a tag (confirmed for
+// real by inspecting the v0.1.1 release's own certificate -
+// `@refs/heads/main`, not `@refs/tags/v0.1.1`), unlike
+// execution-environment.yml's own tag-triggered identity below.
+const RELEASE_VERSION = "0.2.1";
 const RELEASE_LOCK_IDENTITY = "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/heads/main";
 
 const exec = promisify(execFile);
@@ -134,14 +139,20 @@ const networkName = `hof-apply-acceptance-${randomUUID()}`;
 // Environment image builds" CI check already runs), used ONLY via
 // apply.mjs's own executionEnvironmentImageOverride seam for the two
 // scenarios below that specifically need the FIXED state role's real
-// atomic-publish/retry behavior - ee-v0.1.4, the real, published image
-// every other scenario in this file still uses unmodified, does not
-// have that fix baked in yet (it's an Ansible role, baked in at image-
-// build time, not a control-plane script). Every other new scenario
-// below (the execution lease, secret scoping, Wächter ordering) is
-// entirely control-plane code (scripts/, never ansible/roles/) and
-// needs no override at all - it runs against the real, published,
-// signed image, same as the rest of this file.
+// atomic-publish/retry behavior. This seam predates ee-v0.1.5 - at the
+// time it was written, ee-v0.1.4 (the real, published image every other
+// scenario in this file used) did not have that fix baked in yet (it's
+// an Ansible role, baked in at image-build time, not a control-plane
+// script). Verification PR (0.2.1/ee-v0.1.5): the real, published image
+// now DOES have it too, since it's built from the exact same
+// ansible/roles/state/tasks/main.yml this working tree's own local
+// build reads - making this override strictly redundant for those two
+// scenarios specifically. Left as-is here: removing it is a real
+// simplification, but out of scope for this narrow release-version
+// bump. Every other new scenario below (the execution lease, secret
+// scoping, Wächter ordering) is entirely control-plane code (scripts/,
+// never ansible/roles/) and needs no override at all - it runs against
+// the real, published, signed image, same as the rest of this file.
 const localEeImageTag = "hof-ops-apply-acceptance-local-ee:test";
 
 let workDir;
@@ -367,7 +378,7 @@ async function readCurrentState() {
   return JSON.parse(await onTarget("cat", "/var/lib/hof/state/current.json"));
 }
 
-test("a real, full bootstrap apply against the real, published, signed v0.2.0 release, then a real applied-mode reconciliation lifecycle against the same target - every real role, start to finish, generation 1 through 4", async () => {
+test("a real, full bootstrap apply against the real, published, signed v0.2.1 release, then a real applied-mode reconciliation lifecycle against the same target - every real role, start to finish, generation 1 through 4", async () => {
   // The real operator workflow, exercised for real: a genuine `hofctl
   // plan` run (real inspectTarget() over the real SSH transport this
   // whole fixture already sets up, real cosign verification of the

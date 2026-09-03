@@ -264,11 +264,31 @@ function computeUpgradeBlockers(baseline, desired, update, catalog) {
     if (!service.database) continue;
     const wasEnabled = baseline.services[service.id]?.enabled === true;
     const stillEnabled = desired.services[service.id]?.enabled === true;
-    if (!wasEnabled || !stillEnabled) continue;
-    const baselineSchema = baseline.services[service.id]?.schemaVersion ?? null;
     const desiredSchema = desired.services[service.id]?.schemaVersion ?? null;
-    if (baselineSchema !== null && desiredSchema !== null && baselineSchema !== desiredSchema) {
-      blockers.push(`${service.id}: schema version change (${baselineSchema} -> ${desiredSchema}) on an already-enabled service is out of item 9's own scope - see ADR 0005, items 10-11`);
+    if (wasEnabled && stillEnabled) {
+      const baselineSchema = baseline.services[service.id]?.schemaVersion ?? null;
+      if (baselineSchema !== null && desiredSchema !== null && baselineSchema !== desiredSchema) {
+        blockers.push(`${service.id}: schema version change (${baselineSchema} -> ${desiredSchema}) on an already-enabled service is out of item 9's own scope - see ADR 0005, items 10-11`);
+      }
+      continue;
+    }
+    // Item 9 review fix (finding 5): re-enabling a service from a RETAINED
+    // disable when its recorded retained schema version does NOT match
+    // what's now desired. servicesNeedingMigration() only skips migration
+    // for a retained re-enable when the two versions already agree; a
+    // mismatch falls straight through and migrationOperations() emits an
+    // EXECUTABLE database.migrate with reason "initialize database"
+    // (wasEnabled is false, so its own from/to schema-skip guard never
+    // fires) - which would run a fresh-install migration against real,
+    // still-existing retained data that sits at a different schema. That
+    // is a genuine data migration and belongs to items 10-11, exactly like
+    // the enabled->enabled case just above. Block it here, before
+    // migrationOperations() ever runs.
+    if (!wasEnabled && stillEnabled) {
+      const retained = baseline.retainedServices?.[service.id];
+      if (retained && desiredSchema !== null && retained.schemaVersion !== desiredSchema) {
+        blockers.push(`${service.id}: re-enabling a retained service whose recorded schema version (${retained.schemaVersion}) does not match the desired schema version (${desiredSchema}) would migrate real retained data - out of item 9's own scope, see ADR 0005, items 10-11`);
+      }
     }
   }
   return blockers;
@@ -395,13 +415,28 @@ function migrationOperations(baseline, desired, desiredRendered, needing) {
 // removal path AND the migration path (never in item 9's own action
 // whitelist - see scripts/applied-actions.mjs and ADR 0005) - real
 // again once items 10-11 relax it.
-function buildOperations({ baseline, desired, create, update, remove, migrations, catalog, missingVolumes, missingNetworks, generatedDriftToRepair }) {
+function buildOperations({ baseline, desired, create, update, remove, migrations, catalog, missingVolumes, missingNetworks, generatedDriftToRepair, secretsByUnit, allSecretNames }) {
   const operations = [];
   let sequence = 0;
   const next = (id, phase, action, resource, rest) => {
     sequence += 1;
     operations.push({ id: `${String(sequence).padStart(3, "0")}.${id}`, phase, action, resource, ...rest });
   };
+
+  // Item 9 review fix (finding 6): the exact set of secret names this
+  // plan's own secret.ensure is approved to (re)deliver. A bootstrap
+  // delivers every required secret (first install). An applied plan
+  // delivers ONLY the secrets consumed by units it actually starts,
+  // restarts, or migrates ([...create, ...update] already covers every
+  // such unit, including a migration's own component - see
+  // foldMigrationOnlyIntoUpdates) - so an unrelated applied change (a
+  // backup-schedule edit, a config-only tweak elsewhere) can never
+  // silently overwrite a live secret whose consumers this plan never
+  // touches, leaving them split across old and new values with no
+  // coordinated restart.
+  const scopedSecretNames = baseline.mode === "bootstrap"
+    ? [...allSecretNames].sort()
+    : [...new Set([...create, ...update].flatMap((entry) => secretsByUnit.get(entry.unit) ?? []))].sort();
 
   // topologyDigest covers backup schedule/retention/destinations and
   // anything else renderTopology() produces with no per-unit Compose
@@ -418,8 +453,18 @@ function buildOperations({ baseline, desired, create, update, remove, migrations
     // Idempotent either way (the secret role's own copy loop over an
     // unchanged map is simply a no-op) - unconditional on anyChange for
     // BOTH modes now, not just bootstrap, so a newly-enabled service
-    // that needs its own secret actually gets it.
-    next("secret.ensure", "secret", "secret.ensure", "secrets.sops.yaml", { reason: baseline.mode === "bootstrap" ? "first successful apply for this installation" : "keep every required secret current, including any this change newly needs" });
+    // that needs its own secret actually gets it. `secrets` scopes
+    // exactly which values apply is approved to deliver (finding 6) - an
+    // empty list on an applied change that restarts no secret-consuming
+    // unit is legitimate and makes this a genuine no-op.
+    next("secret.ensure", "secret", "secret.ensure", "secrets.sops.yaml", {
+      secrets: scopedSecretNames,
+      reason: baseline.mode === "bootstrap"
+        ? "first successful apply for this installation"
+        : scopedSecretNames.length > 0
+          ? "deliver the secrets consumed by the units this change starts or restarts"
+          : "no secret-consuming unit is started or restarted by this change - nothing to deliver",
+    });
   }
 
   const newVolumes = desired.volumes.filter((volume) => !baseline.volumes.includes(volume));
@@ -569,9 +614,20 @@ export function buildPlan({ baseline, desiredRendered, manifest, releaseLock, ca
   const { operations: migrations, blockers: migrationBlockers, warnings: migrationWarnings } =
     migrationOperations(baseline, desired, desiredRendered, needingMigration);
 
+  // Item 9 review fix (finding 6): unit -> secret names it consumes,
+  // straight from the rendered Compose (wireSecret() adds each name to
+  // the service's own `secrets:` list - see render-topology.mjs), so
+  // buildOperations can scope secret.ensure to exactly the units this
+  // plan restarts. allSecretNames is every file-based secret this
+  // rendered topology declares.
+  const secretsByUnit = new Map(
+    Object.entries(desiredRendered.compose?.services ?? {}).map(([unit, definition]) => [unit, definition.secrets ?? []]),
+  );
+  const allSecretNames = Object.keys(desiredRendered.compose?.secrets ?? {});
+
   const operations = buildOperations({
     baseline, desired, create, update, remove, migrations, catalog,
-    missingVolumes, missingNetworks, generatedDriftToRepair,
+    missingVolumes, missingNetworks, generatedDriftToRepair, secretsByUnit, allSecretNames,
   });
   const migrateCount = operations.filter((operation) => operation.action === "database.migrate").length;
 

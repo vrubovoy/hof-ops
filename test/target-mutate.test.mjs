@@ -23,7 +23,7 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { acquireLock, acquireLockAndJournal, appendEvent, readCurrentState, readEvents, readGenerationSnapshot, readJournal, readLock, readTopology, releaseLock, updateJournalStatus, writeJournal } from "../scripts/target-mutate.mjs";
+import { acquireExecutionLease, acquireLock, acquireLockAndJournal, appendEvent, readCurrentState, readEvents, readGenerationSnapshot, readGenerationSnapshotReleaseLock, readGenerationSnapshotTopology, readJournal, readLock, readTopology, releaseLock, updateJournalStatus, writeJournal } from "../scripts/target-mutate.mjs";
 
 const exec = promisify(execFile);
 
@@ -301,6 +301,285 @@ test("readGenerationSnapshot: refuses a non-positive-integer generation before e
   await assert.rejects(() => readGenerationSnapshot({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run }, 0), /positive integer/);
   await assert.rejects(() => readGenerationSnapshot({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run }, 1.5), /positive integer/);
   await assert.rejects(() => readGenerationSnapshot({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run }, "3; rm -rf /"), /positive integer/);
+});
+
+// Item 9 review fix (finding 8): the same generation snapshot directory's
+// other two files - a corrupt/missing topology.json or release-lock.json
+// used to pass unnoticed when only state.json was ever confirmed.
+test("readGenerationSnapshotTopology/readGenerationSnapshotReleaseLock: present/absent both parse, targeting the same generation directory's other two files", async () => {
+  const topology = { compose: { services: {} }, caddyfile: "", topology: {}, backup: {} };
+  const { run: topoRun, calls: topoCalls } = mockRun({ sshStdout: `HOF_MUTATE_PRESENT\n${JSON.stringify(topology)}` });
+  const presentTopology = await readGenerationSnapshotTopology({ ...SSH_TARGET, run: topoRun }, 3);
+  assert.deepEqual(presentTopology, { status: "present", topology });
+  assert.match(topoCalls.find((c) => c.command === "ssh").input, /\/var\/lib\/hof\/state\/generations\/000003\/topology\.json/);
+  const absentTopology = await readGenerationSnapshotTopology({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run }, 3);
+  assert.deepEqual(absentTopology, { status: "absent", topology: null });
+
+  const releaseLock = { apiVersion: "hof.dev/release-lock/v1", release: "1.0.0" };
+  const { run: lockRun, calls: lockCalls } = mockRun({ sshStdout: `HOF_MUTATE_PRESENT\n${JSON.stringify(releaseLock)}` });
+  const presentLock = await readGenerationSnapshotReleaseLock({ ...SSH_TARGET, run: lockRun }, 3);
+  assert.deepEqual(presentLock, { status: "present", releaseLock });
+  assert.match(lockCalls.find((c) => c.command === "ssh").input, /\/var\/lib\/hof\/state\/generations\/000003\/release-lock\.json/);
+  const absentLock = await readGenerationSnapshotReleaseLock({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run }, 3);
+  assert.deepEqual(absentLock, { status: "absent", releaseLock: null });
+});
+
+// Item 9 review fix (finding 3): acquireExecutionLease's own shape and
+// branching, with a fake, in-memory `spawnFn` (this function talks to a
+// long-lived streaming child, not the shared one-shot `run` seam every
+// other function here uses - see its own comment on why it takes its own
+// seam). The mechanism this was actually redesigned around three times
+// over (stdin-EOF release, then a heartbeat with a bounded remote
+// timeout, after sudo's own session-isolation of signals and a slow real
+// transport teardown were both found live against a genuine sudo-enabled
+// sshd target - not something a fake spawn could ever have caught) is
+// deliberately NOT re-asserted here; that real behavior is the transport
+// layer's job, exercised for real, not mocked twice.
+// scriptedStdout is delivered the instant something actually subscribes
+// to "data" on stdout, not before - acquireExecutionLease() is async and
+// reaches that subscription only after its own await chain (pinning
+// known_hosts via a real ssh-keyscan round trip, in ssh mode) resolves,
+// so firing eagerly (immediately after calling acquireExecutionLease())
+// races that setup and can arrive before anyone is listening - a real
+// bug this file's own first draft hit, the response silently lost and
+// the test hanging until the runner cancelled it.
+// emitExit(code, signal)/emitError(error)/emitStdinError(error) let a
+// test drive this fake's own lifecycle AFTER acquisition too (a second
+// review's own "post-acquisition lease loss", "stdin error", and
+// "confirmation timeout" cases all need the fake child to keep behaving
+// like a real one well past the point acquireExecutionLease()'s own
+// returned promise has already resolved).
+function fakeChild(scriptedStdout) {
+  const listeners = { stdout: [], stderr: [], error: [], exit: [] };
+  const stdinListeners = { error: [] };
+  const child = {
+    stdin: {
+      written: [], ended: false,
+      write(chunk) { this.written.push(chunk); },
+      // A real `sh -s` reaching real end-of-input exits on its own too -
+      // fired on a microtask (item 9 THIRD review fix: was fully
+      // synchronous, which let a call to end() emit "exit" before a
+      // listener registered immediately AFTER that same end() call - in
+      // particular release()'s own internal `child.once("exit", ...)`,
+      // registered the line right after it calls child.stdin.end() -
+      // could ever see it, silently falling all the way through to the
+      // 5s/3s SIGTERM/SIGKILL fallback below instead. A microtask still
+      // never makes a test wait out any real timer (it fires before this
+      // same turn's I/O/timer phases run at all), but - like a real
+      // process's own genuinely async exit - it fires AFTER the
+      // synchronous call to end() has fully returned, so a listener
+      // registered by the very next line of caller code (exactly
+      // release()'s own pattern) is already in place in time.
+      end() { this.ended = true; queueMicrotask(() => child.emitExit(0, null)); },
+      on(event, fn) { if (event === "error") stdinListeners.error.push(fn); },
+      emitError(error) { for (const fn of stdinListeners.error) fn(error); },
+    },
+    stdout: {
+      on(event, fn) {
+        if (event !== "data") return;
+        listeners.stdout.push(fn);
+        if (scriptedStdout) fn(Buffer.from(scriptedStdout));
+      },
+      // Lets a test deliver a chunk of its own choosing, at a moment of
+      // its own choosing (unlike the constructor's own scriptedStdout,
+      // fired once, synchronously, during on() registration itself) -
+      // needed to simulate a HOF_LEASE_HELD chunk that was already
+      // buffered/in flight, arriving AFTER some other event a test wants
+      // to fire first (see the item 9 fourth review's own stdin-error-
+      // before-acquisition test below).
+      emitStdout(chunk) { for (const fn of listeners.stdout) fn(Buffer.from(chunk)); },
+    },
+    stderr: { on(event, fn) { if (event === "data") listeners.stderr.push(fn); } },
+    on(event, fn) { listeners[event]?.push(fn); },
+    once(event, fn) { listeners[event]?.push(fn); },
+    // A real kill() eventually produces a real "exit" event too - fired
+    // synchronously here for the same reason .end() above is, so a test
+    // exercising release()'s own SIGTERM/SIGKILL fallback (a child that
+    // never exits any other way) never has to wait out a real timer.
+    kill(signal) { if (child.exitCode === null && child.signalCode === null) child.emitExit(null, signal ?? "SIGTERM"); },
+    exitCode: null, signalCode: null,
+    emitExit(code, signal) {
+      if (child.exitCode !== null || child.signalCode !== null) return; // a real process only ever exits once
+      child.exitCode = code;
+      child.signalCode = signal ?? null;
+      for (const fn of listeners.exit) fn(code, signal ?? null);
+    },
+    emitError(error) { for (const fn of listeners.error) fn(error); },
+  };
+  return child;
+}
+
+test("acquireExecutionLease: HOF_LEASE_HELD resolves with a release() that ends the child's own stdin (never a signal - see this function's own comment on why a signal alone is not trustworthy under sudo)", async () => {
+  let spawnedArgs;
+  const child = fakeChild("HOF_LEASE_HELD\n");
+  const spawnFn = (command, args) => { spawnedArgs = { command, args }; return child; };
+  const { run } = mockRun({ sshStdout: "" }); // only ssh-keyscan is ever routed through run() here - the long-lived child goes through spawnFn
+  const { release } = await acquireExecutionLease({ ...SSH_TARGET, run }, spawnFn);
+  assert.equal(spawnedArgs.command, "ssh");
+  assert.ok(spawnedArgs.args.includes("sudo") && spawnedArgs.args.includes("sh") && spawnedArgs.args.includes("-s"));
+  assert.match(child.stdin.written.join(""), /flock -n -x 9/);
+  assert.equal(child.stdin.ended, false, "stdin is deliberately left open while the lease is held");
+  // The fake child never exits on its own, so release()'s own internal
+  // wait-for-exit would otherwise hang for its full fallback timeout -
+  // racing it against a short timer is enough to confirm the one thing
+  // this test cares about: release() ends stdin immediately, well before
+  // any fallback signal.
+  await Promise.race([release(), new Promise((resolve) => setTimeout(resolve, 50))]);
+  assert.equal(child.stdin.ended, true, "release() ends stdin");
+});
+
+test("acquireExecutionLease: HOF_LEASE_BUSY rejects with a clear message and releases (ends stdin) rather than leaving the busy child dangling", async () => {
+  const child = fakeChild("HOF_LEASE_BUSY\n");
+  const spawnFn = () => child;
+  const { run } = mockRun({ sshStdout: "" });
+  await assert.rejects(acquireExecutionLease({ ...SSH_TARGET, run }, spawnFn), /already holds the execution lease/);
+  assert.equal(child.stdin.ended, true, "the busy branch's own release still ends stdin, even though the remote side already exited on its own");
+});
+
+test("acquireExecutionLease: local mode runs `sudo -n sh -s` directly, no SSH/known_hosts machinery", async () => {
+  let spawnedArgs;
+  const child = fakeChild("HOF_LEASE_HELD\n");
+  const spawnFn = (command, args) => { spawnedArgs = { command, args }; return child; };
+  await acquireExecutionLease({ mode: "local" }, spawnFn);
+  assert.deepEqual(spawnedArgs, { command: "sudo", args: ["-n", "sh", "-s"] });
+});
+
+// A second review found the original version of this function fail-OPEN
+// after acquisition: HOF_LEASE_HELD resolved the promise, `settled`
+// latched true, and the SAME child's own later exit/error - a genuine
+// loss of the lease - was silently discarded by the guard built only to
+// stop the acquisition promise settling twice. Fixed: isLost()/
+// lostReason()/onLost() surface exactly that, for a caller (apply.mjs's
+// own dispatch loop) to check before every further mutation.
+test("acquireExecutionLease: a lease loss discovered AFTER acquisition (the child exits unexpectedly, never through release()) is recorded and broadcast, not silently discarded", async () => {
+  const child = fakeChild("HOF_LEASE_HELD\n");
+  const spawnFn = () => child;
+  const { run } = mockRun({ sshStdout: "" });
+  const lease = await acquireExecutionLease({ ...SSH_TARGET, run }, spawnFn);
+  assert.equal(lease.isLost(), false, "not lost immediately after a clean acquisition");
+
+  const observed = [];
+  lease.onLost((reason) => observed.push(reason));
+  child.emitExit(1, null); // the remote helper died on its own - never released
+  assert.equal(lease.isLost(), true);
+  assert.match(lease.lostReason(), /exited unexpectedly/);
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0], lease.lostReason());
+});
+
+test("acquireExecutionLease: a lease loss discovered via a child-level error event (not just exit) is recorded the same way", async () => {
+  const child = fakeChild("HOF_LEASE_HELD\n");
+  const spawnFn = () => child;
+  const { run } = mockRun({ sshStdout: "" });
+  const lease = await acquireExecutionLease({ ...SSH_TARGET, run }, spawnFn);
+  child.emitError(new Error("ECONNRESET"));
+  assert.equal(lease.isLost(), true);
+  assert.match(lease.lostReason(), /ECONNRESET/);
+});
+
+test("acquireExecutionLease: release() is never mistaken for an unexpected loss - the exit release() itself triggers must not call onLost", async () => {
+  const child = fakeChild("HOF_LEASE_HELD\n");
+  const spawnFn = () => child;
+  const { run } = mockRun({ sshStdout: "" });
+  const lease = await acquireExecutionLease({ ...SSH_TARGET, run }, spawnFn);
+  const observed = [];
+  lease.onLost((reason) => observed.push(reason));
+  // release() itself ends stdin, which this fake treats as a real clean
+  // shutdown and fires a real "exit" event for, same as a real `sh -s`
+  // reaching end-of-input would - exactly the exit release() itself
+  // must never mistake for an unexpected loss.
+  await lease.release();
+  assert.equal(lease.isLost(), false, "a voluntary release is never reported as a loss");
+  assert.equal(observed.length, 0);
+});
+
+// A second review found child.stdin.write(".") inside the heartbeat's
+// own try/catch could not actually catch an EPIPE - a write failure on
+// a stream surfaces asynchronously as an 'error' EVENT on that stream,
+// never a thrown exception from .write() itself, so an unhandled one
+// there was free to crash the whole process.
+test("acquireExecutionLease: an error event on the child's own stdin is handled, never left to crash the process, and stops release() from double-ending it", async () => {
+  const child = fakeChild("HOF_LEASE_HELD\n");
+  const spawnFn = () => child;
+  const { run } = mockRun({ sshStdout: "" });
+  const lease = await acquireExecutionLease({ ...SSH_TARGET, run }, spawnFn);
+  child.stdin.emitError(new Error("EPIPE")); // must not throw, must not crash the process
+  // release() itself is deliberately NOT awaited here - once stdin has
+  // already errored, it can no longer end cleanly, so release() falls
+  // through to its own real SIGTERM/SIGKILL fallback timers (seconds,
+  // by design - a genuine grace period for a real remote process, not
+  // shortened for this test's own convenience). What this test actually
+  // checks is synchronous: the decision to skip a second .end() on an
+  // already-errored stream is made before release()'s own first await.
+  void lease.release();
+  assert.equal(child.stdin.ended, false, "once stdin has already errored, release() never calls .end() on it again");
+});
+
+// Item 9 FOURTH review fix (finding 1): a further review found a stdin
+// error arriving BEFORE acquisition is confirmed used to only call
+// markLost() - recording a loss, but never claiming or rejecting the
+// still-open acquisition promise itself. A HOF_LEASE_HELD chunk that was
+// already buffered/in flight could then still arrive right after, win
+// claim() in the stdout handler (never yet claimed by anything), and
+// resolve successfully - handing the caller a lease whose very first
+// isLost() check already reports true. `mode: "local"` is used
+// specifically because it has no `await` at all before the child is
+// spawned and every listener registered (unlike ssh mode's own
+// `await pinnedKnownHosts()`), so the two synchronous calls below land on
+// listeners that are already in place, in the exact order this test
+// writes them - deterministically reproducing the race rather than
+// hoping to catch it.
+// Item 9 FIFTH review fix (finding 2): a further review found the
+// previous version of this test asserted only /stdin error/ - a bare
+// substring match, present in BOTH the specific claim()-based handler
+// fix this test means to isolate AND the separate, more general
+// post-`await acquirePromise` safety net (see acquireExecutionLease()'s
+// own comment on why that second layer exists) - that safety net's own
+// message is `execution lease resolved already lost (${lostReason()})
+// - ...`, and lostReason() itself is the exact same "stdin error..."
+// string, so it ALSO satisfies a bare /stdin error/ match. Removing only
+// the claim()-based handler fix left this test green, silently testing
+// the safety net instead of the mechanism it claims to. Anchored to the
+// START of the message instead: the handler-level rejection's own
+// message begins with "stdin error..." directly; the safety net's own
+// message begins with "execution lease resolved already lost (..." -
+// only the specific fix this test names produces the former.
+test("acquireExecutionLease: a stdin error arriving BEFORE acquisition is confirmed rejects acquisition outright, even when a buffered HOF_LEASE_HELD chunk arrives right after (item 9 fourth review, finding 1)", async () => {
+  const child = fakeChild(); // no scripted stdout - acquisition is still genuinely pending
+  const spawnFn = () => child;
+  const acquiring = acquireExecutionLease({ mode: "local" }, spawnFn);
+  child.stdin.emitError(new Error("EPIPE")); // arrives first, before any HELD/BUSY
+  child.stdout.emitStdout("HOF_LEASE_HELD\n"); // a chunk that was already in flight, arriving right after
+  // A custom validator function (never a bare RegExp) - assert.rejects()
+  // tests a RegExp against String(error) ("Error: <message>"), which a
+  // `^`-anchored pattern can never match past the "Error: " prefix.
+  // error.message itself is checked directly here instead, with
+  // .startsWith() rather than another regex, for the same reason.
+  await assert.rejects(
+    acquiring,
+    (error) => error instanceof Error && error.message.startsWith("stdin error on the execution-lease helper's own connection:"),
+    "the stdin error alone must decide this acquisition, via the handler-level claim()+reject fix specifically - not merely end up rejected some OTHER way (e.g. only the separate post-await safety net) - a HOF_LEASE_HELD arriving after it must never be allowed to win",
+  );
+});
+
+// A second review found no bound at all on how long acquisition itself
+// may take - a hung connection (no HOF_LEASE_HELD/BUSY, no exit, no
+// error) left this function awaiting forever.
+test("acquireExecutionLease: a hung acquisition (neither HELD nor BUSY nor exit/error ever arrives) is bounded by executionLeaseAcquireTimeoutMs, never awaited forever", async () => {
+  const child = fakeChild(); // no scripted stdout at all - genuinely hangs
+  const spawnFn = () => child;
+  const { run } = mockRun({ sshStdout: "" });
+  const startedAt = Date.now();
+  // Bounded, not a specific wording: the timeout firing races the
+  // release() it itself triggers (which, once stdin ends, this fake
+  // treats as a real exit) - either "neither held nor busy" (the
+  // timeout's own message winning) or "exited before the lease was
+  // confirmed" (the resulting exit event winning instead) is a
+  // genuinely correct outcome of the SAME real property this test
+  // actually cares about: acquisition gave up, on its own, near the
+  // configured bound, rather than hanging forever.
+  await assert.rejects(acquireExecutionLease({ ...SSH_TARGET, run, executionLeaseAcquireTimeoutMs: 20 }, spawnFn));
+  assert.ok(Date.now() - startedAt < 2000, "must give up near the configured bound, not hang for a real, unbounded amount of time");
 });
 
 test("local mode: runs `sudo -n sh -s` directly, with no SSH/known_hosts machinery at all", async () => {

@@ -32,7 +32,7 @@
 // (unlike target-probe.sh, which must also work before that's been
 // confirmed).
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -428,17 +428,35 @@ export async function readTopology(conn) {
 // fields already enforce before this is ever called) - never accepted
 // as free-form text, the same "no caller-built shell string" discipline
 // every other path in this module follows.
-function generationSnapshotPath(generation) {
+function generationSnapshotDir(generation) {
   if (!Number.isInteger(generation) || generation < 1) {
     throw new Error(`readGenerationSnapshot requires a positive integer generation, got ${JSON.stringify(generation)}`);
   }
-  return `/var/lib/hof/state/generations/${String(generation).padStart(6, "0")}/state.json`;
+  return `/var/lib/hof/state/generations/${String(generation).padStart(6, "0")}`;
 }
 
 export async function readGenerationSnapshot(conn, generation) {
-  const stdout = await runScript(conn, readScript(generationSnapshotPath(generation)));
+  const stdout = await runScript(conn, readScript(`${generationSnapshotDir(generation)}/state.json`));
   const { status, value } = parseReadResponse(stdout);
   return { status, snapshot: value };
+}
+
+// Item 9 review fix (finding 8): recovery used to confirm ONLY the
+// per-generation snapshot's state.json - a corrupt or missing
+// topology.json/release-lock.json in the same directory could still be
+// accepted as a complete immutable record. These two readers let
+// apply.mjs's recovery paths check the whole directory, not just one
+// file of it.
+export async function readGenerationSnapshotTopology(conn, generation) {
+  const stdout = await runScript(conn, readScript(`${generationSnapshotDir(generation)}/topology.json`));
+  const { status, value } = parseReadResponse(stdout);
+  return { status, topology: value };
+}
+
+export async function readGenerationSnapshotReleaseLock(conn, generation) {
+  const stdout = await runScript(conn, readScript(`${generationSnapshotDir(generation)}/release-lock.json`));
+  const { status, value } = parseReadResponse(stdout);
+  return { status, releaseLock: value };
 }
 
 // Atomic write-then-rename (ADR 0004: "only ever atomically") - the
@@ -492,4 +510,406 @@ fi
   if (tag !== "HOF_MUTATE_PRESENT") throw new Error(`unexpected target-mutate response: ${JSON.stringify(stdout)}`);
   const body = stdout.slice(newlineIndex + 1);
   return body.split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line));
+}
+
+const EXECUTION_LEASE_PATH = "/var/lib/hof/state/exec.lease";
+
+// How often the local side writes one heartbeat byte, and how long the
+// remote side waits for the next one before giving up - see
+// acquireExecutionLease()'s own comment for why a heartbeat, not a bare
+// "block on stdin until it closes", is what this needs.
+const LEASE_HEARTBEAT_INTERVAL_MS = 10_000;
+const LEASE_HEARTBEAT_TIMEOUT_S = 30;
+
+// Item 9 review fix (finding 3): the durable lock.json is a PERSISTENCE
+// lock - it survives a crash so --resume can find an interrupted
+// operation. It is NOT a liveness lease: two `hofctl apply --resume`
+// processes both read the same lock, both see the same events, and both
+// go on to dispatch the same step. This is a PROCESS-LIFETIME execution
+// lease on top of it: a long-lived SSH (or local) child holds an
+// exclusive flock on EXECUTION_LEASE_PATH for exactly as long as this
+// apply process lives, and releases it within a bounded time of this
+// process (or its connection) actually going away.
+//
+// Three real, live rounds of validation against a real sudo-enabled
+// sshd target (a sudo NOPASSWD child, same as every other mutation in
+// this module - a fake mutate/run seam can't catch a real OS/sudo/SSH
+// interaction like the two gaps found here) drove this exact design,
+// each one a genuine bug the previous attempt did not have on paper:
+//   1. `while :; do sleep 3600; done`, meant to die when the SSH
+//      connection is closed, provably does NOT: `sudo` starts its own
+//      child in a NEW session specifically to isolate it from the
+//      invoking terminal/session's own signals, so the SIGHUP a closed
+//      channel would normally deliver never reaches it - confirmed by
+//      killing the local SSH client and finding the remote flock-holder
+//      still running, independently, minutes later.
+//   2. Blocking on the remote script's OWN stdin instead (closing it -
+//      `child.stdin.end()` - to release, relying on the underlying
+//      transport closing to propagate EOF on a crash, since `sudo`
+//      isolates signals but still faithfully connects stdin/stdout/
+//      stderr through) fixed the SIGNAL problem and made an explicit,
+//      clean release() fast (~10ms, confirmed) - but a genuine crash
+//      (this process SIGKILLed) left the remote side hanging for over a
+//      minute before the transport's own teardown was ever noticed,
+//      confirmed by timed, repeated measurement, not assumed. Prompt
+//      teardown notice depends on `sudo`, the local `ssh` client, this
+//      specific network path, and the target's own kernel all
+//      cooperating quickly - not something this module can guarantee
+//      for a real, arbitrary target.
+// Both gaps are closed the same way SSH's own ServerAliveInterval/
+// ClientAliveInterval solve this exact problem, applied at this
+// module's own application layer instead (since a real target's own
+// sshd_config - ClientAliveInterval in particular - is outside this
+// module's control): the local side writes one fixed heartbeat byte
+// every LEASE_HEARTBEAT_INTERVAL_MS; the remote side, holding the flock,
+// loops reading exactly one byte with a LEASE_HEARTBEAT_TIMEOUT_S
+// bound (`timeout N head -c 1` - portable POSIX sh, not bash's own
+// `read -t`, which Debian's default /bin/sh, dash, does not implement -
+// confirmed by hitting exactly that "Illegal option -t" before landing
+// on this). A byte arriving loops again; the read TIMING OUT (rc 124 -
+// no heartbeat within the bound, however that silence came about) or
+// hitting real EOF (rc 0, but nothing read - release() ends stdin, or
+// the connection genuinely died and something already noticed) both
+// exit the loop, ending the script, closing fd 9 and the flock with it.
+// This bounds every disconnection - clean or not - to
+// LEASE_HEARTBEAT_TIMEOUT_S, never dependent on how promptly (if ever)
+// the transport itself gets around to tearing down.
+//
+// A second concurrent apply/resume fails `flock -n` immediately and is
+// refused, WITHOUT ever entering the heartbeat loop at all (the busy
+// branch exits on its own, unconditionally, the instant it prints).
+//
+// How long acquisition itself is allowed to take before this gives up -
+// a second review found the ORIGINAL version of this function had no
+// bound here at all: a hung ssh connection (no HOF_LEASE_HELD/BUSY, no
+// exit, no error - just silence) left acquireExecutionLease() awaiting
+// forever. Generous (matches dispatchOperation()'s own EE budget
+// reasoning) since a slow but genuine connection must never be mistaken
+// for a hung one.
+const LEASE_ACQUIRE_TIMEOUT_MS = 60_000;
+
+// Returns { release, isLost, lostReason, onLost } on success. Throws on
+// contention (another live apply holds it) or a transport failure - the
+// caller turns the former into blocked("lease", ...) and must NOT
+// release the durable lock (the other process legitimately owns the
+// operation).
+//
+// Item 9 SECOND review fix: acquiring the lease once and never looking
+// at it again is fail-OPEN, not fail-closed - a further review found
+// that once HOF_LEASE_HELD resolved this function's own returned
+// promise, `settled` was already true, so the SAME child's own later
+// `exit`/`error` handlers (a genuine loss of the lease - the remote
+// heartbeat loop timed out, the ssh connection itself died, anything)
+// were silently discarded by the `if (!settled)` guard built for a
+// DIFFERENT purpose (never resolving/rejecting the acquisition promise
+// twice) - apply.mjs kept dispatching real mutations with no live lease
+// at all behind them, exactly the double-dispatch risk this whole
+// mechanism exists to prevent. Fixed: a lease loss discovered AFTER
+// acquisition (the child exits or errors, and release() was never
+// called) is now recorded (`isLost()`/`lostReason()`) and broadcast
+// (`onLost(callback)`), and apply.mjs's own dispatch loop checks it
+// before every operation and refuses to start a new one once lost (see
+// its own comment there) - fail-closed for every step this process has
+// not yet dispatched.
+//
+// This still does NOT provide true distributed fencing (a monotonic
+// token every target-side mutation independently checks before acting,
+// the textbook fix for a lease that can expire while its holder is
+// merely paused - GC, SIGSTOP, a scheduler delay - rather than actually
+// gone): building that would mean every one of the ten Ansible roles
+// itself becoming lease-aware, not just this control-plane module, and
+// is out of this fix's own scope. What this DOES close for real: the
+// operation this process already dispatched to the target cannot be
+// recalled either way (true of ANY lease design, fenced or not), but
+// this process now provably stops queuing new ones the moment it knows
+// its own lease is gone, rather than never finding out at all.
+//
+// Item 9 THIRD review fix (findings 4 & 5): two further races in this
+// same acquire/lose lifecycle, both closed below (see each one's own
+// comment at its exact fix site):
+//   4. A timeout/late-success race in the acquisition promise itself -
+//      the timeout path used to start its own async release() BEFORE
+//      marking itself settled, leaving a real window for an
+//      already-in-flight HOF_LEASE_HELD to win the race and resolve
+//      successfully with a lease this function had already begun
+//      releasing. Fixed with a synchronous claim() gate, closed the
+//      instant any one of the four settling paths starts running -
+//      never after its own async cleanup finishes.
+//   5. A stdin EPIPE used to only ever set a local `stdinErrored` flag
+//      (read by the heartbeat and by release()) and otherwise wait for
+//      the child's own, separate "exit" event to eventually call
+//      markLost() - a real gap whenever that event's own delivery lagged
+//      behind the stream error that had already, independently, proven
+//      the lease gone. markLost() is now called directly from the stdin
+//      error handler itself.
+//
+// spawnFn: a testing seam only (see test/target-mutate.test.mjs's own
+// fake spawn) - defaults to node:child_process's real spawn, exactly
+// like every other run/exec seam in this codebase; the real CLI never
+// passes it. A long-lived, streaming child (heartbeats in, output
+// watched as it arrives) can't reuse this module's own one-shot
+// runScript()/mockRun() convention, which is why this takes its own
+// seam rather than the shared `run` one.
+export async function acquireExecutionLease(conn, spawnFn = spawn) {
+  const {
+    mode, host, port, user, hostKeySha256, identityFile, connectTimeoutSeconds = 10, run = defaultRun,
+    // Overridable only so test/target-mutate.test.mjs's own timeout test
+    // doesn't have to wait out the real, generous default - the real
+    // CLI never sets this.
+    executionLeaseAcquireTimeoutMs = LEASE_ACQUIRE_TIMEOUT_MS,
+  } = conn;
+  const remote = `set -eu
+mkdir -p "$(dirname '${EXECUTION_LEASE_PATH}')"
+exec 9>'${EXECUTION_LEASE_PATH}'
+if flock -n -x 9; then
+  echo HOF_LEASE_HELD
+  while :; do
+    got=$(timeout ${LEASE_HEARTBEAT_TIMEOUT_S} head -c 1 2>/dev/null) || break
+    [ -z "$got" ] && break
+  done
+else
+  echo HOF_LEASE_BUSY
+  exit 0
+fi
+`;
+
+  let child;
+  let knownHostsCleanup = () => {};
+  if (mode === "local") {
+    child = spawnFn("sudo", ["-n", "sh", "-s"], { stdio: ["pipe", "pipe", "pipe"] });
+  } else {
+    validateSshDestination(host, user, port);
+    if (!HOST_KEY_SHA256_PATTERN.test(hostKeySha256 ?? "")) throw new Error("a pinned hostKeySha256 is required for ssh mode");
+    const { file: knownHostsFile, cleanup } = await pinnedKnownHosts({ host, port, hostKeySha256, connectTimeoutSeconds, run });
+    knownHostsCleanup = cleanup;
+    const args = [
+      ...SSH_HARDENING,
+      "-o", "StrictHostKeyChecking=yes",
+      "-o", `UserKnownHostsFile=${knownHostsFile}`,
+      "-o", "GlobalKnownHostsFile=/dev/null",
+      "-o", `ConnectTimeout=${connectTimeoutSeconds}`,
+      // A second, complementary layer to the application-level heartbeat
+      // above: if the SERVER itself stops answering (not merely quiet -
+      // genuinely down/unreachable), the local ssh client gives up and
+      // exits on its own within ~45s, rather than sitting idle
+      // indefinitely believing the lease is still held.
+      "-o", "ServerAliveInterval=15",
+      "-o", "ServerAliveCountMax=3",
+      "-p", String(port),
+      ...(identityFile ? ["-i", identityFile, "-o", "IdentitiesOnly=yes"] : []),
+      "--",
+      `${user}@${host}`,
+      "sudo", "-n", "sh", "-s",
+    ];
+    child = spawnFn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
+  }
+
+  // Moved above the stdin error handler just below (item 9 THIRD review
+  // fix, finding 5) - markLost() itself only ever touches lost/
+  // lostReasonValue/lostCallbacks/voluntarilyReleased, none of which
+  // depend on anything declared further down (release, heartbeat), so
+  // hoisting this block costs nothing and lets that handler call it
+  // directly instead of only setting a flag nothing else ever acted on
+  // promptly.
+  let voluntarilyReleased = false;
+  let lost = false;
+  let lostReasonValue = null;
+  const lostCallbacks = [];
+  const markLost = (reason) => {
+    if (lost || voluntarilyReleased) return;
+    lost = true;
+    lostReasonValue = reason;
+    for (const callback of lostCallbacks) {
+      try { callback(reason); } catch { /* a caller's own onLost callback misbehaving must never break lease bookkeeping itself */ }
+    }
+  };
+
+  // Item 9 FOURTH review fix (finding 1): claim()/settled/the acquisition
+  // promise's own resolve+reject are now set up HERE, before the stdin
+  // error handler just below - not, as a third review had it, only
+  // inside the later `new Promise((resolve, reject) => {...})` executor,
+  // which the stdin handler (registered earlier, so it can catch an
+  // error raised by the very first `child.stdin.write(remote)` call)
+  // could not reach at all. A further review found that gap real: a
+  // stdin error arriving BEFORE HOF_LEASE_HELD/BUSY used to only call
+  // markLost() - recording a loss, but neither claiming nor rejecting
+  // the still-open acquisition - so a buffered HOF_LEASE_HELD arriving
+  // right after could still win claim() farther down and resolve
+  // successfully, handing the caller a lease that reports isLost() ===
+  // true from the very first check. `acquireTimeout` is declared (but
+  // not yet assigned) before claim() too - clearTimeout(undefined) is a
+  // harmless no-op, so claim() being called before acquireTimeout exists
+  // (only possible if a stdin error fires this early, before the timer
+  // below is even armed) is always safe.
+  let settled = false;
+  let acquireTimeout;
+  const claim = () => {
+    if (settled) return false;
+    settled = true;
+    clearTimeout(acquireTimeout);
+    return true;
+  };
+  let resolveAcquire, rejectAcquire;
+  const acquirePromise = new Promise((resolve, reject) => { resolveAcquire = resolve; rejectAcquire = reject; });
+
+  // A write to a pipe whose read end (or the whole remote process) is
+  // already gone raises EPIPE asynchronously as an 'error' EVENT on the
+  // stream, not a thrown exception from .write() itself - a second
+  // review found the original try/catch around child.stdin.write(".")
+  // in the heartbeat below could not and did not catch this, leaving an
+  // unhandled stream error free to crash the whole process. Handled
+  // exactly once, here, for the stream's entire lifetime.
+  //
+  // Item 9 THIRD review fix (finding 5): this used to only set
+  // stdinErrored (read by the heartbeat interval, to stop retrying a
+  // dead pipe, and by release(), to know child.stdin.end() would itself
+  // throw) and otherwise wait for the SEPARATE child "exit" event to
+  // eventually call markLost() - a real gap: a remote process that is
+  // gone but whose own OS-level exit notification is merely delayed
+  // (nothing here promises "at the same instant" for two independent
+  // event sources on two different streams of the same child) left
+  // isLost() reporting false for that whole window, even though the
+  // stdin error had already, independently, proven the pipe - and so the
+  // lease - is gone. markLost() is now called here directly and
+  // immediately; markLost()'s own idempotency guard (lost ||
+  // voluntarilyReleased) makes the later, likely-redundant call from
+  // "exit" (if it still fires) harmless.
+  //
+  // Item 9 FOURTH review fix (finding 1): if acquisition itself has not
+  // settled yet, THIS stdin error IS the acquisition's own outcome - it
+  // now claims the promise and rejects it (after the same release()
+  // teardown every other pre-acquisition failure path already uses),
+  // exactly like the child's own "error"/"exit" handlers below already
+  // do. Without this, a stdin error arriving before HOF_LEASE_HELD only
+  // recorded a lost flag nothing yet consumed, leaving the race described
+  // above wide open. release() itself is safe to call here even though
+  // it is defined a few lines further down - this handler only ever
+  // FIRES asynchronously, well after this function's own synchronous
+  // setup (including release()'s own assignment) has completed.
+  let stdinErrored = false;
+  child.stdin.on("error", (error) => {
+    stdinErrored = true;
+    const message = `stdin error on the execution-lease helper's own connection: ${error instanceof Error ? error.message : error}`;
+    markLost(message);
+    if (claim()) {
+      release().finally(() => rejectAcquire(new Error(message)));
+    }
+  });
+
+  // Deliberately NOT ended here (unlike every other one-shot script in
+  // this module) - see this function's own top comment. The heartbeat
+  // below keeps writing to it; release() is what finally ends it.
+  child.stdin.write(remote);
+  const heartbeat = setInterval(() => {
+    if (stdinErrored) return;
+    try { child.stdin.write("."); } catch { /* the child may already be gone - release()/exit handle that */ }
+  }, LEASE_HEARTBEAT_INTERVAL_MS);
+  // Never keeps the whole Node process alive on its own - only real work
+  // (an in-flight apply run) does that; this is bookkeeping.
+  heartbeat.unref?.();
+
+  const release = async () => {
+    voluntarilyReleased = true;
+    clearInterval(heartbeat);
+    knownHostsCleanup();
+    if (child.exitCode === null && child.signalCode === null) {
+      // Sends EOF, not a signal - see this function's own top comment
+      // on why a signal alone never reliably reached a `sudo`-isolated
+      // remote child. The remote heartbeat loop notices (an EOF read
+      // there breaks it immediately, well inside its own timeout
+      // bound) and exits on its own; the SIGTERM/SIGKILL fallback
+      // below is only for the local ssh/sudo child itself, in case the
+      // remote side is somehow still not exiting promptly - never the
+      // primary release mechanism.
+      if (!stdinErrored) { try { child.stdin.end(); } catch { /* already gone */ } }
+      await new Promise((res) => {
+        const t = setTimeout(() => { child.kill("SIGTERM"); setTimeout(() => { child.kill("SIGKILL"); res(); }, 3000); }, 5000);
+        child.once("exit", () => { clearTimeout(t); res(); });
+      });
+    }
+  };
+
+  let out = "";
+  let err = "";
+  // Item 9 THIRD review fix (finding 4): claim() SYNCHRONOUSLY decides
+  // who wins the race to settle this promise, and does so the instant
+  // whichever handler runs first starts running - separated from
+  // actually calling resolve/reject, which may need to `await
+  // release()` first. The OLD code (a single `finish(fn, arg)` that
+  // checked-and-set `settled` only ONCE it was already ready to call
+  // fn(arg)) had a real gap here: the timeout path calls release()
+  // (async - clearInterval, knownHostsCleanup, then possibly an awaited
+  // child teardown) BEFORE it ever touched `settled`, leaving a real
+  // window, for the whole duration of that await, during which
+  // `settled` was still false. A HOF_LEASE_HELD chunk already in
+  // flight and delivered to the stdout "data" handler during exactly
+  // that window would see `!settled`, call its OWN finish(resolve,
+  // {...}), and WIN - resolving this call successfully with a lease
+  // object for a lease this function had already committed to
+  // releasing and was about to reject as timed out (a real,
+  // independently reachable split-brain source: the CALLER believes it
+  // holds the lease while release() is concurrently, genuinely
+  // dropping it on the target). claim() closes this: `settled` is now
+  // set (and the timeout cleared) synchronously, before ANY async work
+  // begins, on every one of the five paths now sharing it (the stdin
+  // error handler above included) - whichever one actually runs first is
+  // decided the instant it starts running (JS has no interleaving
+  // mid-callback), and every later claim() call is then a guaranteed
+  // no-op, however long that first caller's own async cleanup goes on to
+  // take.
+  acquireTimeout = setTimeout(() => {
+    if (!claim()) return;
+    const timeoutError = new Error(`execution-lease helper confirmed neither held nor busy within ${executionLeaseAcquireTimeoutMs}ms - the target may be unreachable or hung; refusing to wait indefinitely`);
+    release().finally(() => rejectAcquire(timeoutError));
+  }, executionLeaseAcquireTimeoutMs);
+
+  child.stdout.on("data", (chunk) => {
+    out += chunk.toString();
+    if (out.includes("HOF_LEASE_HELD")) {
+      if (!claim()) return;
+      resolveAcquire({
+        release,
+        isLost: () => lost,
+        lostReason: () => lostReasonValue,
+        onLost: (callback) => { lostCallbacks.push(callback); },
+      });
+    } else if (out.includes("HOF_LEASE_BUSY")) {
+      if (!claim()) return;
+      release().finally(() => rejectAcquire(new Error(`another apply process already holds the execution lease for this target (${EXECUTION_LEASE_PATH}) - refusing to run a second, concurrent apply/resume against the same host`)));
+    }
+  });
+  child.stderr.on("data", (chunk) => { err += chunk.toString(); });
+  child.on("error", (error) => {
+    clearInterval(heartbeat);
+    knownHostsCleanup();
+    if (claim()) { rejectAcquire(error); return; }
+    markLost(error instanceof Error ? error.message : String(error));
+  });
+  child.on("exit", (code, signal) => {
+    clearInterval(heartbeat);
+    knownHostsCleanup();
+    const exitError = new Error(`execution-lease helper exited before the lease was confirmed (code ${code}, signal ${signal})${err.trim() ? `: ${err.trim().split("\n").slice(-3).join("; ")}` : ""}`);
+    if (claim()) { rejectAcquire(exitError); return; }
+    markLost(`the execution-lease helper process exited unexpectedly (code ${code}, signal ${signal}) - the lease is no longer held`);
+  });
+
+  // Item 9 FOURTH review fix (finding 1): a caller must never receive a
+  // lease that is already known lost - possible if markLost() fired
+  // (post-claim, from the child's own "exit"/"error" handlers above) in
+  // the narrow window between resolveAcquire() being called and this
+  // await actually returning control here (both are plain microtask
+  // continuations, so the window is tiny, but not provably zero - a
+  // caller acting on isLost() only inside its own dispatch loop, as
+  // apply.mjs used to, is exactly the fail-open runApply() itself now
+  // additionally guards against, see its own comment on why THIS check
+  // alone is not sufficient by itself). Checked here too, as the
+  // cheapest possible place to close it for every caller at once: a
+  // lease that resolved lost is released immediately and reported as an
+  // acquisition failure, never handed back as if it were healthy.
+  const lease = await acquirePromise;
+  if (lease.isLost()) {
+    await lease.release().catch(() => {});
+    throw new Error(`execution lease resolved already lost (${lease.lostReason()}) - refusing to hand back a lease that was never actually healthy`);
+  }
+  return lease;
 }

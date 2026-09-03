@@ -14,6 +14,20 @@
       - hof_service_image is not none
     fail_msg: "service role's start action additionally requires hof_service_image"
 
+# Item 9 review fix (finding 10): stop/remove's discovery below scopes on
+# hof_installation_id - defaults/main.yml calls it mandatory for these two
+# actions and the executor always passes it, but nothing asserted it here.
+# On a regression that let it through as null, the docker ps filter
+# "label=hof.installation-id=" would match zero containers, discovery would
+# return no matches, and the role would silently commit state without ever
+# removing the container it was told to remove. Fail loudly instead.
+- name: Assert stop/remove's own required variables are present
+  when: hof_service_action in ["stop", "remove"]
+  ansible.builtin.assert:
+    that:
+      - hof_installation_id is not none
+    fail_msg: "service role's stop/remove actions additionally require hof_installation_id - discovery must scope to exactly this installation, never a null (match-anything) label"
+
 # --no-deps: scoped strictly to this one unit, exactly like this role's
 # own defaults/main.yml comment promises - every OTHER unit that needs
 # starting gets its own separate service.start operation from plan.mjs,

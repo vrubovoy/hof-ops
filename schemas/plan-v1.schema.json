@@ -209,6 +209,12 @@
             "rollbackCompatible": { "type": "boolean" }
           }
         },
+        "secrets": {
+          "description": "Only for secret.ensure (item 9 review, finding 6) - the exact, sorted set of secret names this operation is approved to (re)deliver. Bootstrap lists every required secret; an applied plan lists only those consumed by units this plan actually starts/restarts/migrates.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        },
         "reason": { "type": "string" }
       }
     }

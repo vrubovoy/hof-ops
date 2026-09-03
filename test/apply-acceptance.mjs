@@ -84,7 +84,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { after, before } from "node:test";
@@ -95,8 +95,17 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import YAML from "yaml";
 
-import { runApply } from "../scripts/apply.mjs";
+import { buildDockerRunArgs, buildExtraVars, buildInventory, computeExpectedCommittedState, runApply, withoutVolatileStateFields } from "../scripts/apply.mjs";
+import { sha256 } from "../scripts/digest.mjs";
+import { buildEvent, buildJournalDocument, buildLockDocument, currentOperator, newOperationId } from "../scripts/operation-journal.mjs";
 import { runPlan } from "../scripts/plan-command.mjs";
+import { SUPPLIED_TLS_CERTIFICATE_SECRET_NAME, SUPPLIED_TLS_PRIVATE_KEY_SECRET_NAME } from "../scripts/render-topology.mjs";
+import { generateSecretValue } from "../scripts/secrets.mjs";
+import {
+  acquireExecutionLease, acquireLockAndJournal, appendEvent, pinnedKnownHosts,
+  readCurrentState as readCurrentStateViaMutate, readGenerationSnapshot, readGenerationSnapshotReleaseLock, readGenerationSnapshotTopology, readTopology,
+} from "../scripts/target-mutate.mjs";
+import { loadAndValidateDeployment } from "../scripts/validate-deployment.mjs";
 
 const RECOVERY_AGE_RECIPIENT = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
 // The real platform release this test downloads and applies - see
@@ -119,6 +128,21 @@ const fixtureDir = path.join(root, "test/fixtures/apply-acceptance");
 const targetImageTag = "hof-ops-apply-acceptance-target:test";
 const containerName = `hof-apply-acceptance-${randomUUID()}`;
 const networkName = `hof-apply-acceptance-${randomUUID()}`;
+// Item 9 review (findings 1-2): a LOCAL Execution Environment image
+// built fresh from THIS working tree's own ansible/ (the exact same
+// `docker build --file ansible/Dockerfile ansible` the "Execution
+// Environment image builds" CI check already runs), used ONLY via
+// apply.mjs's own executionEnvironmentImageOverride seam for the two
+// scenarios below that specifically need the FIXED state role's real
+// atomic-publish/retry behavior - ee-v0.1.4, the real, published image
+// every other scenario in this file still uses unmodified, does not
+// have that fix baked in yet (it's an Ansible role, baked in at image-
+// build time, not a control-plane script). Every other new scenario
+// below (the execution lease, secret scoping, Wächter ordering) is
+// entirely control-plane code (scripts/, never ansible/roles/) and
+// needs no override at all - it runs against the real, published,
+// signed image, same as the rest of this file.
+const localEeImageTag = "hof-ops-apply-acceptance-local-ee:test";
 
 let workDir;
 let targetIp;
@@ -169,6 +193,11 @@ before(async () => {
     "--pattern", "release-lock.json*", "--dir", workDir, "--clobber",
   ]);
   releaseLockPath = path.join(workDir, "release-lock.json");
+
+  // Built once, from THIS working tree's own ansible/ - see this file's
+  // own top-level comment on localEeImageTag for why only two scenarios
+  // below actually use it.
+  await exec("docker", ["build", "--quiet", "--tag", localEeImageTag, "--file", path.join(root, "ansible/Dockerfile"), path.join(root, "ansible")], { timeout: 300_000 });
 
   await exec("docker", ["build", "--quiet", "--tag", targetImageTag, fixtureDir], { timeout: 180_000 });
   await exec("docker", ["network", "create", networkName]);
@@ -265,6 +294,7 @@ after(async () => {
   await exec("docker", ["rm", "--force", containerName]).catch(() => {});
   await exec("docker", ["network", "rm", networkName]).catch(() => {});
   await exec("docker", ["rmi", "--force", targetImageTag]).catch(() => {});
+  await exec("docker", ["rmi", "--force", localEeImageTag]).catch(() => {});
   if (workDir) await rm(workDir, { recursive: true, force: true });
 });
 
@@ -656,4 +686,490 @@ test("a real, full bootstrap apply against the real, published, signed v0.2.0 re
     JSON.parse(await onTarget("cat", `/var/lib/hof/state/generations/${padded}/topology.json`)); // must at least parse
     JSON.parse(await onTarget("cat", `/var/lib/hof/state/generations/${padded}/release-lock.json`)); // must at least parse
   }
+});
+
+// ===========================================================================
+// Item 9 review (2026-09-01): real acceptance coverage for the review's own
+// Required Gate, continuing reconciliation against the SAME already-
+// bootstrapped target the test above leaves at generation 4 (kuvert
+// enabled, unlocked) - never a fresh target, matching this whole file's
+// own established "one real target, one continuous real lifecycle"
+// convention. Each test below assumes the ones before it (in file order,
+// node:test's own default) already ran and left the target in the state
+// its own comment describes.
+// ===========================================================================
+
+// A minimal `run` matching target-mutate.mjs's own (unexported) default -
+// only ever needed here to satisfy pinnedKnownHosts()'s own required `run`
+// parameter, exactly the way apply.mjs's own real CLI path does it
+// (defaultExecFile there, never surfaced to a caller).
+function defaultRun(command, args, { input, timeout } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(command, args, { maxBuffer: 8 * 1024 * 1024, timeout }, (error, stdout, stderr) => {
+      if (error) reject(Object.assign(error, { stdout, stderr }));
+      else resolve({ stdout, stderr });
+    });
+    if (input !== undefined) {
+      child.stdin.write(input);
+      child.stdin.end();
+    }
+  });
+}
+
+function mutateConn() {
+  return { mode: "ssh", host: targetIp, port: 22, user: "hofprobe", hostKeySha256: hostKeyFingerprint, identityFile: userKeyPath, connectTimeoutSeconds: 30, run: defaultRun };
+}
+
+// Everything computeExpectedCommittedState()/buildJournalDocument() need
+// that isn't already carried by a real plan-v2 document itself - read
+// fresh off the same real files this whole file's own runPlan()/runApply()
+// calls already use, exactly the way apply.mjs's own real CLI path reads
+// them (loadAndValidateDeploymentWithBytes there) - so this can never
+// silently drift from what a real apply run would itself compute.
+async function loadRealDeploymentInputs() {
+  const { manifest, catalog, catalogBytes, releaseLock: lock, releaseLockBytes, servicesBytes, composeTemplateBytes, servicesSchema, catalogSchema, releaseLockSchema } =
+    await loadAndValidateDeployment({ servicesPath, releaseLockPath, releaseLockIdentity: RELEASE_LOCK_IDENTITY, skipSignature: false });
+  const inputDigests = {
+    manifestDigest: sha256(servicesBytes),
+    releaseLockDigest: sha256(releaseLockBytes),
+    catalogDigest: sha256(catalogBytes),
+    composeTemplateDigest: sha256(composeTemplateBytes),
+    executionEnvironmentDigest: lock.ansibleEnvironment.image.slice(lock.ansibleEnvironment.image.indexOf("@") + 1),
+  };
+  return { manifest, catalog, releaseLock: lock, servicesSchema, catalogSchema, releaseLockSchema, inputDigests };
+}
+
+// Directly dispatches ONE real state.commit - never through the full
+// runApply() orchestration, so a test can dispatch it a second time
+// against an ALREADY-committed generation (the real retry apply.mjs's
+// own resume path would otherwise take, exercised here directly and
+// synchronously instead) or against a deliberately-incomplete on-target
+// snapshot directory, and see its real, raw exit/output either way.
+//
+// Item 9 SECOND review fix (finding 11): builds the extra-vars AND the
+// docker run argv via apply.mjs's own real, EXPORTED buildExtraVars()/
+// buildDockerRunArgs() - the exact same two functions a real
+// dispatchOperation() call uses internally - rather than reconstructing
+// either by hand a second time. That hand-built version had already,
+// silently, drifted from production in a real way this extraction now
+// makes structurally impossible: `stepId` here is a plan-v2 STEP id
+// shape ("999.state.commit", matching plan.mjs's own real `NNN.<action>`
+// convention for a state.commit operation) - never the whole apply RUN's
+// own UUID, which the state role's own staging-directory name embeds via
+// hof_operation_id and which the hand-built version had been passing
+// instead.
+async function dispatchStateRoleForReal({ image, stepId, generation, stateDir }) {
+  const { file: knownHostsFile, cleanup } = await pinnedKnownHosts({ host: targetIp, port: 22, hostKeySha256: hostKeyFingerprint, connectTimeoutSeconds: 30, run: defaultRun });
+  try {
+    const inventoryFile = path.join(workDir, `inventory-${randomUUID()}.ini`);
+    await writeFile(inventoryFile, buildInventory({ host: targetIp, port: 22, user: "hofprobe", connectTimeoutSeconds: 30 }), { mode: 0o600 });
+    const operation = { id: stepId, phase: "state", action: "state.commit", resource: "state/current.json", reason: "test/apply-acceptance.mjs's own direct real dispatch" };
+    const extraVars = buildExtraVars(operation, { commitGeneration: generation });
+    const context = {
+      image, identityFile: userKeyPath, knownHostsFile, inventoryFile, stateDir, dockerNetwork: networkName,
+    };
+    const args = buildDockerRunArgs(operation, extraVars, context);
+    return await exec("docker", args, { timeout: 60_000 });
+  } finally {
+    await cleanup();
+  }
+}
+
+// Written under workDir (never a separate OS-level temp dir) so
+// after()'s own single `rm(workDir, ...)` cleans these up too, exactly
+// like every other scratch file this whole test already creates.
+async function writeStateDir({ current, topology, releaseLock: lock }) {
+  const dir = path.join(workDir, `state-${randomUUID()}`);
+  await mkdir(dir, { recursive: true });
+  await writeFile(path.join(dir, "current.json"), JSON.stringify(current));
+  await writeFile(path.join(dir, "topology.json"), JSON.stringify(topology));
+  await writeFile(path.join(dir, "release-lock.json"), JSON.stringify(lock));
+  return dir;
+}
+
+test("an applied change delivers ONLY the secrets its own scoped set names (never an unrelated required secret), and Wächter's agent unit starts and becomes ready before its API unit (item 9 review, findings 4 and 6)", async () => {
+  // Enables herold AND wachter together - herold-credential-encryption-key
+  // and wachter-agent-token are both newly required. A real,
+  // deterministically-generated value for each (scripts/secrets.mjs's own
+  // real generateSecretValue(), never test noise) is handed in via the
+  // documented readSecretsStore testing seam (apply.mjs's own comment:
+  // "the real CLI never passes them") - this is the one, official,
+  // real-SOPS-bypassing seam apply.mjs exposes; SOPS/age's own real
+  // encrypt/decrypt round trip is already covered elsewhere
+  // (test/secrets.test.mjs, test/hofctl-secrets-cli.test.mjs), not this
+  // file's own concern (which is apply's own delivery-scoping logic).
+  const heroldSecretName = "herold-credential-encryption-key";
+  const wachterSecretName = "wachter-agent-token";
+  const heroldValue = generateSecretValue("token");
+  const wachterValue = generateSecretValue("token");
+
+  const manifest = YAML.parse(await readFile(servicesPath, "utf8"));
+  manifest.services.herold.enabled = true;
+  manifest.services.wachter.enabled = true;
+  await writeFile(servicesPath, YAML.stringify(manifest));
+
+  const enablePlan = await runPlan(planOptions());
+  assert.ok(!enablePlan.blocked, JSON.stringify(enablePlan.diagnostics));
+  const secretEnsureOp = enablePlan.plan.operations.find((o) => o.action === "secret.ensure");
+  assert.ok(secretEnsureOp, "fixture assumption: enabling two secret-consuming services emits secret.ensure");
+  assert.deepEqual([...secretEnsureOp.secrets].sort(), [heroldSecretName, wachterSecretName].sort());
+
+  let deliveredSecrets;
+  const events = [];
+  const planPath = path.join(workDir, "plan-enable-herold-wachter.json");
+  await writeFile(planPath, JSON.stringify(enablePlan.plan));
+  const result = await runApply({
+    ...baseOptions(), approvePlanId: enablePlan.plan.planId, planPath, emit: (event) => events.push(event),
+    // Item 9 SECOND review fix (finding 2): secretsStorePath itself is
+    // required by apply.mjs's own eager "was a store even given at all"
+    // gate BEFORE it ever calls readSecretsStore - without it this run
+    // was refused with reason "secrets" before ever reaching the
+    // interesting part of this scenario. Never actually read (the seam
+    // below bypasses that), but its mere presence is what the gate
+    // checks.
+    secretsStorePath: "/dev/null",
+    readSecretsStore: async () => ({ [heroldSecretName]: heroldValue, [wachterSecretName]: wachterValue }),
+    dockerRun: async (command, args, options) => {
+      const mountArg = args.find((a) => a.endsWith(":/hof/secrets.json:ro"));
+      if (mountArg) deliveredSecrets = JSON.parse(await readFile(mountArg.slice(0, -":/hof/secrets.json:ro".length), "utf8"));
+      return loggingDockerRun(command, args, options);
+    },
+  });
+  assert.equal(result.blocked, false, `enabling herold+wachter failed: ${JSON.stringify(result)}`);
+
+  // Item 9 SECOND review fix (finding 5): this fixture uses supplied TLS
+  // (see before()'s own manifest.tls.mode = "supplied") - apply.mjs
+  // ALWAYS folds the two fixed supplied-TLS secret names into whatever
+  // secret.ensure delivers, on top of (never instead of) the plan's own
+  // scoped list, since the gateway consuming them is (re)started by any
+  // plan that delivers them at all (see apply.mjs's own delivery code,
+  // right after computing suppliedTlsForDelivery). The PLAN's own scoped
+  // list (secretEnsureOp.secrets, asserted above) correctly stays just
+  // [herold, wachter] - TLS names are never part of THAT scoping - but
+  // the DELIVERED file also carries the two TLS names on top.
+  assert.deepEqual(
+    Object.keys(deliveredSecrets).sort(),
+    [heroldSecretName, wachterSecretName, SUPPLIED_TLS_CERTIFICATE_SECRET_NAME, SUPPLIED_TLS_PRIVATE_KEY_SECRET_NAME].sort(),
+    "delivered: the plan's own scoped secrets, PLUS the two fixed supplied-TLS names always carried alongside them - nothing else",
+  );
+  const { stdout: deliveredHerold } = await exec("docker", ["exec", containerName, "cat", `/etc/hof/secrets/${heroldSecretName}`]);
+  assert.equal(deliveredHerold, heroldValue);
+  const { stdout: deliveredWachter } = await exec("docker", ["exec", containerName, "cat", `/etc/hof/secrets/${wachterSecretName}`]);
+  assert.equal(deliveredWachter, wachterValue);
+  const { stdout: heroldStat } = await exec("docker", ["exec", containerName, "stat", "--format", "%a %U", `/etc/hof/secrets/${heroldSecretName}`]);
+  assert.equal(heroldStat.trim(), "444 root");
+
+  // Item 9 review fix (finding 4): wachter-agent's own service.start AND
+  // readiness.wait must both resolve, for real, BEFORE wachter's own
+  // service.start is even dispatched - with the OLD ordering this exact
+  // scenario used to hang readiness.wait's full retry budget and then
+  // fail outright (the API's own /ready needs the agent already up).
+  const operationEvents = events.filter((event) => event.apiVersion === "hof.dev/operation-event/v1");
+  const failed = operationEvents.filter((event) => event.phase === "failed");
+  assert.equal(failed.length, 0, `every operation must succeed: ${JSON.stringify(failed)}`);
+  const agentReadySucceeded = operationEvents.find((event) => event.step.includes(".readiness.wait.") && event.step.includes("wachter-agent") && event.phase === "succeeded");
+  const apiStartStarted = operationEvents.find((event) => event.step.includes(".service.start.") && event.step.endsWith(".wachter") && event.phase === "started");
+  assert.ok(agentReadySucceeded && apiStartStarted, "fixture assumption: both events exist in a successful enable");
+  assert.ok(new Date(agentReadySucceeded.at).getTime() <= new Date(apiStartStarted.at).getTime(), "the agent must be confirmed ready before the API unit is even started");
+
+  // Item 9 SECOND review fix (finding 10): exact container names, not a
+  // substring/word-boundary regex - /wachter\b/ also matches inside
+  // "wachter-agent" (the boundary lands on the hyphen), so it could
+  // never actually distinguish "the API's own container exists" from
+  // "only the agent's does". The real ordering proof is the event-
+  // timestamp assertion above; this is just a liveness confirmation, now
+  // an exact one.
+  const namesAfter = (await onTarget("docker", "ps", "--format", "{{.Names}}")).split("\n").map((name) => name.trim()).filter(Boolean);
+  // herold-backend/herold-frontend - catalog/services-v1.yaml's own two
+  // artifacts for herold, not a single "herold" unit.
+  for (const expected of ["wachter-agent", "wachter", "herold-backend", "herold-frontend"]) {
+    assert.ok(namesAfter.includes(expected), `expected an exact container named "${expected}" among ${JSON.stringify(namesAfter)}`);
+  }
+
+  // A FURTHER, unrelated applied change (another config-only backup
+  // edit, touching no secret-consuming unit) must NEVER re-deliver
+  // herold's own secret, even when the store now holds a DIFFERENT
+  // (simulating a workstation-side rotation) value for it.
+  const rotatedHeroldValue = generateSecretValue("token");
+  const manifestAfter = YAML.parse(await readFile(servicesPath, "utf8"));
+  manifestAfter.backup.schedule = "05:15";
+  await writeFile(servicesPath, YAML.stringify(manifestAfter));
+  const unrelatedPlan = await runPlan(planOptions());
+  assert.ok(!unrelatedPlan.blocked, JSON.stringify(unrelatedPlan.diagnostics));
+  const unrelatedSecretOp = unrelatedPlan.plan.operations.find((o) => o.action === "secret.ensure");
+  assert.deepEqual(unrelatedSecretOp?.secrets ?? [], [], "a change touching no secret-consuming unit delivers no secret at all");
+  const unrelatedPlanPath = path.join(workDir, "plan-unrelated-backup.json");
+  await writeFile(unrelatedPlanPath, JSON.stringify(unrelatedPlan.plan));
+  const unrelatedResult = await runApply({
+    ...baseOptions(), approvePlanId: unrelatedPlan.plan.planId, planPath: unrelatedPlanPath,
+    secretsStorePath: "/dev/null",
+    readSecretsStore: async () => ({ [heroldSecretName]: rotatedHeroldValue, [wachterSecretName]: wachterValue }),
+  });
+  assert.equal(unrelatedResult.blocked, false, JSON.stringify(unrelatedResult));
+  const { stdout: heroldAfterUnrelated } = await exec("docker", ["exec", containerName, "cat", `/etc/hof/secrets/${heroldSecretName}`]);
+  assert.equal(heroldAfterUnrelated, heroldValue, "herold's own secret file is byte-identical to what was delivered before - the rotated value was never written");
+});
+
+// Item 9 SECOND review fix (finding 9): named and scoped honestly now -
+// this exercises RETRY-safety (a repeat, identical-content dispatch),
+// an INCOMPLETE-directory refusal, and ORPHAN-STAGING-directory cleanup,
+// all via directly reproduced ON-DISK STATES a crash could leave behind
+// (never a literal process kill mid-flight - see this whole section's
+// own top comment on why: a timing-based kill race is exactly what the
+// live, hands-on validation that redesigned target-mutate.mjs's own
+// execution lease this review round found genuinely unreliable to
+// script, even locally). It does NOT prove interruption strictly
+// between two specific role tasks (the staging-copy loop and the atomic
+// rename) - the orphan-staging case below is the closest real proxy for
+// that: a staging directory left behind by an attempt that got exactly
+// that far and no further.
+test("crash/retry of the atomic generation-snapshot publish is real and safe: a repeat, identical-content dispatch is idempotent; an incomplete existing snapshot directory is refused; an orphan staging directory from an interrupted publish is cleaned up and superseded (item 9 review, finding 1)", async () => {
+  const { status: liveStatus, current: liveCurrent } = await readCurrentStateViaMutate(mutateConn());
+  assert.equal(liveStatus, "present", "fixture assumption: the target already has a committed generation from the tests above");
+  const generation = liveCurrent.generation;
+
+  // Re-read the SAME generation's own real, already-published snapshot
+  // (its own real, already-produced content - never hand-built) and
+  // dispatch state.commit a SECOND time for it, via the FIXED local EE
+  // image - directly targets the concrete bug this finding fixed: the
+  // old role compared an existing snapshot with a controller-side
+  // lookup('file') of a path that only exists on the TARGET, crashing
+  // every retry outright.
+  const { snapshot: existingState } = await readGenerationSnapshot(mutateConn(), generation);
+  const { topology: existingTopology } = await readGenerationSnapshotTopology(mutateConn(), generation);
+  const { releaseLock: existingReleaseLock } = await readGenerationSnapshotReleaseLock(mutateConn(), generation);
+  const retryStateDir = await writeStateDir({ current: existingState, topology: existingTopology, releaseLock: existingReleaseLock });
+  await dispatchStateRoleForReal({ image: localEeImageTag, stepId: "999.state.commit", generation, stateDir: retryStateDir });
+  // No throw above means the retry genuinely succeeded (a real
+  // ansible-playbook run failure would reject with a real, non-zero
+  // exit). Independently re-confirm nothing on the target actually
+  // changed - a true no-op retry, not a silent overwrite.
+  const { snapshot: afterRetry } = await readGenerationSnapshot(mutateConn(), generation);
+  assert.deepEqual(withoutVolatileStateFields(afterRetry), withoutVolatileStateFields(existingState));
+
+  // A genuinely NEW, never-before-used generation number whose own
+  // snapshot directory is deliberately INCOMPLETE (only state.json)
+  // must be refused outright, never silently "completed" by a later
+  // dispatch. Item 9 SECOND review fix (finding 4): the mounted
+  // current.json fed to THIS dispatch must itself claim
+  // hof_state_generation's own value (poisonedGeneration) - the role's
+  // very FIRST task cross-checks the mounted current.json's own
+  // generation against hof_state_generation before it ever reaches the
+  // incomplete-directory check, so reusing the real generation's own
+  // current.json unmodified (as this test originally did) tripped THAT
+  // earlier assertion instead, never actually reaching the one this
+  // test means to exercise.
+  const poisonedGeneration = generation + 100; // definitely never legitimately committed
+  const poisonedDir = `/var/lib/hof/state/generations/${String(poisonedGeneration).padStart(6, "0")}`;
+  await onTarget("mkdir", "-p", poisonedDir);
+  await onTarget("sh", "-c", `cat > '${poisonedDir}/state.json' <<'JSON'\n${JSON.stringify(existingState)}\nJSON`);
+  const poisonedCurrent = { ...existingState, generation: poisonedGeneration };
+  const poisonStateDir = await writeStateDir({ current: poisonedCurrent, topology: existingTopology, releaseLock: existingReleaseLock });
+  // ansible-playbook's own human-readable task failure output (including
+  // a failed assert's fail_msg) goes to stdout, not stderr - checked
+  // directly here rather than via assert.rejects' own message match
+  // (which only ever looks at the rejected Error's own .message, built
+  // from stderr - see node:child_process's own execFile error shape).
+  let poisonError;
+  try {
+    await dispatchStateRoleForReal({ image: localEeImageTag, stepId: "999.state.commit", generation: poisonedGeneration, stateDir: poisonStateDir });
+  } catch (error) {
+    poisonError = error;
+  }
+  assert.ok(poisonError, "an incomplete existing generation directory must be refused, not silently completed");
+  assert.match(poisonError.stdout ?? "", /is incomplete/);
+  await onTarget("rm", "-rf", poisonedDir);
+
+  // Item 9 SECOND review fix (finding 9): an ORPHAN STAGING directory -
+  // exactly what a crash strictly between the staging-copy loop and the
+  // atomic `mv -T` rename leaves behind (see ansible/roles/state/tasks/
+  // main.yml's own "Remove any orphan staging directory left by a
+  // crashed earlier attempt" task) - for a DIFFERENT never-legitimately-
+  // committed generation, so the final generations/NNNNNN/ directory
+  // does not exist yet. A real, later dispatch for that same generation
+  // must remove the orphan and publish its own complete, correct
+  // snapshot in its place, never trip on - or silently reuse bytes from
+  // - the leftover.
+  const crashedGeneration = generation + 200;
+  const crashedStepId = "999.state.commit";
+  // The staging directory's own name embeds hof_operation_id VERBATIM
+  // (ansible/roles/state/tasks/main.yml's own Jinja) - matching it here
+  // to the exact SAME stepId this dispatch below will itself send is
+  // what makes this a real "the SAME retried operation's own leftover",
+  // not an unrelated stale directory that happens to share a generation.
+  const orphanStagingDir = `/var/lib/hof/state/generations/.staging-${crashedStepId}-${String(crashedGeneration).padStart(6, "0")}`;
+  await onTarget("mkdir", "-p", orphanStagingDir);
+  await onTarget("sh", "-c", `printf 'not a real snapshot file - an orphan from an interrupted publish' > '${orphanStagingDir}/state.json'`);
+  const crashedCurrent = { ...existingState, generation: crashedGeneration };
+  const crashedStateDir = await writeStateDir({ current: crashedCurrent, topology: existingTopology, releaseLock: existingReleaseLock });
+  await dispatchStateRoleForReal({ image: localEeImageTag, stepId: crashedStepId, generation: crashedGeneration, stateDir: crashedStateDir });
+  await assert.rejects(() => exec("docker", ["exec", containerName, "test", "-e", orphanStagingDir]), "the orphan staging directory is removed, never left behind or reused");
+  const { status: crashedSnapshotStatus, snapshot: crashedSnapshot } = await readGenerationSnapshot(mutateConn(), crashedGeneration);
+  assert.equal(crashedSnapshotStatus, "present");
+  assert.deepEqual(withoutVolatileStateFields(crashedSnapshot), withoutVolatileStateFields(crashedCurrent));
+  await onTarget("rm", "-rf", `/var/lib/hof/state/generations/${String(crashedGeneration).padStart(6, "0")}`);
+});
+
+test("a concurrent --resume is refused by the real execution lease while the operation is still in flight; once free, resume finishes a commit interrupted between the immutable generation snapshot and its two mutable pointer files - real target, real Ansible role, real re-dispatch (item 9 review, findings 2 and 3)", async () => {
+  // The real, already-committed baseline this scenario builds forward
+  // from.
+  const { current: baselineCurrent } = await readCurrentStateViaMutate(mutateConn());
+  const baselineGeneration = baselineCurrent.generation;
+
+  // A real, legitimate next change - one more config-only backup edit,
+  // kept deliberately small (no unit restart) so this scenario's own
+  // operations list is short and its own real state.commit dispatch
+  // below is the only thing this test cares about timing precisely.
+  const manifest2 = YAML.parse(await readFile(servicesPath, "utf8"));
+  manifest2.backup.schedule = "06:00";
+  await writeFile(servicesPath, YAML.stringify(manifest2));
+  // Item 9 SECOND review fix (finding 2): read AFTER the manifest edit
+  // just above, never before it - inputDigests.manifestDigest must
+  // reflect the SAME servicesPath content this scenario's own plan,
+  // journal, and later resume all actually see, or resume's own "input
+  // changed since journaled" digest-match gate refuses it outright (a
+  // real bug a further review found: this used to be read too early).
+  const { manifest, catalog, releaseLock: lock, servicesSchema, catalogSchema, releaseLockSchema, inputDigests } = await loadRealDeploymentInputs();
+  const { blocked, plan, diagnostics } = await runPlan(planOptions());
+  assert.ok(!blocked, JSON.stringify(diagnostics));
+  assert.equal(plan.target.baselineGeneration, baselineGeneration);
+  const generation = baselineGeneration + 1;
+  const installationId = plan.target.installationId;
+
+  // A REAL, full, uninterrupted dispatch of this exact commit's own
+  // state.commit - using the FIXED local EE image - lands the immutable
+  // snapshot AND both pointers for real (nothing is hand-built past this
+  // point; everything from here on is real, role-produced content). This
+  // is the exact same document a real state.commit dispatch for this
+  // operationId/generation would itself produce and is what this whole
+  // scenario's own final assertions compare the target back against.
+  const operationId = newOperationId();
+  // Item 9 THIRD review fix (finding 6): computeExpectedCommittedState()
+  // now requires operationStartedAt explicitly (a real apply run passes
+  // its own journal's startedAt - see apply.mjs). This scenario never
+  // builds a real journal document at all, so it stands in the same
+  // fixed instant a real journal.startedAt would be for this operation -
+  // any fixed string does, since nothing here calls this function a
+  // second time to compare against a divergent one.
+  const operationStartedAt = new Date().toISOString();
+  const { currentState: expectedCurrent, appliedRendered: expectedTopology } = computeExpectedCommittedState({
+    manifest, catalog, releaseLock: lock, servicesSchema, catalogSchema, releaseLockSchema,
+    plan, operationId, installationId, generation, inputDigests, operationStartedAt,
+  });
+  const stateDir = await writeStateDir({ current: expectedCurrent, topology: expectedTopology, releaseLock: lock });
+  // plan.operations.at(-1) - a real applied plan's own LAST operation is
+  // always state.commit (see plan.mjs's own buildOperations) - its own
+  // .id is the real plan-v2 STEP id this dispatch's own extra-vars
+  // must carry as hof_operation_id (see buildExtraVars()'s own comment;
+  // never the whole apply run's UUID, `operationId` above, which is a
+  // different thing computeExpectedCommittedState() needs for a
+  // different reason).
+  assert.equal(plan.operations.at(-1).action, "state.commit", "fixture assumption: an applied plan's own last operation is always state.commit");
+  await dispatchStateRoleForReal({ image: localEeImageTag, stepId: plan.operations.at(-1).id, generation, stateDir });
+
+  // Confirmed genuinely landed - both pointers AND the immutable
+  // snapshot, all real.
+  const { current: landedCurrent } = await readCurrentStateViaMutate(mutateConn());
+  assert.equal(landedCurrent.generation, generation);
+  const { snapshot: landedSnapshot } = await readGenerationSnapshot(mutateConn(), generation);
+  assert.ok(landedSnapshot);
+
+  // NOW reconstruct the exact crash window this finding fixes: a real
+  // apply crashing strictly between the atomic topology.json write and
+  // the atomic current.json write. The immutable snapshot (published
+  // BEFORE either pointer - see ansible/roles/state/tasks/main.yml) and
+  // topology.json already, genuinely, say generation N; only
+  // current.json is manually reverted here, to its own real, previously-
+  // committed generation N-1 bytes - the ONE deliberate step in this
+  // whole scenario that isn't itself a direct role dispatch, standing in
+  // for the timing a real process kill can't be scripted to land on
+  // precisely and reproducibly.
+  await onTarget("sh", "-c", `cat > /var/lib/hof/state/current.json <<'JSON'\n${JSON.stringify(baselineCurrent)}\nJSON`);
+  const { current: crashWindowCurrent } = await readCurrentStateViaMutate(mutateConn());
+  assert.equal(crashWindowCurrent.generation, baselineGeneration, "fixture assumption: the manual revert landed");
+
+  // A real lock+journal+event history for this exact operationId,
+  // written directly via target-mutate.mjs's own real functions. Item 9
+  // SECOND review fix (finding 8): named honestly - every operation
+  // BEFORE state.commit is marked started+succeeded SYNTHETICALLY here
+  // (this scenario never actually dispatched host.prepare/secret.ensure/
+  // config.write/etc for real under THIS operationId; only state.commit
+  // was, directly, above), matching what a real journal would show for
+  // an interrupted apply that had genuinely gotten that far - but this
+  // is a narrow, deliberate proof of state.commit's OWN resume recovery
+  // specifically, not a claim that every generated artifact a full,
+  // genuinely end-to-end interrupted apply would have produced is
+  // present and self-consistent here too (config.write's own real
+  // output, in particular, was never actually generated under this
+  // operationId at all).
+  const conn = mutateConn();
+  const lockDoc = await buildLockDocument({ operationId, approvedPlanId: plan.planId, target: plan.target, acquiredBy: currentOperator() });
+  const journalDoc = await buildJournalDocument({ operationId, approvedPlanId: plan.planId, target: plan.target, plan, inputDigests });
+  const { acquired } = await acquireLockAndJournal(conn, lockDoc, journalDoc);
+  assert.ok(acquired, "fixture assumption: the target is unlocked before this scenario constructs its own");
+  for (const operation of plan.operations.slice(0, -1)) {
+    await appendEvent(conn, operationId, await buildEvent({ operationId, step: operation.id, attempt: 1, phase: "started" }));
+    await appendEvent(conn, operationId, await buildEvent({ operationId, step: operation.id, attempt: 1, phase: "succeeded" }));
+  }
+  const stateCommitOp = plan.operations.at(-1);
+  assert.equal(stateCommitOp.action, "state.commit");
+  await appendEvent(conn, operationId, await buildEvent({ operationId, step: stateCommitOp.id, attempt: 1, phase: "started" }));
+
+  // Item 9 review fix (finding 3): "process A" - already running,
+  // holding the real execution lease for this exact target - before
+  // "process B" (a second, independent --resume of the SAME operation)
+  // gets anywhere near dispatching its own remaining step.
+  // Item 9 SECOND review fix (finding 2): herold/wachter are still
+  // enabled from the previous test (this file's own continuous, real
+  // lifecycle - see this section's own top comment), so requiredSecrets()
+  // for THIS deployment is non-empty and apply.mjs's own eager secrets
+  // gate runs BEFORE the lease check below on every call here, resume or
+  // not - without a store, both would be refused with reason "secrets"
+  // instead of ever reaching what this scenario actually tests. Neither
+  // call below dispatches secret.ensure for real (a backup-only change
+  // scopes to no secret-consuming unit - see the previous test's own
+  // "unrelated change" case), so the exact values handed back here are
+  // never delivered anywhere; they only need to satisfy the gate.
+  const secretsOptions = {
+    secretsStorePath: "/dev/null",
+    readSecretsStore: async () => ({
+      "herold-credential-encryption-key": generateSecretValue("token"),
+      "wachter-agent-token": generateSecretValue("token"),
+    }),
+  };
+
+  const heldLease = await acquireExecutionLease(conn);
+  try {
+    const concurrentResume = await runApply({ ...baseOptions(), ...secretsOptions, resume: true, executionEnvironmentImageOverride: localEeImageTag });
+    assert.equal(concurrentResume.blocked, true, "a concurrent resume must be refused");
+    assert.equal(concurrentResume.reason, "lease");
+    assert.match(concurrentResume.diagnostics[0], /execution lease/);
+    // Refused WITHOUT touching the durable lock A still legitimately
+    // holds - confirmed directly on the target, not just via the
+    // returned result.
+    await exec("docker", ["exec", containerName, "test", "-e", "/var/lib/hof/state/lock.json"]);
+  } finally {
+    await heldLease.release();
+  }
+
+  // A is "done" now (in a real crash, its own process - and the lease
+  // with it - would simply be gone) - the real, production
+  // `hofctl apply --resume`, using the FIXED local EE image so the
+  // re-dispatch below runs the real, retry-safe role, not the old,
+  // published, still-broken one.
+  const dockerCalls = [];
+  const resumeResult = await runApply({
+    ...baseOptions(), ...secretsOptions, resume: true, executionEnvironmentImageOverride: localEeImageTag,
+    dockerRun: async (command, args, options) => { dockerCalls.push(args); return loggingDockerRun(command, args, options); },
+  });
+  assert.equal(resumeResult.blocked, false, `resume should finish the interrupted commit: ${JSON.stringify(resumeResult)}`);
+  assert.equal(resumeResult.committedGeneration, generation);
+  assert.ok(dockerCalls.some((args) => JSON.parse(args.at(-1)).hof_role === "state"), "state.commit must genuinely be RE-dispatched here - only the immutable snapshot was already complete, the pointers were not");
+
+  const { current: finalCurrent } = await readCurrentStateViaMutate(mutateConn());
+  assert.equal(finalCurrent.generation, generation);
+  assert.deepEqual(withoutVolatileStateFields(finalCurrent), withoutVolatileStateFields(expectedCurrent));
+  const { topology: finalTopology } = await readTopology(mutateConn());
+  assert.deepEqual(finalTopology, expectedTopology);
+  await assert.rejects(() => exec("docker", ["exec", containerName, "test", "-e", "/var/lib/hof/state/lock.json"]), "the lock is released once the commit genuinely finishes");
 });

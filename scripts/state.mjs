@@ -149,6 +149,25 @@ export function topologyToServiceState(rendered, catalog, { manifest, releaseLoc
   };
 }
 
+// Item 9 review fix (finding 2): the single generation every ownership
+// label in a rendered topology.json agrees on, as an integer - or null
+// if the labels disagree, carry no hof.generation, or carry a
+// non-integer one. render-topology.mjs stamps hof.generation onto every
+// compose service, volume and network it produces (see ownershipLabels/
+// resourceOwnershipLabels), so a well-formed topology.json always has
+// exactly one distinct value here.
+function renderedTopologyGeneration(rendered) {
+  const labelSets = [
+    ...Object.values(rendered?.compose?.services ?? {}),
+    ...Object.values(rendered?.compose?.volumes ?? {}),
+    ...Object.values(rendered?.compose?.networks ?? {}),
+  ].map((entry) => entry?.labels?.["hof.generation"]);
+  const distinct = new Set(labelSets.filter((value) => value !== undefined && value !== null));
+  if (distinct.size !== 1) return null;
+  const only = Number([...distinct][0]);
+  return Number.isInteger(only) ? only : null;
+}
+
 function validateObservation(observation) {
   const required = [
     "containersStatus", "resources", "volumesStatus", "volumes", "networksStatus", "networks",
@@ -219,6 +238,27 @@ export function resolveBaseline({ managedState, catalog, observation }) {
     // doesn't, the state directory was corrupted or hand-edited after
     // the fact, and this baseline can't be trusted.
     if (current.topologyDigest && current.topologyDigest !== serviceState.topologyDigest) {
+      // Item 9 review fix (finding 2): distinguish a genuinely corrupt
+      // pair from the ONE recoverable case - a `hofctl apply` that
+      // crashed after atomically writing the new topology.json but
+      // before atomically writing the new current.json (the two pointer
+      // files are written in that order; see ansible/roles/state/tasks/
+      // main.yml). There, topology.json is exactly ONE generation ahead
+      // of current.json - the generation is carried in topology.json's
+      // own hof.generation ownership labels. That is not corruption: the
+      // interrupted operation's lock is still held and its immutable
+      // per-generation snapshot was already fully published, so the
+      // operator can finish it with `hofctl apply --resume` (which
+      // re-dispatches the idempotent state.commit to rewrite the
+      // pointers). Any OTHER mismatch is still the hard corruption stop.
+      const topoGeneration = renderedTopologyGeneration(topology);
+      if (topoGeneration !== null && topoGeneration === current.generation + 1) {
+        throw new Error(
+          `managed state's topology.json is one generation ahead of current.json (topology.json is generation ${topoGeneration}, ` +
+          `current.json is generation ${current.generation}) - an earlier "hofctl apply" was interrupted after publishing the new ` +
+          `topology but before updating current.json. Its operation lock is still held; run "hofctl apply --resume" to finish it.`,
+        );
+      }
       throw new Error(
         "managed state's recorded topologyDigest does not match a fresh digest of its own saved topology.json - " +
         "state directory is corrupt or was hand-edited, cannot compute a baseline",

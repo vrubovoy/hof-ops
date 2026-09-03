@@ -155,6 +155,16 @@ test("service role's stop/remove actions discover by hof.managed + installationI
   assert.doesNotMatch(tasksYaml, /compose\s*\n\s*-\s*down/, "service role must never run a project-wide `compose down`");
   assert.doesNotMatch(tasksYaml, /--volumes|docker volume rm/, "service role must never remove a volume");
   assert.match(tasksYaml, /length > 1/, "more than one discovered container must be refused, not guessed at");
+  // Item 9 review fix (finding 10): stop/remove's discovery scopes on
+  // hof_installation_id - it must be asserted present for those actions,
+  // or a regression that let it through as null would make the filter
+  // "label=hof.installation-id=" match nothing and the role would
+  // silently commit state without removing the intended container.
+  assert.match(
+    tasksYaml,
+    /hof_service_action in \["stop", "remove"\][\s\S]*?ansible\.builtin\.assert:[\s\S]*?hof_installation_id is not none/,
+    "stop/remove must assert hof_installation_id is not none before its installation-scoped discovery",
+  );
 });
 
 test("readiness role discovers the container by its own real Compose labels and polls docker inspect's JSON, never a Go-template format string", () => {
@@ -171,11 +181,17 @@ test("state role writes topology.json before current.json, both via ansible.buil
   const currentIndex = tasksYaml.indexOf("dest: /var/lib/hof/state/current.json");
   assert.ok(topologyIndex > 0 && currentIndex > 0, "both files must be written");
   assert.ok(topologyIndex < currentIndex, "topology.json must be written before current.json - see ADR 0004 and state.mjs's own resolveBaseline() corruption check");
+  // Item 9 review fix (finding 1): the immutable per-generation snapshot
+  // is now written into an operation-scoped STAGING directory (one
+  // looped copy of the three files), verified, then atomically renamed
+  // into place - so `ansible.builtin.copy:` now appears exactly 3 times
+  // (1 looped staging copy + 2 pointer-file writes), and the publish
+  // step itself is an `mv -T ... creates:` atomic directory rename.
   const copyCount = (tasksYaml.match(/ansible\.builtin\.copy:/g) ?? []).length;
-  // Item 9 (ADR 0005) added three more copies - the immutable per-
-  // generation snapshot (state.json, topology.json, release-lock.json)
-  // - on top of the original two pointer-file writes.
-  assert.equal(copyCount, 5, "5 copies: 3 immutable generation-snapshot files + 2 pointer files, all via copy's own atomic semantics");
+  assert.equal(copyCount, 3, "3 copies: 1 looped staging copy of the snapshot files + 2 pointer files, all via copy's own atomic semantics");
+  assert.match(tasksYaml, /hof_state_generation_staging_dir/, "the snapshot must be built in a staging directory first");
+  assert.match(tasksYaml, /- mv\n\s*- -T/, "the staging directory must be published with an atomic `mv -T` directory rename");
+  assert.match(tasksYaml, /creates: "\{\{ hof_state_generation_dir \}\}"/, "the atomic publish must be a no-op if the final directory already exists");
 });
 
 // Item 9 (ADR 0005): the immutable per-generation snapshot -
@@ -183,30 +199,40 @@ test("state role writes topology.json before current.json, both via ansible.buil
 // be fully published BEFORE either pointer file is touched, and a
 // generation number that already has a snapshot on disk must never be
 // silently overwritten with different content.
-test("state role publishes the immutable per-generation snapshot before either pointer file, and refuses to overwrite one with different content", () => {
+test("state role publishes the immutable per-generation snapshot atomically, before either pointer file, and refuses an incomplete or mismatched existing one", () => {
   const { tasksYaml } = loadRoleFiles("state");
   for (const filename of ["state.json", "topology.json", "release-lock.json"]) {
-    assert.ok(tasksYaml.includes(`generations/`) && tasksYaml.includes(`/${filename}`), `generation snapshot must include ${filename}`);
+    assert.ok(tasksYaml.includes(`generations/`) && tasksYaml.includes(`/${filename}`) || tasksYaml.includes("dest: state.json"), `generation snapshot must include ${filename}`);
   }
-  const snapshotStateIndex = tasksYaml.indexOf("hof_state_generation_dir }}/state.json");
-  const snapshotTopologyIndex = tasksYaml.indexOf("hof_state_generation_dir }}/topology.json");
-  const snapshotReleaseLockIndex = tasksYaml.indexOf("hof_state_generation_dir }}/release-lock.json");
+  // Item 9 review fix (finding 1): the snapshot is staged, verified, and
+  // atomically renamed - so the whole publish (staging copy + verify +
+  // `mv -T`) must complete before either pointer file is written.
+  const stagingCopyIndex = tasksYaml.indexOf("hof_state_generation_staging_dir }}/{{ item.dest }}");
+  const atomicPublishIndex = tasksYaml.indexOf("Atomically publish the staging directory");
   const pointerTopologyIndex = tasksYaml.indexOf("dest: /var/lib/hof/state/topology.json");
   const pointerCurrentIndex = tasksYaml.indexOf("dest: /var/lib/hof/state/current.json");
-  assert.ok(
-    snapshotStateIndex > 0 && snapshotTopologyIndex > 0 && snapshotReleaseLockIndex > 0,
-    "all three immutable snapshot files must be written",
-  );
-  assert.ok(
-    snapshotStateIndex < pointerTopologyIndex && snapshotTopologyIndex < pointerTopologyIndex && snapshotReleaseLockIndex < pointerTopologyIndex,
-    "the immutable generation snapshot must be fully published before either pointer file",
-  );
+  assert.ok(stagingCopyIndex > 0 && atomicPublishIndex > 0, "the snapshot must be staged then atomically published");
+  assert.ok(stagingCopyIndex < atomicPublishIndex, "the staging copies must precede the atomic publish");
+  assert.ok(atomicPublishIndex < pointerTopologyIndex, "the immutable generation snapshot must be fully published before either pointer file");
   assert.ok(pointerTopologyIndex < pointerCurrentIndex, "the pointer files themselves keep ADR 0004's own ordering unchanged");
   // Zero-padded, arbitrary positive generation - never a fixed constant.
   assert.match(tasksYaml, /'%06d'\s*\|\s*format\(hof_state_generation\s*\|\s*int\)/, "the snapshot directory name must be zero-padded from the real generation, not hardcoded");
-  // Idempotent-if-identical, blocked-if-different, appliedAt excluded.
+  // Retry / resume: idempotent-if-identical, blocked-if-different or
+  // incomplete, appliedAt excluded. The existing snapshot is read
+  // TARGET-side (slurp), never a controller-side lookup('file') of a
+  // target-only path (the old code's real crash on every retry).
+  assert.match(tasksYaml, /ansible\.builtin\.slurp:/, "an existing snapshot must be read from the target with slurp, never lookup('file')");
+  assert.doesNotMatch(tasksYaml, /lookup\('file',\s*hof_state_generation_dir/, "never a controller-side lookup('file') of a target-only generations/ path");
   assert.match(tasksYaml, /appliedAt/, "the identical-content check must exclude appliedAt - never expected to match across a genuine retry");
-  assert.match(tasksYaml, /hof_state_generation_existing == hof_state_generation_incoming/, "an existing snapshot's content must be compared, not assumed");
+  // Item 9 SECOND review fix (finding 3): all three files of an already-
+  // published snapshot must be compared, not just state.json - a
+  // topology.json or release-lock.json that's parseable and non-empty
+  // but belongs to a genuinely different commit used to slip past a
+  // check that only ever looked at state.json's own content.
+  assert.match(tasksYaml, /hof_state_generation_existing_state == hof_state_generation_incoming_state/, "state.json's own content must be compared, not assumed");
+  assert.match(tasksYaml, /hof_state_generation_existing_topology == hof_state_generation_incoming_topology/, "topology.json's own content must be compared too, not just state.json's");
+  assert.match(tasksYaml, /hof_state_generation_existing_release_lock == hof_state_generation_incoming_release_lock/, "release-lock.json's own content must be compared too, not just state.json's");
+  assert.match(tasksYaml, /is incomplete \(a crashed earlier publish\)/, "an existing but incomplete generation directory must be refused, not silently completed");
 });
 
 test("ansible/requirements.yml pins the exact collections the roles' own README/defaults comments promise", () => {

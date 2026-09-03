@@ -404,3 +404,40 @@ test("resolveBaseline: refuses managed state whose recorded topologyDigest doesn
     /does not match a fresh digest of its own saved topology\.json/,
   );
 });
+
+// Item 9 review fix (finding 2): a `hofctl apply` that crashed strictly
+// between the atomic topology.json write and the atomic current.json
+// write leaves topology.json exactly ONE generation ahead of
+// current.json. That is recoverable, not corruption - resolveBaseline
+// must say so (and point at --resume), not give the generic
+// "corrupt or hand-edited" stop.
+test("resolveBaseline: topology.json exactly one generation ahead of current.json is an interrupted commit, recoverable with --resume - never the generic corruption stop", async () => {
+  const contracts = await loadContracts();
+  // topology.json was published for generation 2; current.json still
+  // records generation 1 with generation 1's own topologyDigest.
+  const renderedNext = renderTopology({ ...contracts, installationId: "inst-1", generation: 2 });
+  const managedState = {
+    current: { generation: 1, installationId: "inst-1", topologyDigest: "sha256:" + "1".repeat(64) },
+    topology: renderedNext,
+  };
+  assert.throws(
+    () => resolveBaseline({ managedState, catalog: contracts.catalog, observation: available }),
+    (error) =>
+      /one generation ahead of current\.json/.test(error.message)
+      && /hofctl apply --resume/.test(error.message)
+      && !/corrupt or was hand-edited/.test(error.message),
+  );
+});
+
+test("resolveBaseline: a topology.json TWO generations ahead is still the hard corruption stop, not a resume hint", async () => {
+  const contracts = await loadContracts();
+  const renderedFuture = renderTopology({ ...contracts, installationId: "inst-1", generation: 5 });
+  const managedState = {
+    current: { generation: 1, installationId: "inst-1", topologyDigest: "sha256:" + "1".repeat(64) },
+    topology: renderedFuture,
+  };
+  assert.throws(
+    () => resolveBaseline({ managedState, catalog: contracts.catalog, observation: available }),
+    /corrupt or was hand-edited/,
+  );
+});

@@ -109,31 +109,37 @@ import { loadAndValidateDeployment } from "../scripts/validate-deployment.mjs";
 
 const RECOVERY_AGE_RECIPIENT = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
 // The real platform release this test downloads and applies - see
-// releases/0.2.2.yml (reuses releases/0.2.0.yml's own app-component
-// selections unchanged; only ansibleEnvironment moves to ee-v0.1.6, item
-// 9's own five review rounds (PR #57) PLUS the network-lifecycle fix
-// this same verification PR (#58) itself needed - external hof/
-// wachter-internal networks, sole Ansible ownership - see ADR 0005's
-// own errata sections for the full history). `workflow_dispatch` signs
-// with the DISPATCHING branch's own ref, never a tag (confirmed for
-// real by inspecting the v0.1.1 release's own certificate -
-// `@refs/heads/main`, not `@refs/tags/v0.1.1`), unlike
-// execution-environment.yml's own tag-triggered identity below.
+// releases/0.2.3.yml (reuses releases/0.2.0.yml's own app-component
+// selections unchanged; only ansibleEnvironment moves to ee-v0.1.7, item
+// 9's own five review rounds (PR #57) PLUS every fix this same
+// verification PR (#58) itself needed along the way - network-lifecycle
+// (external hof/wachter-internal networks, sole Ansible ownership),
+// operation-ordering (dependency-aware service.start/readiness.wait
+// sequencing), and the real Docker-socket-gid fix that finally resolved
+// wachter's own persistent /ready 503 - see ADR 0005's own errata
+// sections for the full history. `workflow_dispatch` signs with the
+// DISPATCHING branch's own ref, never a tag (confirmed for real by
+// inspecting the v0.1.1 release's own certificate - `@refs/heads/main`,
+// not `@refs/tags/v0.1.1`), unlike execution-environment.yml's own
+// tag-triggered identity below.
 //
-// This whole file's own real acceptance run has, twice now, forced a
-// release bump one step later than expected: v0.2.0 -> v0.2.1 (PR #57's
-// Wachter-ordering fix changed composeTemplateDigest) -> v0.2.2 (PR
-// #58's OWN network-lifecycle fix changed it again, discovered by this
-// very test) - apply's own supply-chain check correctly refusing a
-// stale release each time, exactly as intended.
+// This whole file's own real acceptance run has, three times now,
+// forced a release bump one step later than expected: v0.2.0 -> v0.2.1
+// (PR #57's Wachter-ordering fix changed composeTemplateDigest) ->
+// v0.2.2 (PR #58's OWN network-lifecycle fix changed it again) -> v0.2.3
+// (v0.2.2's own wachter-agent EACCES against the real Docker socket -
+// ee-v0.1.6 never carried the fix, since this scenario always runs
+// against the real, published, pinned ansibleEnvironment image, never a
+// locally-rebuilt one) - apply's own supply-chain check correctly
+// refusing a stale release each time, exactly as intended.
 //
 // RELEASE_LOCK_IDENTITY is transiently `item-9-v021-verification`, not
-// `main` - v0.2.2 was cut via `workflow_dispatch --ref
-// item-9-v021-verification` (dispatched straight against this PR's own
-// branch, never requiring it to be merged first just to verify the fix
-// it itself contains). Once a future release is eventually cut from
-// `main` again post-merge, this reverts to `@refs/heads/main`.
-const RELEASE_VERSION = "0.2.2";
+// `main` - v0.2.3, like v0.2.2 before it, was cut via `workflow_dispatch
+// --ref item-9-v021-verification` (dispatched straight against this
+// PR's own branch, never requiring it to be merged first just to verify
+// the fix it itself contains). Once a future release is eventually cut
+// from `main` again post-merge, this reverts to `@refs/heads/main`.
+const RELEASE_VERSION = "0.2.3";
 const RELEASE_LOCK_IDENTITY = "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/heads/item-9-v021-verification";
 
 const exec = promisify(execFile);
@@ -410,7 +416,7 @@ async function containerIdForUnit(unit) {
   return stdout.trim() || null;
 }
 
-test("a real, full bootstrap apply against the real, published, signed v0.2.2 release, then a real applied-mode reconciliation lifecycle against the same target - every real role, start to finish, generation 1 through 4", async () => {
+test("a real, full bootstrap apply against the real, published, signed v0.2.3 release, then a real applied-mode reconciliation lifecycle against the same target - every real role, start to finish, generation 1 through 4", async () => {
   // The real operator workflow, exercised for real: a genuine `hofctl
   // plan` run (real inspectTarget() over the real SSH transport this
   // whole fixture already sets up, real cosign verification of the

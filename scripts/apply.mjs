@@ -244,8 +244,14 @@ function defaultExecFile(command, args, options = {}) {
 function sanitizeError(error) {
   const raw = [error?.stdout, error?.stderr, error?.message].filter(Boolean).join("\n");
   const lines = raw.split("\n").filter((line) => line.trim().length > 0);
-  const tail = lines.slice(-40).join("\n");
-  return (tail || "operation failed with no further diagnostic detail").slice(0, 4000);
+  // Item 9 review (wachter finding, second pass): widened again - the
+  // readiness role's own assert now also carries the failing unit's own
+  // captured `docker logs` output alongside the State/Health JSON, and
+  // both together routinely exceed the previous 40-line/4000-char
+  // budget, silently dropping exactly the application-level detail this
+  // whole diagnostic chain exists to surface.
+  const tail = lines.slice(-80).join("\n");
+  return (tail || "operation failed with no further diagnostic detail").slice(0, 8000);
 }
 
 // Runs one operation inside a fresh, throwaway Execution Environment

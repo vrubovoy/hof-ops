@@ -65,6 +65,26 @@
   delay: 2
   ignore_errors: true
 
+# Item 9 review (wachter finding, second pass): the State/Health JSON
+# alone couldn't distinguish WHY a "healthy" condition's own probe
+# failed - it shows THAT the container's healthcheck failed, never
+# what the application itself saw. docker logs is the only way to see
+# that (the application's own stdout/stderr), and it costs nothing when
+# the wait above already succeeded (`is failed` skips this every time
+# but the one time this whole role's own point is to explain).
+- name: Capture this unit's own recent log output, for real diagnostic detail if the wait above never succeeded
+  when: hof_readiness_state is failed
+  ansible.builtin.command:
+    argv:
+      - docker
+      - logs
+      - --tail
+      - "50"
+      - "{{ hof_readiness_container_id.stdout | trim }}"
+  register: hof_readiness_container_logs
+  changed_when: false
+  failed_when: false
+
 - name: Assert the container actually reached the required condition, with real diagnostic detail on failure
   ansible.builtin.assert:
     that:
@@ -75,4 +95,6 @@
     fail_msg: >-
       container {{ hof_readiness_container_id.stdout | trim }} for compose service {{ hof_readiness_unit }}
       never reached "{{ hof_readiness_condition }}" within its own retry budget - last observed State:
-      {{ (hof_readiness_state.stdout | from_json)[0].State | to_json }}
+      {{ (hof_readiness_state.stdout | from_json)[0].State | to_json }} - its own recent log output (stdout):
+      {{ hof_readiness_container_logs.stdout | default('(not captured)') }} - (stderr):
+      {{ hof_readiness_container_logs.stderr | default('(not captured)') }}

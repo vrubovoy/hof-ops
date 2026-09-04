@@ -28,6 +28,33 @@
       - hof_installation_id is not none
     fail_msg: "service role's stop/remove actions additionally require hof_installation_id - discovery must scope to exactly this installation, never a null (match-anything) label"
 
+# Item 9 review (wachter finding): render-topology.mjs's own
+# wachter-agent fragment reads ${DOCKER_GID:-998} for its group_add
+# (comment: "an operator's own setup would `stat -c '%g' /var/run/
+# docker.sock`, per Tor's README") - that fallback is only ever a guess,
+# and integration-matrix.mjs's own local runtime pass already discovered
+# a real, persistent EACCES against the socket once a target's real
+# docker group gid isn't actually 998 (it fixes this for its own local
+# runs by reading the real value the same way). This role is the one
+# place `docker compose up` actually runs against a REAL target, so it
+# needs the identical real-value discovery - without it, wachter-agent
+# silently can't read the Docker socket, `sampleContainers()`'s own
+# dockerSource never leaves "error", and wachter's own GET /ready
+# (backend/src/lib/sampler.ts's isReady()) reports 503 forever, not just
+# during a slow startup. Harmless for every unit that doesn't reference
+# DOCKER_GID at all - Compose only substitutes it where a service
+# fragment actually names the variable.
+- name: Discover this target's own real Docker socket group id
+  when: hof_service_action == "start"
+  ansible.builtin.command:
+    argv:
+      - stat
+      - -c
+      - "%g"
+      - /var/run/docker.sock
+  register: hof_docker_socket_gid
+  changed_when: false
+
 # --no-deps: scoped strictly to this one unit, exactly like this role's
 # own defaults/main.yml comment promises - every OTHER unit that needs
 # starting gets its own separate service.start operation from plan.mjs,
@@ -49,6 +76,8 @@
       - --pull
       - "never"
       - "{{ hof_service_unit }}"
+  environment:
+    DOCKER_GID: "{{ hof_docker_socket_gid.stdout | trim }}"
   changed_when: true
 
 # Item 9 (ADR 0005): stop/remove - applied-mode-only, never invoked for

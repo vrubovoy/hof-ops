@@ -130,6 +130,35 @@ test("Wächter: the agent's own service.start + readiness.wait are ordered befor
   assert.ok(apiStart < apiReady);
 });
 
+// Item 9 review (operation ordering finding): a real acceptance run
+// found this exact deadlock for real - herold (dependsOn: [tor,
+// schlussel]) newly enabled cascades a CORS/ALLOWED_ORIGINS change into
+// schlussel's own already-running config (the same cascading-update
+// pattern the "enabling a previously-disabled service" test above
+// already exercises for schrank), so schlussel gets its own `update`
+// entry in the SAME apply that creates herold. The OLD fixed
+// [...create, ...update] order dispatched herold's own service.start +
+// readiness.wait (a `create` entry) before schlussel's own restart (an
+// `update` entry, stopped earlier and not yet started again) - herold's
+// own real /ready check depends on reaching schlussel, so its own
+// readiness.wait exhausted its full retry budget failing while schlussel
+// was still down. topologicallySortByDependency() now sequences
+// schlussel's own restart (start AND readiness, in full) before herold's
+// own start is ever dispatched.
+test("topology change: a newly-enabled service (herold) whose real dependsOn dependency (schlussel) is ALSO restarted by the same apply never has its own readiness raced against that restart (item 9 review, operation ordering finding)", async () => {
+  const before = await fixture((contracts) => { contracts.manifest.services.herold.enabled = false; });
+  const baseline = baselineFrom(before.rendered, before.contracts.catalog, 2);
+
+  const after = await fixture((contracts) => { contracts.manifest.services.herold.enabled = true; });
+  const plan = buildDesired({ baseline, rendered: after.rendered, contracts: after.contracts, observation: observedMatching(baseline) });
+
+  assert.ok(plan.operations.some((o) => o.action === "service.stop" && o.resource === "schlussel"), "fixture assumption: enabling herold cascades a real config change into schlussel, restarting it");
+  const schlusselReady = plan.operations.findIndex((o) => o.action === "readiness.wait" && o.resource === "schlussel");
+  const heroldBackendStart = plan.operations.findIndex((o) => o.action === "service.start" && o.resource === "herold-backend");
+  assert.ok(schlusselReady >= 0 && heroldBackendStart >= 0, "fixture assumption: both operations exist");
+  assert.ok(schlusselReady < heroldBackendStart, "schlussel's own restart must be fully confirmed ready before herold-backend's own service.start is even dispatched - herold's own /ready check depends on reaching it");
+});
+
 test("bootstrap migration operations carry their own argv/volume - a plan is self-sufficient, apply never re-reads the catalog", async () => {
   const { contracts, rendered } = await fixture();
   const plan = buildDesired({ baseline: emptyBaseline(), rendered, contracts });

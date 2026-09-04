@@ -6,7 +6,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 
 import { loadContracts } from "../scripts/contracts.mjs";
-import { renderTopology } from "../scripts/render-topology.mjs";
+import { HOF_NETWORK_NAME, renderTopology } from "../scripts/render-topology.mjs";
 import { emptyBaseline, resolveBaseline, topologyToServiceState } from "../scripts/state.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
@@ -126,10 +126,13 @@ test("topologyToServiceState reads Hof's own ownership labels, keyed by unit, no
   assert.equal(typeof state.services.kuvert.schemaVersion, "number");
   assert.equal("schemaVersion" in state.services.schloss, false);
   // networks alongside volumes - orphan-detection needs to know what's
-  // expected on both, not just volumes.
+  // expected on both, not just volumes. Networks record their own
+  // PHYSICAL name (item 9 review, network lifecycle finding), never the
+  // bare Compose-internal logical key - see render-topology.mjs's own
+  // physicalNetworkName() comment on why those two now diverge.
   assert.deepEqual(state.volumes, Object.keys(rendered.compose.volumes).sort());
-  assert.deepEqual(state.networks, Object.keys(rendered.compose.networks).sort());
-  assert.ok(state.networks.includes("hof"));
+  assert.deepEqual(state.networks, Object.values(rendered.compose.networks).map((network) => network.name).sort());
+  assert.ok(state.networks.includes(HOF_NETWORK_NAME));
 });
 
 test("topologyToServiceState's manifest/releaseLock digests are optional - null when not supplied", async () => {

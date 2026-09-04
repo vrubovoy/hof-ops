@@ -302,6 +302,10 @@
           "uniqueItems": true,
           "items": { "type": "string" }
         },
+        "internal": {
+          "description": "Only for network.ensure (item 9 review, network lifecycle finding) - whether this network must be created with no default route to the outside world (Wachter's own wachter-internal network, isolating its agent/API pair). false/absent for every other network (e.g. the default \"hof\" network). This is now the ONLY place `internal` is expressed - the network is external to Compose (see render-topology.mjs's own physicalNetworkName() comment), so the Ansible network role, not compose.yml, is what actually applies it at creation time.",
+          "type": "boolean"
+        },
         "reason": { "type": "string" }
       }
     }

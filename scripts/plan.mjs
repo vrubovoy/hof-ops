@@ -8,6 +8,7 @@
 // exercise directly.
 
 import { sha256 } from "./digest.mjs";
+import { WACHTER_INTERNAL_NETWORK_NAME } from "./render-topology.mjs";
 import { topologyToServiceState } from "./state.mjs";
 
 // Compares two {services: {units}} snapshots unit by unit - keyed by
@@ -405,6 +406,49 @@ function migrationOperations(baseline, desired, desiredRendered, needing) {
   return { operations, blockers, warnings };
 }
 
+// Item 9 review (operation ordering finding): orders `entries` (each a
+// diffUnits()-shaped {service, unit, ...}) so that if entry A's own
+// catalog service dependsOn entry B's own service, and BOTH are present
+// in this exact list, B's own entry (or entries - a multi-unit service
+// like schlussel+schlussel-frontend must have EVERY one of its own units
+// sequenced first) comes before A's. A dependency NOT present in this
+// list at all (already stable, untouched by this apply) imposes no
+// constraint - only a dependency this SAME apply is itself
+// creating/restarting can possibly still be down when a dependent
+// unit's own readiness check runs. Stable: two entries with no
+// dependency relationship between them keep their original relative
+// order (Kahn's algorithm, always advancing the EARLIEST-appearing
+// ready entry, never an arbitrary one) - every existing scenario with
+// no cross-service dependency at play is byte-for-byte unaffected.
+function topologicallySortByDependency(entries, catalog) {
+  const dependsOnByService = new Map(catalog.services.map((service) => [service.id, service.dependsOn ?? []]));
+  const servicesPresent = new Set(entries.map((entry) => entry.service));
+  const inPlanDependencies = (entry) => (dependsOnByService.get(entry.service) ?? []).filter((serviceId) => servicesPresent.has(serviceId));
+
+  const remaining = [...entries];
+  const doneServices = new Set();
+  const sorted = [];
+  while (remaining.length > 0) {
+    const readyIndex = remaining.findIndex((entry) => inPlanDependencies(entry).every((serviceId) => doneServices.has(serviceId)));
+    // Every real dependsOn edge in this catalog is a genuine DAG (no
+    // cycles, confirmed directly against catalog/services-v1.yaml) - an
+    // apparent deadlock here is a real bug in the catalog itself
+    // (a cycle), never something safe to silently paper over with an
+    // arbitrary fallback order.
+    if (readyIndex === -1) {
+      throw new Error(`internal error: dependsOn cycle (or unresolvable ordering) prevents sequencing service.start for: ${remaining.map((entry) => `${entry.service}/${entry.unit}`).join(", ")}`);
+    }
+    const [entry] = remaining.splice(readyIndex, 1);
+    sorted.push(entry);
+    // Only "done" once EVERY one of this service's own units in this
+    // exact list has been sequenced - a multi-unit service must have
+    // ALL of its units resolved before anything depending on the
+    // SERVICE (not just one specific unit) is unblocked.
+    if (!remaining.some((other) => other.service === entry.service)) doneServices.add(entry.service);
+  }
+  return sorted;
+}
+
 // Item 9 (ADR 0005) reordered this: volume/network ensure, image
 // verify/pull, THEN stop affected/removed units, THEN write the new
 // desired config, THEN remove disabled units, THEN migrations, THEN
@@ -476,7 +520,32 @@ function buildOperations({ baseline, desired, create, update, remove, migrations
   // field (an apply executor, an audit log) must be able to tell "make
   // sure this named volume exists" and "make sure this named network
   // exists" apart without also reading `resource`/`reason` text.
-  for (const network of missingNetworks) next(`network.ensure.${network}`, "volume", "network.ensure", network, { reason: "recreate a missing network" });
+  //
+  // Item 9 review (network lifecycle finding): missingNetworks alone
+  // (baseline-expected, but observed absent) used to be the WHOLE story
+  // - a network newly required by the DESIRED topology that baseline
+  // never expected at all (wachter-internal, the very first time
+  // Wachter is enabled) got no network.ensure of its own, ever. Compose
+  // itself then silently auto-created it as a NON-external network on
+  // whatever unit's own `docker compose run` happened to need it first -
+  // exactly the same "Compose thinks it owns this network" class of bug
+  // the rest of this fix closes for the "hof" network. newNetworks below
+  // closes the other half: desired's own network list, minus whatever
+  // baseline already expected.
+  const newNetworks = desired.networks.filter((network) => !baseline.networks.includes(network));
+  const networksToEnsure = [...new Set([...missingNetworks, ...newNetworks])];
+  for (const network of networksToEnsure) {
+    next(`network.ensure.${network}`, "volume", "network.ensure", network, {
+      reason: missingNetworks.includes(network) ? "recreate a missing network" : "new network",
+      // Only wachter-internal is ever internal (no default route to the
+      // outside world) - see render-topology.mjs's own
+      // WACHTER_INTERNAL_NETWORK_NAME/physicalNetworkName() comments.
+      // Omitted (never `false`) for every other network, matching this
+      // schema's own "absent means false" convention for every other
+      // optional operation field.
+      ...(network === WACHTER_INTERNAL_NETWORK_NAME ? { internal: true } : {}),
+    });
+  }
 
   for (const entry of [...create, ...update].filter((entry) => entry.imageChanged)) {
     next(`image.verify.${entry.service}.${entry.unit}`, "image", "image.verify", entry.unit, { image: entry.image ?? entry.toImage, reason: "confirm the release-locked, hofctl validate-approved image" });
@@ -495,7 +564,28 @@ function buildOperations({ baseline, desired, create, update, remove, migrations
     operations.push({ ...operation, id: `${String(sequence).padStart(3, "0")}.${operation.id}` });
   }
 
-  for (const entry of [...create, ...update]) {
+  // Item 9 review (operation ordering finding): a real, reproducible
+  // deadlock a further review found - [...create, ...update] used to be
+  // dispatched in that fixed, unconditional order. A brand new unit
+  // (create) can have a real catalog dependsOn dependency that is
+  // SIMULTANEOUSLY being restarted (update) by this very same apply -
+  // e.g. herold (dependsOn: [tor, schlussel]) newly enabled, cascading a
+  // CORS/ALLOWED_ORIGINS change into schlussel's own already-running
+  // config, so schlussel gets its own update entry too. That dependency
+  // was already stopped earlier (the update-only service.stop pass
+  // above) and its own restart is itself an `update` entry, dispatched
+  // AFTER every `create` entry in the old fixed order - so herold's own
+  // readiness.wait (its real /ready check depends on reaching schlussel)
+  // used to run, and exhaust its own full retry budget failing, WHILE
+  // schlussel was still down, since schlussel's own restart had not even
+  // been dispatched yet. Sorted here via a stable topological sort keyed
+  // on the catalog's own dependsOn graph, restricted to dependencies
+  // this SAME apply is actually touching (an already-stable, untouched
+  // dependency imposes no ordering constraint at all) - every existing,
+  // already-verified scenario with no such cross-service dependency
+  // relationship keeps its own exact original relative order (see
+  // topologicallySortByDependency()'s own comment).
+  for (const entry of topologicallySortByDependency([...create, ...update], catalog)) {
     next(`service.start.${entry.service}.${entry.unit}`, "service", "service.start", entry.unit, { image: entry.image ?? entry.toImage, reason: entry.reason ?? "new unit" });
     // The gateway deliberately has no Compose healthcheck (see
     // render-topology.mjs's own comment on why) - it can only ever wait

@@ -73,6 +73,7 @@ jobs:
                   hof_secrets_file: "/dev/null"
                   hof_volume_name: "x"
                   hof_network_name: "x"
+                  hof_network_internal: false
                   hof_installation_id: "00000000-0000-0000-0000-000000000000"
                   hof_generation: 1
                   hof_image_action: "verify"

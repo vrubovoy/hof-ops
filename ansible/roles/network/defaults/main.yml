@@ -1,11 +1,27 @@
 ---
 # network.ensure - a named, Hof-labeled Docker network, idempotent -
 # also used to repair a baseline-expected network gone missing (see
-# plan.mjs's own computeMissingResources). Same label discipline as
-# volume.ensure - see that role's own comment for why the labels must
-# byte-for-byte match what render-topology.mjs already wrote into
-# compose.yml.
+# plan.mjs's own computeMissingResources), or to create one the desired
+# topology needs for the very first time (plan.mjs's own newNetworks).
+#
+# Item 9 review (network lifecycle finding): unlike volume.ensure, this
+# role's own labels no longer need to byte-for-byte match anything
+# render-topology.mjs writes into compose.yml - this network is now
+# `external: true` there (Compose never creates, updates, or reconciles
+# it at all), so this role is its one and only owner, and its own labels
+# never carry hof.generation (a network is long-lived, shared
+# infrastructure; only per-generation service containers still carry
+# one - see tasks/main.yml's own comment on why that used to break real
+# applies).
 hof_operation_id: null
 hof_network_name: null
 hof_installation_id: null
-hof_generation: null
+# Every default here stays null, like every other role's own (see
+# test/ansible-skeleton.test.mjs's own real gate on this) - null means
+# "false" for this one specifically, via tasks/main.yml's own
+# default(false, true) (the second, "treat falsy/None as needing the
+# default too" argument - a bare default(false) would NOT replace an
+# explicit None with false, since Jinja only replaces genuinely
+# UNDEFINED values by default). Only wachter-internal (see plan.mjs's
+# own network.ensure dispatch) ever supplies true.
+hof_network_internal: null

@@ -143,7 +143,20 @@ export function topologyToServiceState(rendered, catalog, { manifest, releaseLoc
     // Unlike volumes, a missing network is safe to just recreate
     // (stateless infrastructure) - plan.mjs still needs to know what's
     // expected to tell "recreate this" apart from "this was never ours".
-    networks: Object.keys(rendered.compose.networks).sort(),
+    //
+    // Item 9 review (network lifecycle finding): the network's own
+    // PHYSICAL name (rendered.compose.networks[key].name - e.g.
+    // "hof_hof"), never the bare object key ("hof") - render-topology.mjs
+    // now marks every network external with an explicit physical name
+    // that no longer matches its own logical Compose key by construction
+    // (see physicalNetworkName()'s own comment on why). This exact
+    // physical name is what target-inspector.mjs's own probe reports
+    // back (a real `docker network ls` only ever knows physical names),
+    // and what plan.mjs's own network.ensure operations create/expect -
+    // recording the logical key here instead would make every apply
+    // wrongly believe its own already-existing, already-external network
+    // was still missing.
+    networks: Object.values(rendered.compose.networks).map((network) => network.name).sort(),
     suppliedTlsCertificateFingerprint: suppliedTlsCertificateFingerprint ?? null,
     suppliedTlsPrivateKeyFingerprint: suppliedTlsPrivateKeyFingerprint ?? null,
   };
@@ -153,9 +166,18 @@ export function topologyToServiceState(rendered, catalog, { manifest, releaseLoc
 // label in a rendered topology.json agrees on, as an integer - or null
 // if the labels disagree, carry no hof.generation, or carry a
 // non-integer one. render-topology.mjs stamps hof.generation onto every
-// compose service, volume and network it produces (see ownershipLabels/
+// compose service and volume it produces (see ownershipLabels/
 // resourceOwnershipLabels), so a well-formed topology.json always has
-// exactly one distinct value here.
+// exactly one distinct value here. Networks are deliberately excluded
+// (item 9 review, network lifecycle finding): they're now external,
+// long-lived Compose references with no labels of their own at all (see
+// render-topology.mjs's own physicalNetworkName() comment on why a
+// network can never carry a per-generation label without Compose trying
+// to reconcile - and possibly destructively recreate - it on every
+// single `docker compose run` against ANY unit, not just ones that
+// actually changed) - Object.values(...networks) below still contributes
+// entries to labelSets, but each one's own `.labels` is now simply
+// undefined, which the filter just below already discards.
 function renderedTopologyGeneration(rendered) {
   const labelSets = [
     ...Object.values(rendered?.compose?.services ?? {}),

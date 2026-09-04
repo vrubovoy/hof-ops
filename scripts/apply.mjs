@@ -112,11 +112,15 @@ const ACTION_TO_ROLE = {
 // unit (image.pull itself carries no imageTrust field of its own - see
 // plan-v2.schema.json's own comment: "Only for image.verify").
 // installationId/generation are the exact same values renderTopology()
-// was called with - volume.ensure/network.ensure must label a resource
-// identically to how Compose would have labeled it itself. secret.ensure
-// and config.write don't carry their own real content here at all -
-// dispatchOperation() below mounts it in separately (see its own
-// comment on why: never through extra-vars/argv).
+// was called with - volume.ensure must label a resource identically to
+// how Compose would have labeled it itself (network.ensure deliberately
+// no longer does - item 9 review, network lifecycle finding: a network
+// is long-lived, shared infrastructure the Ansible network role now
+// owns exclusively, and never carries a per-generation label - see that
+// role's own comment on why). secret.ensure and config.write don't
+// carry their own real content here at all - dispatchOperation() below
+// mounts it in separately (see its own comment on why: never through
+// extra-vars/argv).
 //
 // Exported (unlike this file's other pure helpers not already exported
 // for test/apply-acceptance.mjs's own use - see computeExpectedCommittedState()'s
@@ -145,7 +149,16 @@ export function buildExtraVars(operation, { commitGeneration, imageTrustByUnit, 
     case "network.ensure":
       vars.hof_network_name = operation.resource;
       vars.hof_installation_id = installationId;
-      vars.hof_generation = generation;
+      // Item 9 review (network lifecycle finding): no hof_generation
+      // here - unlike volume.ensure, this network is long-lived, shared
+      // infrastructure the Ansible network role now owns exclusively
+      // (see that role's own comment on why a per-generation label used
+      // to make Compose fight it for ownership). operation.internal is
+      // only ever true for wachter-internal (plan.mjs's own
+      // network.ensure dispatch); absent (never explicitly false) for
+      // every other network, and the role's own default(false) handles
+      // that.
+      if (operation.internal) vars.hof_network_internal = true;
       break;
     case "image.verify":
       vars.hof_image_action = "verify";
@@ -216,11 +229,39 @@ function defaultExecFile(command, args, options = {}) {
 // Never a raw exception dump into the journal/stdout event stream (see
 // operation-event-v1.schema.json's own comment on `error`) - the last
 // handful of lines only, truncated, nothing from the environment.
+//
+// Item 9 review (operation ordering finding): 8 lines/2000 chars turned
+// out to be too aggressive for real diagnosis - a real CI failure
+// investigating a readiness.wait timeout found the surviving tail was
+// just ansible's own generic Python-interpreter-discovery warning
+// (printed once, early, but still the last few lines of the WHOLE
+// combined stdout when a long `until` retry loop's own "FAILED -
+// RETRYING" spam pushes everything actually useful (the failing
+// container's own last docker-inspect health status/log, which the
+// readiness role's own assert now surfaces explicitly - see that role's
+// own comment) further back than 8 lines could ever reach. Widened, not
+// removed - still bounded, still truncated, never a raw unbounded dump.
 function sanitizeError(error) {
   const raw = [error?.stdout, error?.stderr, error?.message].filter(Boolean).join("\n");
   const lines = raw.split("\n").filter((line) => line.trim().length > 0);
-  const tail = lines.slice(-8).join("\n");
-  return (tail || "operation failed with no further diagnostic detail").slice(0, 2000);
+  // Item 9 review (wachter finding, second pass): widened again - the
+  // readiness role's own assert now also carries the failing unit's own
+  // captured `docker logs` output alongside the State/Health JSON, and
+  // both together routinely exceed the previous 40-line/4000-char
+  // budget, silently dropping exactly the application-level detail this
+  // whole diagnostic chain exists to surface.
+  //
+  // Real bug found via a real CI run (item 9 review, third pass):
+  // `.slice(0, N)` keeps the FIRST N characters of the tail, not the
+  // last - backwards from the intent. The tail is already the last few
+  // lines chronologically, so the most recent, most relevant content
+  // (this role's own final assert - the whole reason this function
+  // takes a tail at all) sits at the END of that string; a single long
+  // line earlier in the tail (docker inspect's own escaped-JSON output)
+  // was enough to push it past a start-anchored cutoff and silently
+  // drop it, exactly as it did here.
+  const tail = lines.slice(-80).join("\n");
+  return (tail || "operation failed with no further diagnostic detail").slice(-8000);
 }
 
 // Runs one operation inside a fresh, throwaway Execution Environment

@@ -38,6 +38,17 @@
 # docker inspect's own JSON output, parsed in Jinja (from_json) - never
 # Go template syntax (`--format '{{.State.Status}}'`), which would
 # collide with Ansible's own Jinja templating of this same string.
+#
+# Item 9 review (operation ordering finding): ignore_errors here, plus
+# the explicit assert right after with its own detailed fail_msg - a
+# real CI investigation found the generic "FAILED - RETRYING" /
+# until-exhausted failure this task alone would otherwise report carries
+# no usable diagnostic at all once apply.mjs's own sanitizeError() takes
+# just the tail of the whole combined output (a long retry loop's own
+# repeated "FAILED - RETRYING" lines push anything actually useful well
+# past that tail). The retry behavior itself (until/retries/delay) is
+# completely unchanged - only how a FINAL, exhausted failure gets
+# reported differs now.
 - name: "Wait for the container to report: {{ hof_readiness_condition }}"
   ansible.builtin.command:
     argv:
@@ -52,3 +63,38 @@
     (hof_readiness_condition == "healthy" and (((hof_readiness_state.stdout | from_json)[0].State.Health.Status) | default('')) == "healthy")
   retries: 60
   delay: 2
+  ignore_errors: true
+
+# Item 9 review (wachter finding, second pass): the State/Health JSON
+# alone couldn't distinguish WHY a "healthy" condition's own probe
+# failed - it shows THAT the container's healthcheck failed, never
+# what the application itself saw. docker logs is the only way to see
+# that (the application's own stdout/stderr), and it costs nothing when
+# the wait above already succeeded (`is failed` skips this every time
+# but the one time this whole role's own point is to explain).
+- name: Capture this unit's own recent log output, for real diagnostic detail if the wait above never succeeded
+  when: hof_readiness_state is failed
+  ansible.builtin.command:
+    argv:
+      - docker
+      - logs
+      - --tail
+      - "50"
+      - "{{ hof_readiness_container_id.stdout | trim }}"
+  register: hof_readiness_container_logs
+  changed_when: false
+  failed_when: false
+
+- name: Assert the container actually reached the required condition, with real diagnostic detail on failure
+  ansible.builtin.assert:
+    that:
+      - >-
+        (hof_readiness_condition == "running" and (hof_readiness_state.stdout | from_json)[0].State.Status == "running")
+        or
+        (hof_readiness_condition == "healthy" and (((hof_readiness_state.stdout | from_json)[0].State.Health.Status) | default('')) == "healthy")
+    fail_msg: >-
+      container {{ hof_readiness_container_id.stdout | trim }} for compose service {{ hof_readiness_unit }}
+      never reached "{{ hof_readiness_condition }}" within its own retry budget - last observed State:
+      {{ (hof_readiness_state.stdout | from_json)[0].State | to_json }} - its own recent log output (stdout):
+      {{ hof_readiness_container_logs.stdout | default('(not captured)') }} - (stderr):
+      {{ hof_readiness_container_logs.stderr | default('(not captured)') }}

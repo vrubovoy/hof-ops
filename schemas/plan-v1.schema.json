@@ -215,6 +215,10 @@
           "uniqueItems": true,
           "items": { "type": "string" }
         },
+        "internal": {
+          "description": "Only for network.ensure (item 9 review, network lifecycle finding) - whether this network must be created with no default route to the outside world (Wachter's own wachter-internal network). Absent/false for every other network.",
+          "type": "boolean"
+        },
         "reason": { "type": "string" }
       }
     }

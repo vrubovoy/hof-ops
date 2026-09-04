@@ -99,7 +99,7 @@ import { buildDockerRunArgs, buildExtraVars, buildInventory, computeExpectedComm
 import { sha256 } from "../scripts/digest.mjs";
 import { buildEvent, buildJournalDocument, buildLockDocument, currentOperator, newOperationId } from "../scripts/operation-journal.mjs";
 import { runPlan } from "../scripts/plan-command.mjs";
-import { SUPPLIED_TLS_CERTIFICATE_SECRET_NAME, SUPPLIED_TLS_PRIVATE_KEY_SECRET_NAME } from "../scripts/render-topology.mjs";
+import { HOF_NETWORK_NAME, SUPPLIED_TLS_CERTIFICATE_SECRET_NAME, SUPPLIED_TLS_PRIVATE_KEY_SECRET_NAME } from "../scripts/render-topology.mjs";
 import { generateSecretValue } from "../scripts/secrets.mjs";
 import {
   acquireExecutionLease, acquireLockAndJournal, appendEvent, pinnedKnownHosts,
@@ -109,18 +109,38 @@ import { loadAndValidateDeployment } from "../scripts/validate-deployment.mjs";
 
 const RECOVERY_AGE_RECIPIENT = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
 // The real platform release this test downloads and applies - see
-// releases/0.2.0.yml (reuses releases/0.1.4.yml's own app-component
-// selections unchanged; only ansibleEnvironment moves to ee-v0.1.4, item
-// 9's own real, independently-verified cut - PR #53 - baking in the new
-// service-role start|stop|remove actions and the state role's own
-// immutable per-generation snapshots this file's own applied-lifecycle
-// half below exercises for real). `workflow_dispatch` signs with the
+// releases/0.2.3.yml (reuses releases/0.2.0.yml's own app-component
+// selections unchanged; only ansibleEnvironment moves to ee-v0.1.7, item
+// 9's own five review rounds (PR #57) PLUS every fix this same
+// verification PR (#58) itself needed along the way - network-lifecycle
+// (external hof/wachter-internal networks, sole Ansible ownership),
+// operation-ordering (dependency-aware service.start/readiness.wait
+// sequencing), and the real Docker-socket-gid fix that finally resolved
+// wachter's own persistent /ready 503 - see ADR 0005's own errata
+// sections for the full history. `workflow_dispatch` signs with the
 // DISPATCHING branch's own ref, never a tag (confirmed for real by
 // inspecting the v0.1.1 release's own certificate - `@refs/heads/main`,
 // not `@refs/tags/v0.1.1`), unlike execution-environment.yml's own
 // tag-triggered identity below.
-const RELEASE_VERSION = "0.2.0";
-const RELEASE_LOCK_IDENTITY = "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/heads/main";
+//
+// This whole file's own real acceptance run has, three times now,
+// forced a release bump one step later than expected: v0.2.0 -> v0.2.1
+// (PR #57's Wachter-ordering fix changed composeTemplateDigest) ->
+// v0.2.2 (PR #58's OWN network-lifecycle fix changed it again) -> v0.2.3
+// (v0.2.2's own wachter-agent EACCES against the real Docker socket -
+// ee-v0.1.6 never carried the fix, since this scenario always runs
+// against the real, published, pinned ansibleEnvironment image, never a
+// locally-rebuilt one) - apply's own supply-chain check correctly
+// refusing a stale release each time, exactly as intended.
+//
+// RELEASE_LOCK_IDENTITY is transiently `item-9-v021-verification`, not
+// `main` - v0.2.3, like v0.2.2 before it, was cut via `workflow_dispatch
+// --ref item-9-v021-verification` (dispatched straight against this
+// PR's own branch, never requiring it to be merged first just to verify
+// the fix it itself contains). Once a future release is eventually cut
+// from `main` again post-merge, this reverts to `@refs/heads/main`.
+const RELEASE_VERSION = "0.2.3";
+const RELEASE_LOCK_IDENTITY = "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/heads/item-9-v021-verification";
 
 const exec = promisify(execFile);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -134,14 +154,20 @@ const networkName = `hof-apply-acceptance-${randomUUID()}`;
 // Environment image builds" CI check already runs), used ONLY via
 // apply.mjs's own executionEnvironmentImageOverride seam for the two
 // scenarios below that specifically need the FIXED state role's real
-// atomic-publish/retry behavior - ee-v0.1.4, the real, published image
-// every other scenario in this file still uses unmodified, does not
-// have that fix baked in yet (it's an Ansible role, baked in at image-
-// build time, not a control-plane script). Every other new scenario
-// below (the execution lease, secret scoping, Wächter ordering) is
-// entirely control-plane code (scripts/, never ansible/roles/) and
-// needs no override at all - it runs against the real, published,
-// signed image, same as the rest of this file.
+// atomic-publish/retry behavior. This seam predates ee-v0.1.5 - at the
+// time it was written, ee-v0.1.4 (the real, published image every other
+// scenario in this file used) did not have that fix baked in yet (it's
+// an Ansible role, baked in at image-build time, not a control-plane
+// script). Verification PR (0.2.1/ee-v0.1.5): the real, published image
+// now DOES have it too, since it's built from the exact same
+// ansible/roles/state/tasks/main.yml this working tree's own local
+// build reads - making this override strictly redundant for those two
+// scenarios specifically. Left as-is here: removing it is a real
+// simplification, but out of scope for this narrow release-version
+// bump. Every other new scenario below (the execution lease, secret
+// scoping, Wächter ordering) is entirely control-plane code (scripts/,
+// never ansible/roles/) and needs no override at all - it runs against
+// the real, published, signed image, same as the rest of this file.
 const localEeImageTag = "hof-ops-apply-acceptance-local-ee:test";
 
 let workDir;
@@ -367,7 +393,30 @@ async function readCurrentState() {
   return JSON.parse(await onTarget("cat", "/var/lib/hof/state/current.json"));
 }
 
-test("a real, full bootstrap apply against the real, published, signed v0.2.0 release, then a real applied-mode reconciliation lifecycle against the same target - every real role, start to finish, generation 1 through 4", async () => {
+// Item 9 review (network lifecycle finding): discovers a Compose
+// service's own real container by its own compose ownership labels,
+// exactly like ansible/roles/readiness/tasks/main.yml's own real
+// discovery does ("never by guessing Compose's own container-naming
+// convention" - that role's own comment) - NEVER by assuming the bare
+// service key is the container's own name. A real, empirical check
+// against this exact Compose version found containers are actually
+// named `<project>-<service>-<n>` (e.g. "hof-kuvert-backend-1", not
+// "kuvert-backend") - a latent bug in this test file's own PRE-EXISTING
+// exact-name assertions too (see the container-name check further
+// down), never caught before because this whole test had never
+// actually run this far in any real CI attempt until this same round.
+// Returns the container's own id, or null if none is currently running
+// for this unit.
+async function containerIdForUnit(unit) {
+  const stdout = await onTarget(
+    "docker", "ps", "--all", "-q",
+    "--filter", "label=com.docker.compose.project=hof",
+    "--filter", `label=com.docker.compose.service=${unit}`,
+  );
+  return stdout.trim() || null;
+}
+
+test("a real, full bootstrap apply against the real, published, signed v0.2.3 release, then a real applied-mode reconciliation lifecycle against the same target - every real role, start to finish, generation 1 through 4", async () => {
   // The real operator workflow, exercised for real: a genuine `hofctl
   // plan` run (real inspectTarget() over the real SSH transport this
   // whole fixture already sets up, real cosign verification of the
@@ -803,6 +852,23 @@ test("an applied change delivers ONLY the secrets its own scoped set names (neve
   const heroldValue = generateSecretValue("token");
   const wachterValue = generateSecretValue("token");
 
+  // Item 9 review (network lifecycle finding): kuvert is already
+  // enabled and running here (the bootstrap+lifecycle test above this
+  // one leaves it that way - see this section's own top comment), and
+  // completely unrelated to herold/wachter - this real target is
+  // exactly the scenario that found the bug in the first place:
+  // enabling herold's own database.migrate used to trip Compose into
+  // trying to remove-then-recreate the "hof" network mid-apply, which
+  // Docker correctly refused because kuvert's own containers were still
+  // attached to it. Captured here, before the apply below, and compared
+  // again after it: kuvert's own containers and the network itself must
+  // be the exact same real Docker objects throughout - untouched,
+  // unrestarted, never recreated - by an apply that never had any
+  // reason to touch either.
+  const kuvertContainerIdsBefore = await Promise.all(["kuvert-backend", "kuvert-frontend"].map(containerIdForUnit));
+  assert.ok(kuvertContainerIdsBefore.every(Boolean), `fixture assumption: kuvert's own containers are already running - ${JSON.stringify(kuvertContainerIdsBefore)}`);
+  const hofNetworkIdBefore = await onTarget("docker", "network", "inspect", "--format", "{{.Id}}", HOF_NETWORK_NAME);
+
   const manifest = YAML.parse(await readFile(servicesPath, "utf8"));
   manifest.services.herold.enabled = true;
   manifest.services.wachter.enabled = true;
@@ -872,19 +938,39 @@ test("an applied change delivers ONLY the secrets its own scoped set names (neve
   assert.ok(agentReadySucceeded && apiStartStarted, "fixture assumption: both events exist in a successful enable");
   assert.ok(new Date(agentReadySucceeded.at).getTime() <= new Date(apiStartStarted.at).getTime(), "the agent must be confirmed ready before the API unit is even started");
 
-  // Item 9 SECOND review fix (finding 10): exact container names, not a
-  // substring/word-boundary regex - /wachter\b/ also matches inside
+  // Item 9 SECOND review fix (finding 10): exact container IDENTITY, not
+  // a substring/word-boundary regex - /wachter\b/ also matches inside
   // "wachter-agent" (the boundary lands on the hyphen), so it could
   // never actually distinguish "the API's own container exists" from
   // "only the agent's does". The real ordering proof is the event-
-  // timestamp assertion above; this is just a liveness confirmation, now
-  // an exact one.
-  const namesAfter = (await onTarget("docker", "ps", "--format", "{{.Names}}")).split("\n").map((name) => name.trim()).filter(Boolean);
+  // timestamp assertion above; this is just a liveness confirmation.
+  //
+  // Item 9 review fix (network lifecycle finding): this used to compare
+  // `docker ps`'s own reported names against the BARE service key
+  // ("wachter-agent", "kuvert-backend", ...) - never actually true for a
+  // real Compose-started container (a real empirical check found
+  // Compose names them `<project>-<service>-<n>`, e.g.
+  // "hof-kuvert-backend-1" - see containerIdForUnit()'s own comment).
+  // This assertion had never actually run before this exact round (every
+  // earlier CI attempt failed before ever reaching it), so the bug was
+  // never caught. Fixed to discover by compose ownership label, exactly
+  // like the real readiness role itself does, never by guessing a name.
   // herold-backend/herold-frontend - catalog/services-v1.yaml's own two
   // artifacts for herold, not a single "herold" unit.
-  for (const expected of ["wachter-agent", "wachter", "herold-backend", "herold-frontend"]) {
-    assert.ok(namesAfter.includes(expected), `expected an exact container named "${expected}" among ${JSON.stringify(namesAfter)}`);
+  for (const unit of ["wachter-agent", "wachter", "herold-backend", "herold-frontend"]) {
+    assert.ok(await containerIdForUnit(unit), `expected a real container for compose service "${unit}"`);
   }
+  // kuvert must never have restarted (this apply had no reason to touch
+  // it at all - see this test's own comment on the network-race bug
+  // this pins), and the "hof" network itself must never have been
+  // recreated. If either drops, some future regression is doing exactly
+  // what the network-lifecycle bug used to do: treating this stable,
+  // unrelated infrastructure as if a completely different operation
+  // owned it.
+  const kuvertContainerIdsAfter = await Promise.all(["kuvert-backend", "kuvert-frontend"].map(containerIdForUnit));
+  assert.deepEqual(kuvertContainerIdsAfter, kuvertContainerIdsBefore, "kuvert's own containers are the exact same real Docker objects - never restarted or recreated by enabling herold/wachter");
+  const hofNetworkIdAfter = await onTarget("docker", "network", "inspect", "--format", "{{.Id}}", HOF_NETWORK_NAME);
+  assert.equal(hofNetworkIdAfter, hofNetworkIdBefore, "the \"hof\" network is the exact same real Docker object - Compose never recreated it (item 9 review, network lifecycle finding)");
 
   // A FURTHER, unrelated applied change (another config-only backup
   // edit, touching no secret-consuming unit) must NEVER re-deliver

@@ -38,6 +38,17 @@
 # docker inspect's own JSON output, parsed in Jinja (from_json) - never
 # Go template syntax (`--format '{{.State.Status}}'`), which would
 # collide with Ansible's own Jinja templating of this same string.
+#
+# Item 9 review (operation ordering finding): ignore_errors here, plus
+# the explicit assert right after with its own detailed fail_msg - a
+# real CI investigation found the generic "FAILED - RETRYING" /
+# until-exhausted failure this task alone would otherwise report carries
+# no usable diagnostic at all once apply.mjs's own sanitizeError() takes
+# just the tail of the whole combined output (a long retry loop's own
+# repeated "FAILED - RETRYING" lines push anything actually useful well
+# past that tail). The retry behavior itself (until/retries/delay) is
+# completely unchanged - only how a FINAL, exhausted failure gets
+# reported differs now.
 - name: "Wait for the container to report: {{ hof_readiness_condition }}"
   ansible.builtin.command:
     argv:
@@ -52,3 +63,16 @@
     (hof_readiness_condition == "healthy" and (((hof_readiness_state.stdout | from_json)[0].State.Health.Status) | default('')) == "healthy")
   retries: 60
   delay: 2
+  ignore_errors: true
+
+- name: Assert the container actually reached the required condition, with real diagnostic detail on failure
+  ansible.builtin.assert:
+    that:
+      - >-
+        (hof_readiness_condition == "running" and (hof_readiness_state.stdout | from_json)[0].State.Status == "running")
+        or
+        (hof_readiness_condition == "healthy" and (((hof_readiness_state.stdout | from_json)[0].State.Health.Status) | default('')) == "healthy")
+    fail_msg: >-
+      container {{ hof_readiness_container_id.stdout | trim }} for compose service {{ hof_readiness_unit }}
+      never reached "{{ hof_readiness_condition }}" within its own retry budget - last observed State:
+      {{ (hof_readiness_state.stdout | from_json)[0].State | to_json }}

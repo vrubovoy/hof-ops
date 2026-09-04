@@ -229,11 +229,23 @@ function defaultExecFile(command, args, options = {}) {
 // Never a raw exception dump into the journal/stdout event stream (see
 // operation-event-v1.schema.json's own comment on `error`) - the last
 // handful of lines only, truncated, nothing from the environment.
+//
+// Item 9 review (operation ordering finding): 8 lines/2000 chars turned
+// out to be too aggressive for real diagnosis - a real CI failure
+// investigating a readiness.wait timeout found the surviving tail was
+// just ansible's own generic Python-interpreter-discovery warning
+// (printed once, early, but still the last few lines of the WHOLE
+// combined stdout when a long `until` retry loop's own "FAILED -
+// RETRYING" spam pushes everything actually useful (the failing
+// container's own last docker-inspect health status/log, which the
+// readiness role's own assert now surfaces explicitly - see that role's
+// own comment) further back than 8 lines could ever reach. Widened, not
+// removed - still bounded, still truncated, never a raw unbounded dump.
 function sanitizeError(error) {
   const raw = [error?.stdout, error?.stderr, error?.message].filter(Boolean).join("\n");
   const lines = raw.split("\n").filter((line) => line.trim().length > 0);
-  const tail = lines.slice(-8).join("\n");
-  return (tail || "operation failed with no further diagnostic detail").slice(0, 2000);
+  const tail = lines.slice(-40).join("\n");
+  return (tail || "operation failed with no further diagnostic detail").slice(0, 4000);
 }
 
 // Runs one operation inside a fresh, throwaway Execution Environment

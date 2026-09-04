@@ -250,8 +250,18 @@ function sanitizeError(error) {
   // both together routinely exceed the previous 40-line/4000-char
   // budget, silently dropping exactly the application-level detail this
   // whole diagnostic chain exists to surface.
+  //
+  // Real bug found via a real CI run (item 9 review, third pass):
+  // `.slice(0, N)` keeps the FIRST N characters of the tail, not the
+  // last - backwards from the intent. The tail is already the last few
+  // lines chronologically, so the most recent, most relevant content
+  // (this role's own final assert - the whole reason this function
+  // takes a tail at all) sits at the END of that string; a single long
+  // line earlier in the tail (docker inspect's own escaped-JSON output)
+  // was enough to push it past a start-anchored cutoff and silently
+  // drop it, exactly as it did here.
   const tail = lines.slice(-80).join("\n");
-  return (tail || "operation failed with no further diagnostic detail").slice(0, 8000);
+  return (tail || "operation failed with no further diagnostic detail").slice(-8000);
 }
 
 // Runs one operation inside a fresh, throwaway Execution Environment

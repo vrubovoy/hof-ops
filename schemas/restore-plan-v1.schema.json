@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/restore-plan-v1.schema.json",
+  "title": "Hof restore plan",
+  "description": "hofctl restore's own deterministic plan contract (ADR 0006) - always against a SECOND, genuinely clean target instance, never the same host a backup was taken from (that is in-place restore, item 11's own later scope). target below is the new host's own freshly-observed binding; source below is the historical installation being restored onto it - the two are never conflated, and installationId/generation are restored verbatim from source, never incremented.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion", "planId", "executable", "target", "backupId", "destinationName", "source",
+    "recoveryKitDigest", "backupToolLockDigest", "consistencySet", "operations", "warnings", "blockers"
+  ],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/restore-plan/v1" },
+    "planId": {
+      "description": "sha256 of this plan's own inputs+target binding+source+consistencySet, deterministic - never includes a timestamp.",
+      "$ref": "#/$defs/sha256"
+    },
+    "executable": {
+      "description": "false when blockers is non-empty (target not genuinely clean, snapshot/manifest/release-lock verification failed, another operation already in progress, ...).",
+      "type": "boolean"
+    },
+    "target": {
+      "description": "The NEW, clean target this restore will run against - its own freshly-observed host key, re-checked once more under the mutex before any restore operation is dispatched (never trusted from planning time alone).",
+      "$ref": "#/$defs/targetBinding"
+    },
+    "backupId": { "$ref": "#/$defs/sha256" },
+    "destinationName": {
+      "description": "Which of the historical backup's own configured destinations this snapshot is being read from.",
+      "$ref": "#/$defs/identifier"
+    },
+    "source": {
+      "description": "The historical installation this backup was taken from - kept distinct from target's own identity for the whole lifetime of this plan and the operation it produces.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["installationId", "generation", "release", "releaseLockDigest"],
+      "properties": {
+        "installationId": { "type": "string", "minLength": 1 },
+        "generation": { "type": "integer", "minimum": 1 },
+        "release": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "releaseLockDigest": {
+          "description": "The historical release lock's own digest, verified against its own original Cosign signature identity - a release lock from an older platform release, restored onto a target running today's tooling, must still verify against exactly the identity it was originally signed with.",
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "recoveryKitDigest": {
+      "description": "sha256 of the recovery kit used for this restore (the encrypted recovery copy of application/TLS/backup secrets, plus the recovery age identity that decrypts it) - never the kit's own decrypted content.",
+      "$ref": "#/$defs/sha256"
+    },
+    "backupToolLockDigest": {
+      "description": "The signed backup-tool-lock this plan was verified against, and whose pinned runner/restic/sops/age binaries this restore actually uses.",
+      "$ref": "#/$defs/sha256"
+    },
+    "consistencySet": {
+      "description": "Same shape as backup-plan-v1's own consistencySet (copied, not $ref'd) - every volume this restore must recreate and repopulate together for a coherent result.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/consistencySetEntry" }
+    },
+    "operations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/operation" }
+    },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "blockers": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "operationId": {
+      "type": "string",
+      "pattern": "^[0-9]{3}\\.[a-z][a-z0-9.-]{0,80}$"
+    },
+    "targetBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "host", "port", "user", "hostKeySha256", "installationId", "baselineGeneration"],
+      "properties": {
+        "mode": { "enum": ["ssh", "local"] },
+        "host": { "type": ["string", "null"] },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "user": { "type": ["string", "null"] },
+        "hostKeySha256": { "type": ["string", "null"], "pattern": "^SHA256:[A-Za-z0-9+/]+=*$" },
+        "installationId": {
+          "description": "The NEW target's own installationId - always null at plan time (a genuinely clean host has none yet); state.restore is what actually assigns source.installationId to it.",
+          "const": null
+        },
+        "baselineGeneration": {
+          "description": "Always 0 - a restore target is required to be genuinely clean, never a host with any prior Hof state of its own.",
+          "const": 0
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "ssh" } } },
+          "then": { "properties": { "hostKeySha256": { "type": "string" } } },
+          "else": { "properties": { "hostKeySha256": { "const": null } } }
+        }
+      ]
+    },
+    "consistencySetEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service", "unit", "volume", "retained"],
+      "properties": {
+        "service": { "$ref": "#/$defs/identifier" },
+        "unit": { "$ref": "#/$defs/identifier" },
+        "volume": { "$ref": "#/$defs/identifier" },
+        "retained": { "type": "boolean" }
+      }
+    },
+    "operation": {
+      "description": "The Restore Flow's own fixed, typed operation whitelist (ADR 0006) - no generic executor. Dispatched in list order, under the shared execution mutex, against the new target only.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "phase", "action", "resource", "reason"],
+      "properties": {
+        "id": { "$ref": "#/$defs/operationId" },
+        "phase": {
+          "enum": [
+            "runner", "target", "snapshot", "data", "verification", "checkpoint",
+            "config", "secret", "state", "service", "readiness", "evidence"
+          ]
+        },
+        "action": {
+          "enum": [
+            "runner.install", "target.verify-clean", "snapshot.verify", "volume.create", "data.restore",
+            "manifest.verify", "database.integrity-check", "checkpoint.data-restored", "config.restore",
+            "secret.materialize", "state.restore", "service.start", "readiness.wait", "evidence.write"
+          ]
+        },
+        "resource": {
+          "description": "The unit, volume, or fixed checkpoint/config label this operation concerns, depending on action.",
+          "type": "string"
+        },
+        "condition": {
+          "description": "Only for readiness.wait - reuses plan-v2's own running/healthy vocabulary.",
+          "enum": ["running", "healthy"]
+        },
+        "reason": { "type": "string" }
+      }
+    }
+  }
+}

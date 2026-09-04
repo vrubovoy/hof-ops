@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/restore-evidence-v1.schema.json",
+  "title": "Hof restore evidence",
+  "description": "Written atomically once a restore operation reaches its own end (ADR 0006's own Restore Flow step 12) - immutable once written. Kept entirely separate from the restored installation's own generation history (state-v1.schema.json has no restore-provenance field at all, by design - a restored installationId/generation must read exactly as if that generation had always lived on this hardware, with the fact that it arrived via a restore recorded only here, never folded into current.json itself).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "operationId", "backupId", "source", "target", "startedAt", "completedAt", "status", "dataRestoredCheckpointAt", "readinessConfirmedAt"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/restore-evidence/v1" },
+    "operationId": { "$ref": "#/$defs/operationId" },
+    "backupId": { "$ref": "#/$defs/sha256" },
+    "source": {
+      "description": "The historical installation this restore recovered - see restore-plan-v1's own identical shape.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["installationId", "generation", "release", "releaseLockDigest"],
+      "properties": {
+        "installationId": { "type": "string", "minLength": 1 },
+        "generation": { "type": "integer", "minimum": 1 },
+        "release": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "releaseLockDigest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "target": {
+      "description": "The new host this was actually restored onto.",
+      "$ref": "#/$defs/targetBinding"
+    },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "completedAt": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["succeeded", "failed"] },
+    "dataRestoredCheckpointAt": {
+      "description": "When checkpoint.data-restored was durably recorded - null if the operation never reached it (a --resume before this point may still delete this operation's own volumes and restart materialization from nothing; a --resume after it never rewrites data again).",
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "readinessConfirmedAt": {
+      "description": "When readiness.wait last confirmed the fully-restored platform ready - null unless status is succeeded.",
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "error": {
+      "description": "Only for status: failed - a short, sanitized diagnostic. Never a raw exception dump, a secret value, decrypted content, or an SSH private-key path.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "failed" } } },
+      "then": { "required": ["error"] },
+      "else": { "not": { "required": ["error"] } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "succeeded" } } },
+      "then": { "properties": { "readinessConfirmedAt": { "type": "string" }, "dataRestoredCheckpointAt": { "type": "string" } } }
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "operationId": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "targetBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "host", "port", "user", "hostKeySha256", "installationId", "baselineGeneration"],
+      "properties": {
+        "mode": { "enum": ["ssh", "local"] },
+        "host": { "type": ["string", "null"] },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "user": { "type": ["string", "null"] },
+        "hostKeySha256": { "type": ["string", "null"], "pattern": "^SHA256:[A-Za-z0-9+/]+=*$" },
+        "installationId": { "type": ["string", "null"] },
+        "baselineGeneration": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

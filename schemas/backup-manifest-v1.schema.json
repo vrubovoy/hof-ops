@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/backup-manifest-v1.schema.json",
+  "title": "Hof backup manifest",
+  "description": "Written into the staging tree (ADR 0006's own Backup Flow step 8) and so into every destination's own snapshot alongside it - the one document restore reads BEFORE trusting anything else in the snapshot. Carries the same digest quartet state-v1.schema.json already uses so restore can verify this snapshot's own generated config against a real, independently-verifiable signed historical release lock, without ever having to trust the snapshot's own unsigned content alone.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion", "backupId", "createdAt", "installationId", "generation", "release", "manifestDigest",
+    "releaseLockDigest", "catalogDigest", "composeTemplateDigest", "backupToolLockDigest", "consistencySet",
+    "sanitizedManifestIncluded", "recoveryStoreIncluded"
+  ],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/backup-manifest/v1" },
+    "backupId": { "$ref": "#/$defs/sha256" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "installationId": { "type": "string", "minLength": 1 },
+    "generation": { "type": "integer", "minimum": 1 },
+    "release": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "manifestDigest": { "$ref": "#/$defs/sha256" },
+    "releaseLockDigest": { "$ref": "#/$defs/sha256" },
+    "catalogDigest": { "$ref": "#/$defs/sha256" },
+    "composeTemplateDigest": { "$ref": "#/$defs/sha256" },
+    "backupToolLockDigest": { "$ref": "#/$defs/sha256" },
+    "consistencySet": {
+      "description": "Same shape as backup-plan-v1's own consistencySet (copied, not $ref'd) - exactly what this snapshot actually contains, so restore can confirm the volume set it's about to recreate matches what this manifest claims before restoring a single byte.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/consistencySetEntry" }
+    },
+    "sanitizedManifestIncluded": {
+      "description": "Whether the staging tree included a sanitized copy of services.yml (secretRef names only, never a resolved secret value).",
+      "type": "boolean"
+    },
+    "recoveryStoreIncluded": {
+      "description": "Whether the staging tree included the encrypted recovery copy of application/TLS/backup secrets - always true for a real backup; false only ever appears on a fixture/test document.",
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "consistencySetEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service", "unit", "volume", "retained"],
+      "properties": {
+        "service": { "$ref": "#/$defs/identifier" },
+        "unit": { "$ref": "#/$defs/identifier" },
+        "volume": { "$ref": "#/$defs/identifier" },
+        "retained": { "type": "boolean" }
+      }
+    }
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/operation-journal-v2.schema.json",
+  "title": "Hof operation journal (v2, kind-generic)",
+  "description": "/var/lib/hof/state/journal/<operationId>.json - the durable, per-operation-run header record on the target. Identical to operation-journal-v1 except for the added operationKind field (ADR 0006) and its own committedGeneration semantics below. Written once at operation start (immutable except `status`/`committedGeneration`, updated only by the same operationId that created it); individual attempts are recorded separately as an append-only operation-event-v1 log (unchanged, kind-agnostic) this journal's own operationId ties them to. A pre-existing journal written before this ADR has no operationKind field and does not validate against this schema - an executor must still read and safely resume it as operation-journal-v1 (implicit \"apply\"), never refuse it outright just because the field is absent. Never holds a secret value, decrypted content, an environment dump, or an SSH private-key path - safe to read, copy, or attach to a bug report without a second sanitization pass.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "operationKind", "operationId", "approvedPlanId", "target", "plan", "inputDigests", "startedAt", "status", "committedGeneration"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/operation-journal/v2" },
+    "operationKind": {
+      "description": "Which of the three operation state machines produced this journal. Decides which plan schema `plan` below was validated against before being embedded (plan-v2 for apply, backup-plan-v1 for backup, restore-plan-v1 for restore) and this journal's own committedGeneration semantics (see below).",
+      "enum": ["apply", "backup", "restore"]
+    },
+    "operationId": { "$ref": "#/$defs/operationId" },
+    "approvedPlanId": {
+      "description": "The exact plan this run was approved against (--approve-plan-id) - equal to plan.planId below by construction, regardless of operationKind.",
+      "$ref": "#/$defs/planId"
+    },
+    "target": { "$ref": "#/$defs/targetBinding" },
+    "plan": {
+      "description": "The full, exact plan document this operation was approved against - not just its planId. Loosely typed here on purpose (no schema in this repo cross-references another by $id) - already validated against the schema matching operationKind before ever being embedded.",
+      "type": "object"
+    },
+    "inputDigests": {
+      "description": "Every input this specific run is bound to, fixed at journal creation and never recomputed from a live file again mid-run. executionEnvironmentDigest is the EE image actually dispatched from - for backup/restore this is the backup-tool-lock's own pinned image, not necessarily the platform release's ansibleEnvironment image (ADR 0006's whole point: a backup/restore tool build moves independently of the platform release).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifestDigest", "releaseLockDigest", "catalogDigest", "composeTemplateDigest", "executionEnvironmentDigest"],
+      "properties": {
+        "manifestDigest": { "$ref": "#/$defs/sha256" },
+        "releaseLockDigest": { "$ref": "#/$defs/sha256" },
+        "catalogDigest": { "$ref": "#/$defs/sha256" },
+        "composeTemplateDigest": { "$ref": "#/$defs/sha256" },
+        "executionEnvironmentDigest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "status": {
+      "description": "in-progress: the operation is running or was interrupted and not yet resolved either way. succeeded: every dispatched operation completed (for backup, every configured destination - a partial result is a failure here, recorded separately in backup-evidence-v1). failed: a fatal, unresumable outcome - the operator must diagnose per this operationKind's own recovery rules, never blindly retry this same journal.",
+      "enum": ["in-progress", "succeeded", "failed"]
+    },
+    "committedGeneration": {
+      "description": "apply: the newly-committed generation once state.commit succeeds, exactly as operation-journal-v1. backup: always null, even on success - a backup never mutates current.json or the generation at all. restore: the restored SOURCE generation once state.restore succeeds, carried forward verbatim, never incremented - this is the same installation's history continuing on new hardware, not a new applied change. Null for the entire lifetime of a run that never reaches its own commit point, including every failed one, regardless of kind.",
+      "type": ["integer", "null"],
+      "minimum": 1
+    }
+  },
+  "allOf": [
+    {
+      "description": "The status/committedGeneration/operationKind pairing this schema's own field descriptions above already document, actually enforced - reusing operation-journal-v1's own already-reviewed if/then/else mechanism (2026-08-31), extended one level for operationKind's own backup exception.",
+      "if": { "properties": { "status": { "const": "succeeded" } } },
+      "then": {
+        "if": { "properties": { "operationKind": { "const": "backup" } } },
+        "then": { "properties": { "committedGeneration": { "type": "null" } } },
+        "else": { "properties": { "committedGeneration": { "type": "integer", "minimum": 1 } } }
+      },
+      "else": { "properties": { "committedGeneration": { "type": "null" } } }
+    }
+  ],
+  "$defs": {
+    "operationId": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "planId": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "targetBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "host", "port", "user", "hostKeySha256", "installationId", "baselineGeneration"],
+      "properties": {
+        "mode": { "enum": ["ssh", "local"] },
+        "host": { "type": ["string", "null"] },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "user": { "type": ["string", "null"] },
+        "hostKeySha256": { "type": ["string", "null"], "pattern": "^SHA256:[A-Za-z0-9+/]+=*$" },
+        "installationId": { "type": ["string", "null"] },
+        "baselineGeneration": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

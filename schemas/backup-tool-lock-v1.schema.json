@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/backup-tool-lock-v1.schema.json",
+  "title": "Hof signed backup tool lock",
+  "description": "Independent of release-lock-v1 (ADR 0006) - pins the exact signed Execution Environment image, and the exact restic/sops/age versions baked into it, that hofctl backup/restore actually trusts and dispatches its target-side runner from. Deliberately versioned under its own backup-tool-vX.Y.Z tag namespace, distinct from both platform vX.Y.Z releases and ee-vX.Y.Z Execution Environment tags, so a backup-tool fix can ship - and v0.2.3 (already published, no backup path at all) can get a real one - without cutting a new platform release at all, breaking what would otherwise be an upgrade-needs-backup-needs-upgrade cycle. Never $ref's release-lock-v1.schema.json (this repo's own no-cross-file-$ref convention) - the shared artifact shape is copied independently.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "source", "revision", "sourceTag", "image", "signatureIdentity", "signatureOidcIssuer", "provenanceDigest", "sbomDigest", "pinnedTools"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/backup-tool-lock/v1" },
+    "source": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/" },
+    "revision": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "sourceTag": {
+      "description": "backup-tool-vX.Y.Z - never plain vX.Y.Z (a platform release) or ee-vX.Y.Z (the Execution Environment alone) - three independent tag namespaces in one repository must never be able to collide.",
+      "type": "string",
+      "pattern": "^backup-tool-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "image": {
+      "description": "Digest-pinned, never a tag - the same Execution Environment image the runner and its pinned restic/sops/age binaries are delivered from.",
+      "type": "string",
+      "pattern": "^[a-z0-9.-]+/[a-z0-9_./-]+@sha256:[a-f0-9]{64}$"
+    },
+    "signatureIdentity": {
+      "description": "The Cosign keyless signing identity (a GitHub Actions workflow path) - the exact same trust mechanism release-lock-v1's own first-party components already use.",
+      "type": "string",
+      "pattern": "^https://github\\.com/"
+    },
+    "signatureOidcIssuer": { "type": "string", "format": "uri", "pattern": "^https://" },
+    "provenanceDigest": { "$ref": "#/$defs/sha256" },
+    "sbomDigest": { "$ref": "#/$defs/sha256" },
+    "pinnedTools": {
+      "description": "The exact restic/sops/age versions baked into this image at build time - the target-side runner refuses to start if what it actually finds on disk doesn't match, rather than silently trusting whatever binary happens to be present.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["restic", "sops", "age"],
+      "properties": {
+        "restic": { "type": "string", "minLength": 1 },
+        "sops": { "type": "string", "minLength": 1 },
+        "age": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+  }
+}

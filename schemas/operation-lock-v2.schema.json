@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/operation-lock-v2.schema.json",
+  "title": "Hof operation lock (v2, kind-generic)",
+  "description": "/var/lib/hof/state/lock.json - exclusive ownership of an in-progress or interrupted operation against this host. Identical to operation-lock-v1 except for the added operationKind field (ADR 0006): apply, backup, and restore now all share one physical execution mutex, refusing each other in every direction, not just same-kind contention. A pre-existing lock.json written before this ADR has no operationKind field at all and does not validate against this schema - an executor reading it must treat that absence as an implicit \"apply\" (operation-lock-v1 is still valid, still readable, never deleted). Deliberately has no TTL/expiry field - the lock must survive the invoking process dying (an operator's laptop sleeping, a network drop), so it is only ever removed by a successful commit or reclaimed by --resume for the SAME operationId, never by simply waiting it out.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "operationKind", "operationId", "approvedPlanId", "target", "acquiredAt", "acquiredBy"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/operation-lock/v2" },
+    "operationKind": {
+      "description": "Which of the three operation state machines this lock belongs to - the whole reason this schema exists rather than reusing operation-lock-v1 unchanged. A backup or restore in progress refuses a concurrent apply against the same target, and vice versa, exactly as an apply already refuses a concurrent apply.",
+      "enum": ["apply", "backup", "restore"]
+    },
+    "operationId": {
+      "description": "This operation's own unique identifier - ties the lock to its operation journal (same field name) and to every operation-event-v1 record it emits.",
+      "$ref": "#/$defs/operationId"
+    },
+    "approvedPlanId": {
+      "description": "The approved plan's own planId - a plan-v2, backup-plan-v1, or restore-plan-v1 planId depending on operationKind (all three use the same sha256-of-inputs shape).",
+      "$ref": "#/$defs/planId"
+    },
+    "target": { "$ref": "#/$defs/targetBinding" },
+    "acquiredAt": { "type": "string", "format": "date-time" },
+    "acquiredBy": {
+      "description": "Informational only, for a human debugging a stuck lock - never used for an actual security decision (the lock's own operationId is the only thing that authorizes a resume).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workstation", "pid", "user"],
+      "properties": {
+        "workstation": { "type": "string", "minLength": 1 },
+        "pid": { "type": "integer", "minimum": 1 },
+        "user": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "$defs": {
+    "operationId": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "planId": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "targetBinding": {
+      "description": "The exact target this operation was approved against - see plan-v2.schema.json's own `target` for the full description of each field. Duplicated here (not $ref'd across files - no schema in this repo cross-references another by $id) so this schema stays independently valid on its own.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "host", "port", "user", "hostKeySha256", "installationId", "baselineGeneration"],
+      "properties": {
+        "mode": { "enum": ["ssh", "local"] },
+        "host": { "type": ["string", "null"] },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "user": { "type": ["string", "null"] },
+        "hostKeySha256": {
+          "description": "The exact accepted SSH host-key fingerprint from the same connection the bound plan was computed against - null only in --target-mode local. A host-key change invalidates every plan bound to the old one.",
+          "type": ["string", "null"],
+          "pattern": "^SHA256:[A-Za-z0-9+/]+=*$"
+        },
+        "installationId": { "type": ["string", "null"] },
+        "baselineGeneration": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

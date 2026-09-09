@@ -318,9 +318,20 @@ Releases are cut in two stages: an immutable **candidate**, then a
 after a real published-artifact acceptance run. Both `release.yml` and
 `promote.yml` split into a read-only job and a privileged publish job; the
 privileged job runs under a GitHub **Environment** (`release` / `promote`)
-whose deployment branch policy allows protected branches only, so GitHub
-will not start it from anything but `main` — a feature branch cannot mint a
-Sigstore certificate or create a release even if it edits the workflow.
+whose deployment branch policy allows protected branches only.
+
+For an **unmodified** workflow this means GitHub will not start the
+privileged job from anything but `main`. It is not an absolute boundary:
+because a feature branch controls its own copy of the workflow file, it
+could drop the `environment:` key and request `contents: write` /
+`id-token: write` directly. What that still cannot do is mint a Sigstore
+certificate with the `@refs/heads/main` identity `promote.yml` requires for
+stable, or create an `ee-v*` tag (repository ruleset). The residual
+exposure is limited to squatting a `v*` namespace or emitting
+branch-identity certificates — never forging stable release authority.
+Closing that last gap needs a GitHub App publisher plus a `v*`
+tag-creation ruleset that only the App can satisfy; see
+[SECURITY.md](SECURITY.md#release-channel-integrity).
 
 ### 1. Build an immutable candidate
 

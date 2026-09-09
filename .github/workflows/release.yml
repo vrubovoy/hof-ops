@@ -132,6 +132,7 @@ jobs:
       RELEASE: ${{ inputs.release }}
       CANDIDATE_TAG: ${{ needs.build.outputs.candidate_tag }}
       SIGNING_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+      WANT_ASSETS: "release-lock.json,release-lock.json.pem,release-lock.json.sig"
     steps:
       - name: Re-assert main-only (the `release` environment policy is the real gate)
         run: |
@@ -156,13 +157,45 @@ jobs:
           name: candidate-lock
           path: .
 
-      - name: Recheck candidate-tag and stable-release availability
+      - name: Classify the candidate target state (idempotent)
+        id: state
         run: |
-          ! gh release view "$CANDIDATE_TAG" >/dev/null 2>&1
-          ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" >/dev/null 2>&1
-          ! gh release view "v${RELEASE}" >/dev/null 2>&1
+          T="$CANDIDATE_TAG"; R="$GITHUB_REPOSITORY"
+          if gh release view "v${RELEASE}" --repo "$R" >/dev/null 2>&1; then
+            echo "::error::stable release v${RELEASE} already exists - pick an unreleased version" >&2; exit 1
+          fi
+          if tobj="$(gh api "repos/$R/git/ref/tags/$T" 2>/dev/null)"; then
+            ttype="$(printf '%s' "$tobj" | jq -r .object.type)"
+            tsha="$(printf '%s' "$tobj" | jq -r .object.sha)"
+            [ "$ttype" = "tag" ] && tsha="$(gh api "repos/$R/git/tags/$tsha" -q .object.sha)"
+            [ "$tsha" = "$GITHUB_SHA" ] || {
+              echo "::error::candidate tag $T already exists at $tsha, not this build's commit $GITHUB_SHA - conflicting state, refusing" >&2; exit 1; }
+            tag_state="matching"
+          else
+            tag_state="absent"
+          fi
+          if rel="$(gh release view "$T" --repo "$R" --json isDraft,assets 2>/dev/null)"; then
+            isdraft="$(printf '%s' "$rel" | jq -r .isDraft)"
+            have="$(printf '%s' "$rel" | jq -r '[.assets[].name] | sort | join(",")')"
+            if [ "$isdraft" = "true" ]; then
+              mode="resume-draft"
+            elif [ "$have" = "$WANT_ASSETS" ] && [ "$tag_state" = "matching" ]; then
+              mode="already-done"
+            else
+              echo "::error::candidate release $T already exists but is not a complete publication of this build (tag=$tag_state, assets=[$have]) - refusing" >&2; exit 1
+            fi
+          else
+            mode="fresh"
+          fi
+          echo "mode=${mode}" >> "$GITHUB_OUTPUT"
+          echo "::notice::candidate target state: tag=${tag_state}, mode=${mode}"
+
+      - name: Already published - nothing to do
+        if: steps.state.outputs.mode == 'already-done'
+        run: echo "::notice::${CANDIDATE_TAG} is already a complete, published candidate for this commit."
 
       - name: Sign and verify the candidate release lock
+        if: steps.state.outputs.mode != 'already-done'
         run: |
           cosign sign-blob --yes \
             --output-signature release-lock.json.sig \
@@ -176,17 +209,45 @@ jobs:
             release-lock.json
 
       - name: Confirm hofctl validate accepts the freshly signed candidate lock
+        if: steps.state.outputs.mode != 'already-done'
         run: |
           node scripts/hofctl.mjs validate \
             --services examples/services.yml \
             --release-lock release-lock.json \
             --release-lock-identity "${SIGNING_IDENTITY}"
 
-      - name: Publish the immutable release candidate (pre-release, never latest)
+      - name: Ensure the candidate tag exists at exactly this build's commit
+        if: steps.state.outputs.mode != 'already-done'
         run: |
-          gh release create "$CANDIDATE_TAG" \
+          resolve_tag() {
+            local tobj ttype tsha
+            tobj="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" 2>/dev/null)" || { printf 'absent'; return 0; }
+            ttype="$(printf '%s' "$tobj" | jq -r .object.type)"
+            tsha="$(printf '%s' "$tobj" | jq -r .object.sha)"
+            [ "$ttype" = "tag" ] && tsha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tsha}" -q .object.sha)"
+            printf '%s' "$tsha"
+          }
+          cur="$(resolve_tag)"
+          if [ "$cur" = "absent" ]; then
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/${CANDIDATE_TAG}" -f "sha=${GITHUB_SHA}"
+            cur="$(resolve_tag)"
+          fi
+          [ "$cur" = "$GITHUB_SHA" ] || {
+            echo "::error::candidate tag ${CANDIDATE_TAG} resolves to ${cur}, not ${GITHUB_SHA}" >&2; exit 1; }
+
+      - name: Remove a stale draft so publication is clean
+        if: steps.state.outputs.mode == 'resume-draft'
+        run: gh release delete "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --yes
+
+      - name: Publish the immutable candidate as a draft, verify assets, then release it (pre-release, never latest)
+        if: steps.state.outputs.mode != 'already-done'
+        run: |
+          gh release create "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
             release-lock.json release-lock.json.sig release-lock.json.pem \
-            --target "${GITHUB_SHA}" \
-            --prerelease \
             --title "Hof Platform ${CANDIDATE_TAG}" \
             --notes "Immutable release candidate for v${RELEASE}, built from ${GITHUB_SHA} on ${GITHUB_REF}. Not the stable channel: promote.yml signs and publishes stable-channel metadata only after real published-artifact acceptance. Verify the candidate lock with cosign verify-blob against certificate-identity ${SIGNING_IDENTITY}."
+          have="$(gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '[.assets[].name] | sort | join(",")')"
+          [ "$have" = "$WANT_ASSETS" ] || {
+            echo "::error::draft ${CANDIDATE_TAG} does not carry the full asset set - have [$have], want [$WANT_ASSETS]" >&2; exit 1; }
+          gh release edit "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease

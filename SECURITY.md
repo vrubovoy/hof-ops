@@ -28,28 +28,41 @@ These must be configured and kept in place:
 
 - **GitHub Immutable Releases** enabled (repository Settings → General —
   not exposed by the REST API). `promote.yml` refuses to promote a
-  candidate whose release is not immutable, so this is load-bearing, not
-  advisory: promotion stays inoperable until it is on.
-- **Tag ruleset** covering `refs/tags/v*` and `refs/tags/ee-v*` with
-  `deletion`, `non_fast_forward`, and `update` blocked, so a
-  `contents: write` token cannot delete or move a published tag or its
-  release assets (configured: ruleset "Protect release and EE tags").
+  candidate whose release is not immutable **and** re-checks the stable
+  release's own `immutable` flag after publishing, so this is
+  load-bearing, not advisory: promotion stays inoperable until it is on.
+- **Deployment Environments** `release`, `promote`, and
+  `execution-environment` with deployment branch policies (configured):
+  `release` / `promote` allow protected branches only (so their privileged
+  publish jobs cannot start from a feature branch); `execution-environment`
+  allows the tag pattern `ee-v*` only.
+- **Two tag rulesets** (configured): "Protect release and EE tags" blocks
+  `deletion` / `non_fast_forward` / `update` on `refs/tags/v*` and
+  `refs/tags/ee-v*` for everyone; "Restrict EE tag creation to a human
+  admin" blocks `creation` on `refs/tags/ee-v*` for everyone but a
+  repository admin, so a `contents: write` Actions token cannot introduce
+  an `ee-v*` tag on an unreviewed commit.
 - **Require actions to be pinned to a full-length commit SHA** at the
   repository level (`actions/permissions` → `sha_pinning_required: true`,
-  configured). Every workflow in this repo is already SHA-pinned; the
-  setting stops a future unpinned `uses:` from running.
+  configured). Every workflow here is already SHA-pinned; the setting
+  stops a future unpinned `uses:` from running.
 - **`main` branch protection** with the `contracts` check required and
   admins included (already configured).
 
-`promote.yml` additionally enforces, in code, that a candidate commit is
-an ancestor of `main`, that the candidate lock is schema-valid against
-`main`'s own schema with catalog/renderer digests matching `main`, that
-acceptance evidence is Cosign-signed by `acceptance.yml@refs/heads/main`
-and its recorded run metadata matches the live GitHub run, and that the
+`promote.yml` additionally enforces, in code (from the pinned dispatch
+revision), that the candidate commit is an ancestor of that revision, that
+the candidate lock is schema-valid and passes the full cross-contract
+check against `main`'s own catalog, that both the candidate lock signature
+and the acceptance-evidence signature carry the candidate commit's own
+`github-workflow-sha`, that the evidence's recorded run metadata matches
+the live GitHub run, that the stable tag is created atomically at the
+candidate commit and re-verified before and after publishing, and that the
 stable `release-lock.json` is re-signed under `promote.yml@refs/heads/main`
 as its own authorization signature. None of that removes the need for the
 settings above — they are the layer that keeps an already-published
 immutable artifact from being swapped underneath a valid signature.
+`execution-environment.yml` likewise checks in code that its tagged commit
+is an ancestor of `origin/main`.
 
 ## Scope
 

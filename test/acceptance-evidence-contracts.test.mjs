@@ -37,6 +37,11 @@ async function releaseLockSchema() {
   return readJson("schemas/release-lock-v1.schema.json");
 }
 
+async function trustedCatalog() {
+  const { default: YAML } = await import("yaml");
+  return YAML.parse(await readFile(path.join(root, "catalog/services-v1.yaml"), "utf8"));
+}
+
 async function evidenceValidator() {
   const ajv = new Ajv2020({ allErrors: true, strict: true });
   addFormats(ajv);
@@ -103,6 +108,7 @@ async function promotionArgs(overrides = {}) {
     commit: COMMIT,
     run: runFixture(),
     expectedRunId: RUN_ID,
+    catalog: await trustedCatalog(),
     expectedCatalogDigest: lock.catalogDigest,
     expectedComposeTemplateDigest: lock.composeTemplateDigest,
     ...overrides,
@@ -210,6 +216,31 @@ test("verify-promotion: refuses a schema-invalid release lock (checked with main
   const { ok, errors } = verifyPromotion({ ...args, releaseLock: broken, releaseLockBytes: Buffer.from(JSON.stringify(broken)), evidence: evidenceFor(Buffer.from(JSON.stringify(broken))) });
   assert.equal(ok, false);
   assert.ok(errors.some((e) => /not schema-valid against main's/.test(e)), errors.join("; "));
+});
+
+test("verify-promotion: refuses a schema-valid lock that dropped an optional catalog component (full cross-contract check with main's catalog)", async () => {
+  const args = await promotionArgs();
+  // A real optional artifact - present in the catalog, quietly removed
+  // from the lock. catalogDigest is untouched, so the digest check above
+  // passes; only the cross-contract check catches this.
+  const dropped = "herold-backend";
+  assert.ok(args.releaseLock.components[dropped], "fixture assumption: the example lock carries this optional component");
+  const lock = structuredClone(args.releaseLock);
+  delete lock.components[dropped];
+  const bytes = Buffer.from(JSON.stringify(lock));
+  const { ok, errors } = verifyPromotion({ ...args, releaseLock: lock, releaseLockBytes: bytes, evidence: evidenceFor(bytes) });
+  assert.equal(ok, false);
+  assert.ok(errors.some((e) => new RegExp(`missing catalog artifact ${dropped}`).test(e)), errors.join("; "));
+});
+
+test("verify-promotion: refuses a lock carrying a component the catalog does not define", async () => {
+  const args = await promotionArgs();
+  const lock = structuredClone(args.releaseLock);
+  lock.components["ghost-backend"] = structuredClone(lock.components["herold-backend"]);
+  const bytes = Buffer.from(JSON.stringify(lock));
+  const { ok, errors } = verifyPromotion({ ...args, releaseLock: lock, releaseLockBytes: bytes, evidence: evidenceFor(bytes) });
+  assert.equal(ok, false);
+  assert.ok(errors.some((e) => /unknown catalog artifact ghost-backend/.test(e)), errors.join("; "));
 });
 
 test("verify-promotion: refuses failed evidence, wrong candidate, wrong release, EE-digest / lock-release mismatch", async () => {

@@ -1,20 +1,26 @@
 name: Release candidate
 
 # Builds and publishes an IMMUTABLE release candidate - never the stable
-# channel. Any branch may run this; a candidate from a feature branch is
-# a first-class, signed, immutable artifact, it just cannot become
-# `stable` until promote.yml moves it there after real published-artifact
-# acceptance (see PR 0 of Item 10). The stable channel is promote.yml's
-# exclusive output and only ever runs from protected `main`.
-#
-# Candidate tag: v<release>-rc.<run_number>, a GitHub pre-release. The
-# plain v<release> tag and the `stable` channel metadata are never
-# created here.
+# channel. Two jobs:
+#  - build   (contents: read, no OIDC): runs on the exact dispatch
+#            revision from ANY ref. Resolves and re-verifies the release
+#            lock and runs the integration matrix, then uploads the
+#            UNSIGNED lock as an artifact. A feature branch can exercise
+#            this for CI, but it cannot mint a Sigstore certificate or
+#            create a GitHub release.
+#  - publish (contents: write, id-token: write, environment: release):
+#            the `release` environment's deployment branch policy
+#            (protected branches only) means GitHub will not start this
+#            job from anything but `main` - the in-file check is defense
+#            in depth, not the gate. It signs the artifact `build`
+#            produced and publishes it as a vX.Y.Z-rc.<run_number>
+#            pre-release. It never writes stable-channel metadata and
+#            never marks a release `latest`; that is promote.yml's job,
+#            from `main`, after signed acceptance.
 #
 # Every workflow_dispatch input is consumed through an `env:` binding,
-# never interpolated as ${{ inputs.* }} directly inside a `run:` script -
-# see GitHub's script-injection hardening guidance. `selection` is
-# additionally shape-checked before it reaches any tool.
+# never interpolated into a `run:` script. `selection` is shape-checked.
+# Every action is pinned by commit SHA.
 
 on:
   workflow_dispatch:
@@ -35,37 +41,36 @@ permissions:
   contents: read
 
 jobs:
-  candidate:
+  build:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
-      contents: write
-      id-token: write
-      attestations: read
-      packages: read
+      contents: read
       checks: read
       statuses: read
+      packages: read
+    outputs:
+      candidate_tag: ${{ steps.inputs.outputs.candidate_tag }}
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE: ${{ inputs.release }}
       SELECTION: ${{ inputs.selection }}
-      SIGNING_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
 
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.10.0
-
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
-
       - run: pnpm install --frozen-lockfile
-      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
-      - name: Validate inputs and candidate-tag immutability
+      - name: Validate inputs and candidate-tag availability
+        id: inputs
         run: |
           node -e 'if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(process.env.RELEASE)) { console.error("release must be canonical semver"); process.exit(1); }'
           case "$SELECTION" in
@@ -78,7 +83,7 @@ jobs:
             echo "selection file does not exist: $SELECTION" >&2; exit 1
           fi
           CANDIDATE_TAG="v${RELEASE}-rc.${GITHUB_RUN_NUMBER}"
-          echo "CANDIDATE_TAG=${CANDIDATE_TAG}" >> "$GITHUB_ENV"
+          echo "candidate_tag=${CANDIDATE_TAG}" >> "$GITHUB_OUTPUT"
           if gh release view "$CANDIDATE_TAG" >/dev/null 2>&1; then
             echo "candidate ${CANDIDATE_TAG} already exists - candidates are immutable" >&2; exit 1
           fi
@@ -106,6 +111,57 @@ jobs:
           cmp release-lock.json release-lock.recheck.json
           rm release-lock.recheck.json
 
+      - name: Hand the unsigned lock to publish
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: candidate-lock
+          path: release-lock.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE: ${{ inputs.release }}
+      CANDIDATE_TAG: ${{ needs.build.outputs.candidate_tag }}
+      SIGNING_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+    steps:
+      - name: Re-assert main-only (the `release` environment policy is the real gate)
+        run: |
+          [ "$GITHUB_REF" = "refs/heads/main" ] || { echo "candidate publication runs only from main" >&2; exit 1; }
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.10.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Take the unsigned lock from build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidate-lock
+          path: .
+
+      - name: Recheck candidate-tag and stable-release availability
+        run: |
+          ! gh release view "$CANDIDATE_TAG" >/dev/null 2>&1
+          ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" >/dev/null 2>&1
+          ! gh release view "v${RELEASE}" >/dev/null 2>&1
+
       - name: Sign and verify the candidate release lock
         run: |
           cosign sign-blob --yes \
@@ -125,11 +181,6 @@ jobs:
             --services examples/services.yml \
             --release-lock release-lock.json \
             --release-lock-identity "${SIGNING_IDENTITY}"
-
-      - name: Recheck candidate-tag immutability before publication
-        run: |
-          ! gh release view "$CANDIDATE_TAG" >/dev/null 2>&1
-          ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" >/dev/null 2>&1
 
       - name: Publish the immutable release candidate (pre-release, never latest)
         run: |

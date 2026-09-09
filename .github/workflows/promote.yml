@@ -4,24 +4,28 @@ name: Promote candidate to stable
 # rebuilds nothing, re-resolves nothing, and pulls no images: promotion
 # publishes the exact release-lock.json bytes acceptance already
 # exercised. What changes is the AUTHORIZATION signature - the stable
-# release-lock.json.sig/.pem are re-signed here under
+# release-lock.json.sig/.pem are re-signed under
 # promote.yml@refs/heads/main, so `stable` carries a main-trusted
 # signature distinct from the candidate's own (which stays on the
 # candidate pre-release for provenance).
 #
-# Runs only from protected `main`. A candidate built on a feature branch
-# is promotable, but only if its commit is already an ancestor of main,
-# it is a GitHub Immutable Release, its lock is schema-valid against
-# main's own schema with catalog/renderer digests matching main, and a
-# Cosign-signed acceptance-evidence document from acceptance.ym@main
-# binds to it with GitHub-verifiable run provenance.
+# Two jobs:
+#  - verify   (contents: read, actions: read): every check, on the exact
+#             dispatch revision (checkout @ github.sha). Builds the
+#             stable-channel metadata too, and hands verify's lock bytes +
+#             channel + digest to publish as an artifact.
+#  - publish  (contents: write, id-token: write, environment: promote):
+#             NO checkout, NO pnpm install, NO repository scripts. Downloads
+#             the verified artifact, re-checks its digest, signs, atomically
+#             creates refs/tags/v<release> AT the candidate commit, then
+#             publishes - re-verifying the tag SHA and the release's own
+#             immutability before and after.
 #
-# Until .github/workflows/acceptance.yml exists (Item 10 PR 9) this
-# workflow is intentionally inoperable - it fails fast before doing
-# anything.
-#
-# Every action is pinned by commit SHA. Verification (contents: read)
-# and publication (contents: write, id-token: write) are separate jobs.
+# The `promote` environment's deployment branch policy (protected branches
+# only) is the real main-only gate; the in-file `refs/heads/main` checks
+# are defense in depth. Until .github/workflows/acceptance.yml exists
+# (a later Item 10 PR) this workflow fails fast - promotion is
+# intentionally inoperable.
 
 on:
   workflow_dispatch:
@@ -50,6 +54,7 @@ jobs:
     outputs:
       release: ${{ steps.gate.outputs.release }}
       candidate_commit: ${{ steps.candidate.outputs.commit }}
+      lock_sha256: ${{ steps.channel.outputs.lock_sha256 }}
     env:
       GH_TOKEN: ${{ github.token }}
       CANDIDATE: ${{ inputs.candidate }}
@@ -65,15 +70,16 @@ jobs:
           printf '%s' "$ACCEPTANCE_RUN_ID" | grep -Eq '^[1-9][0-9]*$' || {
             echo "acceptance_run_id must be a positive integer" >&2; exit 1; }
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check out the exact dispatch revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Acceptance workflow must exist (promotion is inoperable until Item 10 PR 9)
         run: |
           test -f .github/workflows/acceptance.yml || {
-            echo "::error::.github/workflows/acceptance.yml does not exist yet - the real published-artifact acceptance workflow is Item 10 PR 9. Promotion is intentionally inoperable until then." >&2
+            echo "::error::.github/workflows/acceptance.yml does not exist yet - the real published-artifact acceptance workflow is a later Item 10 PR. Promotion is intentionally inoperable until then." >&2
             exit 1
           }
 
@@ -87,7 +93,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
-      - name: Resolve the candidate's exact commit; require it be an ancestor of main
+      - name: Resolve the candidate's exact commit; require it be an ancestor of this revision
         id: candidate
         run: |
           obj_type="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE}" -q .object.type)"
@@ -99,16 +105,15 @@ jobs:
           fi
           printf '%s' "$commit" | grep -Eq '^[0-9a-f]{40}$' || {
             echo "candidate tag did not resolve to a 40-character commit: $commit" >&2; exit 1; }
-          git fetch --no-tags origin main
-          git merge-base --is-ancestor "$commit" origin/main || {
-            echo "::error::candidate commit ${commit} is not an ancestor of origin/main - only merged, reviewed commits can be promoted" >&2; exit 1; }
+          git merge-base --is-ancestor "$commit" "$GITHUB_SHA" || {
+            echo "::error::candidate commit ${commit} is not an ancestor of the dispatch revision ${GITHUB_SHA} - only merged, reviewed commits can be promoted" >&2; exit 1; }
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
 
       - name: Require the candidate release be a GitHub Immutable Release
         run: |
           immutable="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${CANDIDATE}" -q '.immutable')"
           if [ "$immutable" != "true" ]; then
-            echo "::error::candidate release ${CANDIDATE} is not immutable (immutable=${immutable}). Enable GitHub Immutable Releases and protect v* / v*-rc.* / ee-v* tags before promoting - see SECURITY.md." >&2
+            echo "::error::candidate release ${CANDIDATE} is not immutable (immutable=${immutable}). Enable GitHub Immutable Releases before promoting - see SECURITY.md." >&2
             exit 1
           fi
 
@@ -140,19 +145,23 @@ jobs:
           test -f evidence/acceptance-evidence.json.sig
           test -f evidence/acceptance-evidence.json.pem
 
-      - name: Verify the evidence signature - acceptance.yml@refs/heads/main, exactly
+      - name: Verify the evidence signature - acceptance.yml@refs/heads/main, on the candidate commit
+        env:
+          CANDIDATE_COMMIT: ${{ steps.candidate.outputs.commit }}
         run: |
           cosign verify-blob \
             --certificate evidence/acceptance-evidence.json.pem \
             --signature evidence/acceptance-evidence.json.sig \
             --certificate-identity 'https://github.com/vrubovoy/hof-ops/.github/workflows/acceptance.yml@refs/heads/main' \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository "${GITHUB_REPOSITORY}" \
+            --certificate-github-workflow-sha "${CANDIDATE_COMMIT}" \
             evidence/acceptance-evidence.json
 
       - name: Pull the acceptance run's live GitHub metadata
         run: gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ACCEPTANCE_RUN_ID}" > run.json
 
-      - name: Gate - evidence, signature identity, run provenance, digests, and the full restore matrix must all bind
+      - name: Gate - evidence, signature identities, run provenance, digests, the full release-lock contract, and the restore matrix must all bind
         id: gate
         env:
           CANDIDATE_COMMIT: ${{ steps.candidate.outputs.commit }}
@@ -167,7 +176,7 @@ jobs:
             --repo-root .)"
           echo "release=${RELEASE}" >> "$GITHUB_OUTPUT"
 
-      - name: Stable release must not already exist
+      - name: Stable release and tag must not already exist
         env:
           RELEASE: ${{ steps.gate.outputs.release }}
         run: |
@@ -178,11 +187,25 @@ jobs:
             echo "git tag v${RELEASE} already exists" >&2; exit 1
           fi
 
-      - name: Hand the verified lock bytes to the publish job
+      - name: Build the stable-channel metadata here (publish never runs repo scripts)
+        id: channel
+        env:
+          RELEASE: ${{ steps.gate.outputs.release }}
+        run: |
+          cp candidate/release-lock.json release-lock.json
+          node scripts/build-channel-metadata.mjs \
+            --release "$RELEASE" --lock release-lock.json \
+            --repository "$GITHUB_REPOSITORY" --out stable-channel.json
+          lock_sha256="$(sha256sum release-lock.json | cut -d' ' -f1)"
+          echo "lock_sha256=${lock_sha256}" >> "$GITHUB_OUTPUT"
+
+      - name: Hand the verified lock bytes + channel to publish
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: promotion-verified-lock
-          path: candidate/release-lock.json
+          name: promotion-bundle
+          path: |
+            release-lock.json
+            stable-channel.json
           if-no-files-found: error
           retention-days: 1
 
@@ -190,6 +213,7 @@ jobs:
     needs: verify
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    environment: promote
     permissions:
       contents: write
       id-token: write
@@ -199,64 +223,89 @@ jobs:
       ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
       RELEASE: ${{ needs.verify.outputs.release }}
       CANDIDATE_COMMIT: ${{ needs.verify.outputs.candidate_commit }}
+      LOCK_SHA256: ${{ needs.verify.outputs.lock_sha256 }}
       STABLE_SIGNING_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/promote.yml@${{ github.ref }}
     steps:
       - name: Re-assert main-only
         run: |
           [ "$GITHUB_REF" = "refs/heads/main" ] || { echo "publish must run from main" >&2; exit 1; }
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: main
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
-        with:
-          version: 11.10.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
-      - name: Take the exact verified lock bytes from the verify job
+      - name: Take the verified lock bytes + channel from verify
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: promotion-verified-lock
+          name: promotion-bundle
           path: .
 
-      - name: Re-sign those exact bytes under promote.yml@refs/heads/main (authorization signature, not a rebuild)
+      - name: Re-check the lock digest matches what verify approved
         run: |
-          cosign sign-blob --yes \
-            --output-signature release-lock.json.sig \
-            --output-certificate release-lock.json.pem \
-            release-lock.json
-          cosign verify-blob \
-            --certificate release-lock.json.pem --signature release-lock.json.sig \
-            --certificate-identity "${STABLE_SIGNING_IDENTITY}" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            release-lock.json
+          echo "${LOCK_SHA256}  release-lock.json" | sha256sum -c -
 
-      - name: Build and sign stable-channel metadata from those same bytes
+      - name: Sign the lock and the channel under promote.yml@refs/heads/main
         run: |
-          node scripts/build-channel-metadata.mjs \
-            --release "$RELEASE" --lock release-lock.json \
-            --repository "$GITHUB_REPOSITORY" --out stable-channel.json
-          cosign sign-blob --yes \
-            --output-signature stable-channel.json.sig \
-            --output-certificate stable-channel.json.pem \
-            stable-channel.json
-          cosign verify-blob \
-            --certificate stable-channel.json.pem --signature stable-channel.json.sig \
-            --certificate-identity "${STABLE_SIGNING_IDENTITY}" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            stable-channel.json
+          for artifact in release-lock.json stable-channel.json; do
+            cosign sign-blob --yes \
+              --output-signature "${artifact}.sig" \
+              --output-certificate "${artifact}.pem" \
+              "${artifact}"
+            cosign verify-blob \
+              --certificate "${artifact}.pem" --signature "${artifact}.sig" \
+              --certificate-identity "${STABLE_SIGNING_IDENTITY}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${artifact}"
+          done
 
-      - name: Publish the stable release - identical lock bytes, promotion signature, signed channel
+      - name: Atomically create refs/tags/v<release> AT the candidate commit
         run: |
-          gh release create "v${RELEASE}" --repo "$GITHUB_REPOSITORY" \
+          resolve_tag() {
+            local t s
+            t="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${RELEASE}" -q .object.type 2>/dev/null)" || return 1
+            s="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${RELEASE}" -q .object.sha)"
+            if [ "$t" = "tag" ]; then s="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${s}" -q .object.sha)"; fi
+            printf '%s' "$s"
+          }
+          if existing="$(resolve_tag)"; then
+            # A prior crashed run may already have created it - accept only
+            # if it points exactly where it must and the release is not out yet.
+            [ "$existing" = "$CANDIDATE_COMMIT" ] || {
+              echo "::error::tag v${RELEASE} already exists at ${existing}, not the candidate commit ${CANDIDATE_COMMIT}" >&2; exit 1; }
+            if gh release view "v${RELEASE}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::error::stable release v${RELEASE} already exists" >&2; exit 1
+            fi
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/v${RELEASE}" -f "sha=${CANDIDATE_COMMIT}"
+          fi
+          # Re-verify immediately before publishing.
+          got="$(resolve_tag)"
+          [ "$got" = "$CANDIDATE_COMMIT" ] || {
+            echo "::error::tag v${RELEASE} resolves to ${got}, not ${CANDIDATE_COMMIT}, right before release creation" >&2; exit 1; }
+
+      - name: Publish the stable release against that exact tag
+        run: |
+          gh release create "v${RELEASE}" --repo "$GITHUB_REPOSITORY" --verify-tag \
             release-lock.json release-lock.json.sig release-lock.json.pem \
             stable-channel.json stable-channel.json.sig stable-channel.json.pem \
-            --target "${CANDIDATE_COMMIT}" \
             --latest \
             --title "Hof Platform v${RELEASE}" \
             --notes "Promoted from ${CANDIDATE} after acceptance run ${ACCEPTANCE_RUN_ID}. release-lock.json is byte-identical to the candidate's; its .sig/.pem here are promote.yml@refs/heads/main's authorization signature (the candidate's own release.yml signature stays on the ${CANDIDATE} pre-release for provenance). stable-channel.json is signed under the same promote.yml identity. Nothing was rebuilt or re-resolved."
+
+      - name: Post-publish - the stable tag and release must be exactly right and immutable
+        run: |
+          resolve_tag() {
+            local t s
+            t="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${RELEASE}" -q .object.type)"
+            s="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${RELEASE}" -q .object.sha)"
+            if [ "$t" = "tag" ]; then s="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${s}" -q .object.sha)"; fi
+            printf '%s' "$s"
+          }
+          got="$(resolve_tag)"
+          [ "$got" = "$CANDIDATE_COMMIT" ] || { echo "::error::after publish, tag v${RELEASE} points at ${got}, not ${CANDIDATE_COMMIT}" >&2; exit 1; }
+          immutable="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v${RELEASE}" -q '.immutable')"
+          [ "$immutable" = "true" ] || { echo "::error::stable release v${RELEASE} is not immutable (immutable=${immutable}) - GitHub Immutable Releases must be enabled" >&2; exit 1; }
+          target="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v${RELEASE}" -q '.target_commitish')"
+          case "$target" in
+            "$CANDIDATE_COMMIT"|"v${RELEASE}") : ;;
+            *) echo "::error::stable release target_commitish is ${target}, not the candidate commit" >&2; exit 1 ;;
+          esac

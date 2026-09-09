@@ -46,6 +46,8 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import YAML from "yaml";
 
+import { validateCatalog, validateReleaseLock } from "./contracts.mjs";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const CANDIDATE_TAG = /^v((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))-rc\.[1-9][0-9]*$/;
@@ -78,7 +80,7 @@ function sha256(bytes) {
 export function verifyPromotion({
   candidate, releaseLockBytes, releaseLock, releaseLockSchema,
   evidence, evidenceSchema, commit, run, expectedRunId,
-  expectedCatalogDigest, expectedComposeTemplateDigest,
+  catalog, expectedCatalogDigest, expectedComposeTemplateDigest,
 }) {
   const errors = [];
   const fail = (message) => errors.push(message);
@@ -99,6 +101,17 @@ export function verifyPromotion({
   const validateLock = ajv.compile(releaseLockSchema);
   if (!validateLock(releaseLock)) {
     fail(`downloaded release-lock.json is not schema-valid against main's release-lock-v1 schema: ${ajv.errorsText(validateLock.errors)}`);
+  }
+
+  // Full cross-contract check with main's own trusted catalog, not just
+  // JSON Schema: every catalog artifact must be present in the lock and
+  // no unknown component may appear (contracts.mjs's own rules, the ones
+  // `pnpm validate` runs). A schema-valid lock that quietly dropped an
+  // optional component would otherwise sail through, especially when
+  // acceptance only exercised core topology.
+  if (catalog !== undefined) {
+    for (const message of validateCatalog(catalog)) fail(`main catalog: ${message}`);
+    for (const message of validateReleaseLock(releaseLock, catalog)) fail(message);
   }
 
   if (evidence.result !== "succeeded") fail(`acceptance evidence result is ${evidence.result}, not succeeded`);
@@ -179,18 +192,21 @@ export function verifyPromotion({
   return { ok: errors.length === 0, errors, release };
 }
 
-// Resolve the catalog / renderer paths a release selection names and
-// digest them from disk, exactly the way build-release-lock.mjs does
-// when it writes catalogDigest / composeTemplateDigest into the lock.
-export async function treeDigestsFromSelection(repoRoot, selectionRelPath = "examples/release-selection.yml") {
+// Resolve the catalog / renderer paths a release selection names, digest
+// them from disk exactly the way build-release-lock.mjs does when it
+// writes catalogDigest / composeTemplateDigest, and parse the catalog
+// itself for the full cross-contract check.
+export async function loadTrustedInputsFromSelection(repoRoot, selectionRelPath = "examples/release-selection.yml") {
   const selection = YAML.parse(await readFile(path.join(repoRoot, selectionRelPath), "utf8"));
   for (const key of ["catalog", "composeTemplate"]) {
     if (typeof selection?.[key] !== "string" || selection[key].includes("..") || selection[key].startsWith("/")) {
       throw new Error(`release selection ${key} is not a safe repo-relative path: ${selection?.[key]}`);
     }
   }
+  const catalogBytes = await readFile(path.join(repoRoot, selection.catalog));
   return {
-    catalogDigest: sha256(await readFile(path.join(repoRoot, selection.catalog))),
+    catalog: YAML.parse(catalogBytes.toString("utf8")),
+    catalogDigest: sha256(catalogBytes),
     composeTemplateDigest: sha256(await readFile(path.join(repoRoot, selection.composeTemplate))),
   };
 }
@@ -220,7 +236,7 @@ async function main() {
   const releaseLockBytes = await readFile(args["release-lock"]);
   const evidenceSchema = JSON.parse(await readFile(path.join(root, "schemas/acceptance-evidence-v1.schema.json"), "utf8"));
   const releaseLockSchema = JSON.parse(await readFile(path.join(repoRoot, "schemas/release-lock-v1.schema.json"), "utf8"));
-  const { catalogDigest, composeTemplateDigest } = await treeDigestsFromSelection(repoRoot, args.selection ?? "examples/release-selection.yml");
+  const { catalog, catalogDigest, composeTemplateDigest } = await loadTrustedInputsFromSelection(repoRoot, args.selection ?? "examples/release-selection.yml");
 
   const { ok, errors, release } = verifyPromotion({
     candidate: args.candidate,
@@ -232,6 +248,7 @@ async function main() {
     commit: args.commit,
     run: runMetadataFromApi(JSON.parse(await readFile(args["run-json"], "utf8"))),
     expectedRunId: args["run-id"],
+    catalog,
     expectedCatalogDigest: catalogDigest,
     expectedComposeTemplateDigest: composeTemplateDigest,
   });

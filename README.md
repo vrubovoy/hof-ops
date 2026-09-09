@@ -313,34 +313,37 @@ host's; a loopback SSH target is the way to exercise `apply` locally (see
 
 ## Cutting a release
 
-Releases are cut in two stages: an immutable **candidate** anyone can build
-from any branch, then a **promotion** to the `stable` channel that only
-`main` can perform and only after a real published-artifact acceptance run.
+Releases are cut in two stages: an immutable **candidate**, then a
+**promotion** to the `stable` channel that only `main` can perform and only
+after a real published-artifact acceptance run. Both `release.yml` and
+`promote.yml` split into a read-only job and a privileged publish job; the
+privileged job runs under a GitHub **Environment** (`release` / `promote`)
+whose deployment branch policy allows protected branches only, so GitHub
+will not start it from anything but `main` — a feature branch cannot mint a
+Sigstore certificate or create a release even if it edits the workflow.
 
 ### 1. Build an immutable candidate
 
 ```sh
-gh workflow run release.yml --repo vrubovoy/hof-ops \
+gh workflow run release.yml --repo vrubovoy/hof-ops --ref main \
   -f release=1.0.0 -f selection=examples/release-selection.yml
 ```
 
-`release.yml` accepts only canonical stable semver and refuses if the
-stable `v<release>` release already exists or the `v<release>-rc.<run>`
-candidate tag is somehow already taken. Every workflow input is consumed
-through an `env:` binding, never interpolated into a shell line; `selection`
-is additionally shape-checked (repo-relative, no `..`, a restricted
-character set, must exist). For each explicit component selection it
-resolves the immutable source tag and image tag to a commit and digest,
-directly checks the named GitHub checks on that commit, runs `cosign
-verify` with the exact expected workflow identity and OIDC issuer, verifies
-SBOM and SLSA provenance attestations, and rejects subject, repository, or
-revision mismatches. It records config schema, database before/after and
-rollback compatibility where applicable, minimum `hofctl`, catalog, Compose
-renderer, and optional Ansible environment pins in `release-lock.json`,
-re-resolves everything once more to reject tag drift, signs the lock with
-keyless Cosign, and publishes it as a GitHub **pre-release** tagged
-`v<release>-rc.<run_number>`. It never writes stable-channel metadata and
-never marks a release `latest`.
+`release.yml`'s `build` job (any ref, `contents: read`, no OIDC) accepts
+only canonical stable semver and refuses if the stable `v<release>`
+release or the `v<release>-rc.<run>` candidate tag already exists. Every
+workflow input is consumed through an `env:` binding, never interpolated
+into a shell line; `selection` is shape-checked (repo-relative, no `..`, a
+restricted character set, must exist). It resolves the immutable source and
+image tags to commits and digests, checks the named GitHub checks, runs
+`cosign verify` with the exact expected workflow identity and OIDC issuer,
+verifies SBOM and SLSA provenance attestations, records compatibility
+metadata and pins in `release-lock.json`, re-resolves once more to reject
+tag drift, and uploads the **unsigned** lock as an artifact. The `publish`
+job (`environment: release`, `contents: write`, `id-token: write`) then
+signs that exact artifact with keyless Cosign and publishes it as a GitHub
+**pre-release** tagged `v<release>-rc.<run_number>`. It never writes
+stable-channel metadata and never marks a release `latest`.
 
 ### 2. Promote a candidate to stable
 
@@ -353,34 +356,45 @@ gh workflow run promote.yml --repo vrubovoy/hof-ops --ref main \
   -f candidate=v1.0.0-rc.4 -f acceptance_run_id=123456789
 ```
 
-`promote.yml` runs as two jobs — a read-only `verify` and a
-`contents: write` `publish`. `verify` refuses any ref other than
-`refs/heads/main`, refuses if `.github/workflows/acceptance.yml` does not
+`promote.yml`'s `verify` job (`contents: read`, `actions: read`) checks out
+the **exact dispatch revision** (`github.sha`) and refuses any ref but
+`refs/heads/main`; refuses if `.github/workflows/acceptance.yml` does not
 exist yet (the real acceptance workflow is a later Item 10 PR — until then
-promotion is deliberately inoperable), resolves the candidate tag to a
-full 40-character commit and requires that commit already be an **ancestor
-of `main`**, requires the candidate release be a GitHub **Immutable
-Release**, Cosign-verifies the candidate `release-lock.json` against
-`release.yml`'s identity **and** the candidate commit, downloads the
-acceptance run's `acceptance-evidence.json` + `.sig` + `.pem` and
-Cosign-verifies it against **exactly** `acceptance.yml@refs/heads/main`,
-then `scripts/verify-promotion.mjs` cross-checks: evidence schema-valid
-and `succeeded`; the acceptance run's live `path` / `head_branch` /
-`head_sha` / `status` / `conclusion` / `run_attempt` / `id` / `html_url`
-all match what the evidence recorded; `commit` == `acceptanceCommit` ==
-the candidate commit; the recorded release-lock digest equals the SHA-256
-of the downloaded lock byte for byte; the lock is schema-valid against
-`main`'s own schema with `catalogDigest` / `composeTemplateDigest`
-matching `main`'s catalog and renderer; and the restore matrix is exactly
-the two required legs (`debian12-to-ubuntu2404`, `ubuntu2404-to-debian12`),
-no duplicates, every destination (`local`, `s3`) green.
+promotion is deliberately inoperable); resolves the candidate tag to a full
+40-character commit and requires it be an **ancestor of that revision**;
+requires the candidate release's GitHub **`immutable`** flag; Cosign-
+verifies the candidate `release-lock.json` against `release.yml`'s identity,
+the repository, **and** `--certificate-github-workflow-sha <candidate
+commit>`; downloads the acceptance run's `acceptance-evidence.json` +
+`.sig` + `.pem` and Cosign-verifies it against **exactly**
+`acceptance.yml@refs/heads/main` on that same candidate commit; then
+`scripts/verify-promotion.mjs` cross-checks: evidence schema-valid and
+`succeeded`; the acceptance run's live `path` / `head_branch` / `head_sha`
+/ `status` / `conclusion` / `run_attempt` / `id` / `html_url` all match
+what the evidence recorded; `commit` == `acceptanceCommit` == the candidate
+commit; the recorded release-lock digest equals the SHA-256 of the
+downloaded lock byte for byte; the lock is schema-valid **and passes the
+full cross-contract check against `main`'s own catalog** (every catalog
+artifact present, no unknown component) with `catalogDigest` /
+`composeTemplateDigest` matching `main`'s catalog and renderer; and the
+restore matrix is exactly the two required legs
+(`debian12-to-ubuntu2404`, `ubuntu2404-to-debian12`), no duplicates, every
+destination (`local`, `s3`) green. `verify` also builds `stable-channel.json`
+and hands it, plus the verified lock bytes and their digest, to `publish`.
 
-`publish` then takes the exact verified lock bytes, **re-signs them under
+`publish` (`environment: promote`, `contents: write`, `id-token: write`)
+runs **no checkout, no `pnpm install`, no repository scripts**. It
+re-checks the artifact digest against what `verify` approved, **re-signs
+the identical lock bytes and the channel under
 `promote.yml@refs/heads/main`** (an authorization signature — not a
-rebuild; the bytes are identical), builds and signs `stable-channel.json`
-from those same bytes, and publishes a separate `v<release>` GitHub
-Release marked `latest`. The candidate's own `release.yml` signature stays
-on the `v<release>-rc.N` pre-release for provenance; failed and superseded
+rebuild), **atomically creates `refs/tags/v<release>` at the candidate
+commit** via the Git Refs API (accepting a pre-existing tag only if it
+already resolves to exactly that commit and no stable release is out yet —
+so a crash between tag and release is resumable), publishes the `v<release>`
+release against that verified tag with `--verify-tag`, and then re-checks
+the tag SHA, the release's `target_commitish`, and the release's own
+`immutable` flag. The candidate's own `release.yml` signature stays on the
+`v<release>-rc.N` pre-release for provenance; failed and superseded
 candidates are left in place for the audit trail.
 
 Verify a published **stable** lock file — its signature identity is

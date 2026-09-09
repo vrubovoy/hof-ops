@@ -36,13 +36,13 @@ jobs:
       - name: Real SSH transport acceptance (ephemeral pinned Debian 12 sshd container)
         run: pnpm test:ssh
       - name: Real hofctl apply acceptance (ephemeral sudo-enabled sshd container, real signed release, real Execution Environment)
+        # Only for a push to this repo or a same-repo PR - never a fork PR.
+        # test:apply-ssh spins a --privileged systemd container; the opt-in
+        # below is what turns it on, and a fork PR must not get it (matching
+        # test/apply-acceptance.mjs's own no-op-without-opt-in contract).
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ github.token }}
-          # test:apply-ssh spins a --privileged systemd container and is a
-          # no-op without this explicit opt-in (see test/apply-acceptance.mjs's
-          # own module-level guard). CI is a disposable single-purpose VM, so
-          # it opts in; a fork PR or a local run without the flag exits before
-          # Docker is ever touched.
           HOF_ALLOW_PRIVILEGED_ACCEPTANCE: "1"
         run: pnpm test:apply-ssh
 

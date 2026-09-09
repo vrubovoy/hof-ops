@@ -233,7 +233,7 @@ historical, informational-only `plan-v1` shape it used to.
 node scripts/hofctl.mjs plan \
   --services examples/services.yml \
   --release-lock examples/release-lock.json \
-  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/tags/v1.0.0" \
+  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/promote.yml@refs/heads/main" \
   --known-hosts ~/.ssh/known_hosts \
   --recovery-age-recipient age1...
 ```
@@ -267,7 +267,7 @@ exact content you approved:
 node scripts/hofctl.mjs plan \
   --services examples/services.yml \
   --release-lock examples/release-lock.json \
-  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/tags/v1.0.0" \
+  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/promote.yml@refs/heads/main" \
   --known-hosts ~/.ssh/known_hosts \
   --recovery-age-recipient age1... \
   > plan.json
@@ -275,7 +275,7 @@ node scripts/hofctl.mjs plan \
 node scripts/hofctl.mjs apply \
   --services examples/services.yml \
   --release-lock examples/release-lock.json \
-  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/tags/v1.0.0" \
+  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/promote.yml@refs/heads/main" \
   --known-hosts ~/.ssh/known_hosts \
   --identity-file ~/.ssh/id_ed25519 \
   --recovery-age-recipient age1... \
@@ -353,33 +353,59 @@ gh workflow run promote.yml --repo vrubovoy/hof-ops --ref main \
   -f candidate=v1.0.0-rc.4 -f acceptance_run_id=123456789
 ```
 
-`promote.yml` refuses any ref other than `refs/heads/main`, downloads the
-candidate's already-signed `release-lock.json` and the acceptance run's
-evidence artifact, and runs `scripts/verify-promotion.mjs`: the evidence
-must be schema-valid, `succeeded`, for exactly this candidate, and its
-recorded release-lock digest must equal the SHA-256 of the downloaded lock
-byte for byte. Only then does it build and sign stable-channel metadata
-**from the untouched candidate lock** (no rebuild, no re-resolve, no image
-pull), attach it to the candidate release, and mark that release `latest`.
-Failed and superseded candidates are left in place for the audit trail.
+`promote.yml` runs as two jobs — a read-only `verify` and a
+`contents: write` `publish`. `verify` refuses any ref other than
+`refs/heads/main`, refuses if `.github/workflows/acceptance.yml` does not
+exist yet (the real acceptance workflow is a later Item 10 PR — until then
+promotion is deliberately inoperable), resolves the candidate tag to a
+full 40-character commit and requires that commit already be an **ancestor
+of `main`**, requires the candidate release be a GitHub **Immutable
+Release**, Cosign-verifies the candidate `release-lock.json` against
+`release.yml`'s identity **and** the candidate commit, downloads the
+acceptance run's `acceptance-evidence.json` + `.sig` + `.pem` and
+Cosign-verifies it against **exactly** `acceptance.yml@refs/heads/main`,
+then `scripts/verify-promotion.mjs` cross-checks: evidence schema-valid
+and `succeeded`; the acceptance run's live `path` / `head_branch` /
+`head_sha` / `status` / `conclusion` / `run_attempt` / `id` / `html_url`
+all match what the evidence recorded; `commit` == `acceptanceCommit` ==
+the candidate commit; the recorded release-lock digest equals the SHA-256
+of the downloaded lock byte for byte; the lock is schema-valid against
+`main`'s own schema with `catalogDigest` / `composeTemplateDigest`
+matching `main`'s catalog and renderer; and the restore matrix is exactly
+the two required legs (`debian12-to-ubuntu2404`, `ubuntu2404-to-debian12`),
+no duplicates, every destination (`local`, `s3`) green.
 
-Verify a published lock file yourself:
+`publish` then takes the exact verified lock bytes, **re-signs them under
+`promote.yml@refs/heads/main`** (an authorization signature — not a
+rebuild; the bytes are identical), builds and signs `stable-channel.json`
+from those same bytes, and publishes a separate `v<release>` GitHub
+Release marked `latest`. The candidate's own `release.yml` signature stays
+on the `v<release>-rc.N` pre-release for provenance; failed and superseded
+candidates are left in place for the audit trail.
+
+Verify a published **stable** lock file — its signature identity is
+`promote.yml`, on `main`:
 
 ```sh
 cosign verify-blob \
   --certificate release-lock.json.pem --signature release-lock.json.sig \
-  --certificate-identity 'https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/heads/main' \
+  --certificate-identity 'https://github.com/vrubovoy/hof-ops/.github/workflows/promote.yml@refs/heads/main' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   release-lock.json
 ```
 
-(A candidate built from a feature branch carries that branch's ref in its
-certificate identity instead; the signed `stable-channel.json` is always
-signed under `promote.yml@refs/heads/main`.)
+The signed `stable-channel.json` carries the same `promote.yml@refs/heads/main`
+identity. A `v<release>-rc.N` **candidate** lock instead verifies against
+`release.yml@refs/heads/<the branch it was built from>` — an unpromoted
+candidate and a promoted stable lock are byte-identical but
+cryptographically distinct in exactly this way.
 
 Run the local, no-pull portion with `pnpm integration`. The candidate job
 adds `--runtime`, which pulls and creates containers without starting a
 platform or requiring the future reconciler.
+
+Promotion assumes repository-level release integrity settings are in
+place — see [SECURITY.md](SECURITY.md#release-channel-integrity).
 
 Third-party artifacts are an explicit exception. The current Caddy gateway is
 resolved and pinned by registry digest under a `digest-only` policy, but Hof

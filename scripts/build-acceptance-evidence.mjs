@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 
 // Emits one schema-valid acceptance-evidence-v1 document from a real
-// published-artifact acceptance run. It is deliberately dumb: it does
-// not itself decide whether acceptance passed - the caller (the
-// acceptance workflow) passes in the per-scenario results it observed,
-// and this script only assembles, derives `result` from them, digests
-// the exact release-lock.json the run downloaded, and schema-checks the
-// whole thing before writing it. The stable-promotion workflow is what
-// later consumes the output as its gate (see scripts/verify-promotion.mjs).
+// published-artifact acceptance run. It is deliberately dumb: the caller
+// (the future .github/workflows/acceptance.yml, running only on
+// protected main) passes in the per-leg / per-destination results it
+// observed plus its own GitHub run context; this script assembles,
+// derives every `result` from the leaves up, digests the exact
+// release-lock.json the run downloaded, and schema-checks the whole
+// thing before writing it. acceptance.yml then Cosign-signs the output
+// with its own OIDC identity; promote.yml verifies that identity, the
+// run provenance recorded here, and the digest binding before it will
+// promote anything (see scripts/verify-promotion.mjs).
 
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
@@ -18,6 +21,10 @@ import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+export const ACCEPTANCE_WORKFLOW_PATH = ".github/workflows/acceptance.yml";
+export const ACCEPTANCE_WORKFLOW_REF = "refs/heads/main";
+export const REQUIRED_SCENARIO_IDS = ["debian12-to-ubuntu2404", "ubuntu2404-to-debian12"];
 
 // --flag value pairs, plus --scenario repeated any number of times.
 function parseArgs(argv) {
@@ -33,7 +40,7 @@ function parseArgs(argv) {
   return args;
 }
 
-// name=debian12->ubuntu2404 restore,source=debian12,target=ubuntu2404,result=succeeded
+// scenarioId=debian12-to-ubuntu2404,local=succeeded,s3=succeeded
 function parseScenario(spec) {
   const fields = {};
   for (const part of spec.split(",")) {
@@ -41,16 +48,27 @@ function parseScenario(spec) {
     if (eq === -1) throw new Error(`malformed --scenario field (expected key=value): ${part}`);
     fields[part.slice(0, eq).trim()] = part.slice(eq + 1).trim();
   }
-  for (const required of ["name", "source", "target", "result"]) {
+  for (const required of ["scenarioId", "local", "s3"]) {
     if (!fields[required]) throw new Error(`--scenario is missing ${required}: ${spec}`);
   }
-  return { name: fields.name, source: fields.source, target: fields.target, result: fields.result };
+  const destinations = { local: { result: fields.local }, s3: { result: fields.s3 } };
+  const result = destinations.local.result === "succeeded" && destinations.s3.result === "succeeded" ? "succeeded" : "failed";
+  return { scenarioId: fields.scenarioId, destinations, result };
 }
 
-export function buildAcceptanceEvidence({ candidate, commit, releaseLockBytes, executionEnvironmentDigest, scenarios, acceptanceRunUrl, recordedAt }) {
+export function buildAcceptanceEvidence({
+  candidate, commit, releaseLockBytes, executionEnvironmentDigest, scenarios,
+  acceptanceRunId, acceptanceRunAttempt, acceptanceCommit, acceptanceRunUrl, recordedAt,
+}) {
   const releaseMatch = /^v((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))-rc\.[1-9][0-9]*$/.exec(candidate ?? "");
   if (!releaseMatch) throw new Error(`--candidate must be an immutable candidate tag vX.Y.Z-rc.N: ${candidate}`);
-  if (!Array.isArray(scenarios) || scenarios.length === 0) throw new Error("at least one --scenario is required");
+
+  const ids = (scenarios ?? []).map((scenario) => scenario.scenarioId);
+  const missing = REQUIRED_SCENARIO_IDS.filter((id) => !ids.includes(id));
+  if (missing.length > 0) throw new Error(`acceptance evidence is missing required restore leg(s): ${missing.join(", ")}`);
+  if (new Set(ids).size !== ids.length) throw new Error(`duplicate scenarioId in acceptance evidence: ${ids.join(", ")}`);
+  const extra = ids.filter((id) => !REQUIRED_SCENARIO_IDS.includes(id));
+  if (extra.length > 0) throw new Error(`unknown scenarioId in acceptance evidence: ${extra.join(", ")}`);
 
   const result = scenarios.every((scenario) => scenario.result === "succeeded") ? "succeeded" : "failed";
 
@@ -61,9 +79,14 @@ export function buildAcceptanceEvidence({ candidate, commit, releaseLockBytes, e
     commit,
     releaseLockDigest: "sha256:" + createHash("sha256").update(releaseLockBytes).digest("hex"),
     executionEnvironmentDigest,
+    acceptanceWorkflowPath: ACCEPTANCE_WORKFLOW_PATH,
+    acceptanceWorkflowRef: ACCEPTANCE_WORKFLOW_REF,
+    acceptanceRunId,
+    acceptanceRunAttempt,
+    acceptanceCommit,
+    acceptanceRunUrl,
     result,
     scenarios,
-    acceptanceRunUrl,
     recordedAt: recordedAt ?? new Date().toISOString(),
   };
 }
@@ -80,7 +103,7 @@ export function executionEnvironmentDigestOf(releaseLock) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  for (const required of ["candidate", "commit", "release-lock", "run-url", "out"]) {
+  for (const required of ["candidate", "commit", "release-lock", "acceptance-run-id", "acceptance-run-attempt", "acceptance-commit", "acceptance-run-url", "out"]) {
     if (!args[required]) throw new Error(`--${required} is required`);
   }
 
@@ -93,7 +116,10 @@ async function main() {
     releaseLockBytes,
     executionEnvironmentDigest: executionEnvironmentDigestOf(releaseLock),
     scenarios: args.scenario.map(parseScenario),
-    acceptanceRunUrl: args["run-url"],
+    acceptanceRunId: args["acceptance-run-id"],
+    acceptanceRunAttempt: Number(args["acceptance-run-attempt"]),
+    acceptanceCommit: args["acceptance-commit"],
+    acceptanceRunUrl: args["acceptance-run-url"],
   });
 
   const schema = JSON.parse(await readFile(path.join(root, "schemas/acceptance-evidence-v1.schema.json"), "utf8"));

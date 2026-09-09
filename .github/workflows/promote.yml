@@ -14,19 +14,23 @@ name: Promote candidate to stable
 #             dispatch revision (checkout @ github.sha). Builds the
 #             stable-channel metadata too, and hands verify's lock bytes +
 #             channel + digest to publish as an artifact.
-#  - publish  (contents: write, id-token: write, environment: promote):
-#             NO checkout, NO pnpm install, NO repository scripts. An
-#             idempotent state machine: it re-classifies the target
-#             (fresh / resume-draft / already-done, or fail-closed on a
-#             conflicting tag or a mutable/incomplete published release),
-#             re-checks the artifact digest, signs, ensures
+#  - publish  (contents: read + id-token: write, environment: promote):
+#             NO checkout, NO pnpm install, NO repository scripts. Holds
+#             NO contents:write - the stable tag and release are written
+#             with a short-lived release-App installation token; id-token
+#             is only for keyless Cosign. An idempotent state machine
+#             (App token, so draft releases are visible): re-classify the
+#             target (fresh / resume-draft / already-done, or fail-closed
+#             on a conflicting tag or a mutable/incomplete published
+#             release), re-check the artifact digest, sign, ensure
 #             refs/tags/v<release> exists at exactly the candidate commit,
-#             creates the release as a DRAFT, verifies the full six-asset
-#             set, then flips it to published+latest (immutable atomically
-#             with that exact set), and re-checks the resolved tag SHA and
-#             the release's own immutability. A crash after the tag or
-#             after a partial draft is resumable; an already-finished
-#             promotion is a success no-op.
+#             create the release as a DRAFT, verify the full six-asset
+#             set, flip it to published+latest (immutable atomically with
+#             that set), re-check the resolved tag SHA and the release's
+#             own immutability. `already-done` additionally re-downloads
+#             the published lock+channel and verifies their bytes and
+#             promote.yml@main signatures. A crash after the tag or after
+#             a partial draft is resumable.
 #
 # The `promote` environment's deployment branch policy (protected branches
 # only) is the real main-only gate; the in-file `refs/heads/main` checks
@@ -188,9 +192,12 @@ jobs:
           RELEASE: ${{ steps.gate.outputs.release }}
           CANDIDATE_COMMIT: ${{ steps.candidate.outputs.commit }}
         run: |
-          # publish re-runs this classification authoritatively (it is the
-          # one that mutates); this is only an early, friendly rejection of
-          # an obviously-conflicting state before signing anything.
+          # Advisory only - publish (in the `promote` environment, with the
+          # App token) re-classifies authoritatively and is the step that
+          # mutates and resumes a stale draft. This read-only GITHUB_TOKEN
+          # cannot see draft releases, so this check only catches an
+          # obviously-unrecoverable state (wrong-commit tag, mutable
+          # published release) before anything is signed.
           T="v${RELEASE}"; R="$GITHUB_REPOSITORY"
           if tobj="$(gh api "repos/$R/git/ref/tags/$T" 2>/dev/null)"; then
             ttype="$(printf '%s' "$tobj" | jq -r .object.type)"
@@ -224,6 +231,7 @@ jobs:
             release-lock.json
             stable-channel.json
           if-no-files-found: error
+          overwrite: true
           retention-days: 1
 
   publish:
@@ -259,8 +267,10 @@ jobs:
           app-id: ${{ vars.HOF_RELEASE_APP_ID }}
           private-key: ${{ secrets.HOF_RELEASE_APP_PRIVATE_KEY }}
 
-      - name: Classify the promotion target state authoritatively (idempotent resume)
+      - name: Classify the promotion target state authoritatively (idempotent resume; App token so drafts are visible)
         id: state
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           T="v${RELEASE}"; R="$GITHUB_REPOSITORY"
           if tobj="$(gh api "repos/$R/git/ref/tags/$T" 2>/dev/null)"; then
@@ -292,12 +302,25 @@ jobs:
           echo "mode=${mode}" >> "$GITHUB_OUTPUT"
           echo "::notice::promotion target: tag=${tag_state}, mode=${mode}"
 
-      - name: Already promoted - nothing to do
-        if: steps.state.outputs.mode == 'already-done'
-        run: echo "::notice::v${RELEASE} is already a published, immutable promotion of ${CANDIDATE}. Exiting successfully."
-
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
-        if: steps.state.outputs.mode != 'already-done'
+
+      - name: Already promoted - the published stable lock must be the exact verified bytes, signed by promote.yml@main
+        if: steps.state.outputs.mode == 'already-done'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          mkdir -p published && gh release download "v${RELEASE}" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'release-lock.json' --pattern 'release-lock.json.sig' --pattern 'release-lock.json.pem' \
+            --pattern 'stable-channel.json' --pattern 'stable-channel.json.sig' --pattern 'stable-channel.json.pem' --dir published
+          echo "${LOCK_SHA256}  published/release-lock.json" | sha256sum -c -
+          for artifact in release-lock.json stable-channel.json; do
+            cosign verify-blob \
+              --certificate "published/${artifact}.pem" --signature "published/${artifact}.sig" \
+              --certificate-identity "${STABLE_SIGNING_IDENTITY}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "published/${artifact}"
+          done
+          echo "::notice::v${RELEASE} is already a complete, immutable, promote.yml@main-signed promotion of ${CANDIDATE}. Exiting successfully."
 
       - name: Take the verified lock bytes + channel from verify
         if: steps.state.outputs.mode != 'already-done'

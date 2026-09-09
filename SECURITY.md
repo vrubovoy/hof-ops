@@ -74,17 +74,37 @@ immutable artifact from being swapped underneath a valid signature.
 is an ancestor of `origin/main`, and pushes + fully signs the immutable
 digest *before* the consumable `ee-vX.Y.Z` tag is assigned to it.
 
-### Residual notes
+### Threat model and residual risk
 
-A collaborator who can push a branch and run a workflow can still, by
-editing their branch's copy of a workflow, request `id-token: write` and
-obtain a Sigstore certificate - but only ever with a
-`@refs/heads/<their-branch>` identity, which no consumer trusts (`hofctl`
-and `promote.yml` require `@refs/heads/main` for stable). They cannot
-create a `v*` or `ee-v*` tag (rulesets), cannot obtain the release App
-key (Environment-bound to `main`), and cannot publish a release without a
-tag. The remaining effect is transparency-log noise from unusable
-branch-identity certificates.
+**Same-repo collaborators with write access are trusted.** Today the only
+such collaborator is a repository admin. The App / ruleset / Environment
+layer defends against *tag-namespace squatting* and *publishing from an
+unreviewed commit*, not against a write-collaborator abusing GitHub's
+Releases API.
+
+A collaborator who can push a branch and run a workflow can, by editing
+their branch's copy of a workflow, request `id-token: write` and obtain a
+Sigstore certificate - but only ever with a `@refs/heads/<their-branch>`
+identity, which no consumer trusts (`hofctl` and `promote.yml` require
+`@refs/heads/main` for stable). They cannot create a `v*` or `ee-v*` tag
+(rulesets), cannot obtain the release-App key (Environment-bound to
+`main`), and cannot publish a release without a tag. What they *can* still
+do with a self-granted `contents: write` `GITHUB_TOKEN` is manipulate the
+Releases control plane: edit drafts and release assets, and re-point the
+`latest` flag - even of an immutable release - so an old, validly-signed
+release could be re-marked `latest`. `release.yml` / `promote.yml` mitigate
+the "false already-done" case by re-downloading the published
+`release-lock.json` and verifying its exact bytes and signature identity,
+not just asset names; they do not defend the `latest` flag itself.
+
+**If the threat model expands to untrusted write-collaborators**, the fix
+is to stop trusting GitHub's `latest`: make the `promote.yml@refs/heads/main`-
+signed `stable-channel.json` (which already pins one exact
+`releaseLockDigest`) the sole authoritative stable pointer, resolved and
+signature-checked by `hofctl`, with full asset-digest verification and
+tag/release/lock/channel cross-binding - or move publication to a separate
+distribution repo / credential boundary. That is tracked as follow-up
+hardening, not part of this PR.
 
 ## Scope
 

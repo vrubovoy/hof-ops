@@ -350,10 +350,13 @@ image tags to commits and digests, checks the named GitHub checks, runs
 verifies SBOM and SLSA provenance attestations, records compatibility
 metadata and pins in `release-lock.json`, re-resolves once more to reject
 tag drift, and uploads the **unsigned** lock as an artifact. The `publish`
-job (`environment: release`, `contents: write`, `id-token: write`) then
-signs that exact artifact with keyless Cosign and publishes it as a GitHub
-**pre-release** tagged `v<release>-rc.<run_number>`. It never writes
-stable-channel metadata and never marks a release `latest`.
+job (`environment: release`, `contents: read` + `id-token: write`) then
+mints a short-lived release-App installation token, signs that exact
+artifact with keyless Cosign, creates the `v<release>-rc.<run_number>` tag
+via the App token, and publishes it as a GitHub **pre-release** (draft →
+verify assets → publish, then re-check the tag SHA and the release's own
+`immutable` flag). It holds no `contents: write`, never writes
+stable-channel metadata, and never marks a release `latest`.
 
 ### 2. Promote a candidate to stable
 
@@ -392,20 +395,25 @@ restore matrix is exactly the two required legs
 destination (`local`, `s3`) green. `verify` also builds `stable-channel.json`
 and hands it, plus the verified lock bytes and their digest, to `publish`.
 
-`publish` (`environment: promote`, `contents: write`, `id-token: write`)
-runs **no checkout, no `pnpm install`, no repository scripts**. It
-re-checks the artifact digest against what `verify` approved, **re-signs
-the identical lock bytes and the channel under
-`promote.yml@refs/heads/main`** (an authorization signature — not a
-rebuild), **atomically creates `refs/tags/v<release>` at the candidate
-commit** via the Git Refs API (accepting a pre-existing tag only if it
-already resolves to exactly that commit and no stable release is out yet —
-so a crash between tag and release is resumable), publishes the `v<release>`
-release against that verified tag with `--verify-tag`, and then re-checks
-the tag SHA, the release's `target_commitish`, and the release's own
-`immutable` flag. The candidate's own `release.yml` signature stays on the
-`v<release>-rc.N` pre-release for provenance; failed and superseded
-candidates are left in place for the audit trail.
+`publish` (`environment: promote`, `contents: read` + `id-token: write`)
+runs **no checkout, no `pnpm install`, no repository scripts**, and holds
+**no `contents: write`** — the stable tag and release are written with a
+short-lived release-App installation token. It re-checks the artifact
+digest against what `verify` approved, classifies the target with the App
+token (so a draft from a crashed prior run is visible: `fresh` /
+`resume-draft` / `already-done`, or fail-closed on a conflicting tag or a
+mutable/incomplete published release), **re-signs the identical lock bytes
+and the channel under `promote.yml@refs/heads/main`** (an authorization
+signature — not a rebuild), ensures `refs/tags/v<release>` exists at
+exactly the candidate commit via the Git Refs API, creates the release as
+a **draft**, verifies the full six-asset set, flips it to
+published + `latest` (immutable atomically with that set), and re-checks
+the resolved protected tag SHA and the release's own `immutable` flag
+(`target_commitish` is **not** asserted — GitHub documents it as unused
+once the tag exists). An `already-done` resume additionally re-downloads
+the published lock + channel and verifies their bytes and
+`promote.yml@refs/heads/main` signatures. The candidate's own `release.yml`
+signature stays on the `v<release>-rc.N` pre-release for provenance.
 
 Verify a published **stable** lock file — its signature identity is
 `promote.yml`, on `main`:

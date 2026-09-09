@@ -1,10 +1,26 @@
-name: Release
+name: Release candidate
+
+# Builds and publishes an IMMUTABLE release candidate - never the stable
+# channel. Any branch may run this; a candidate from a feature branch is
+# a first-class, signed, immutable artifact, it just cannot become
+# `stable` until promote.yml moves it there after real published-artifact
+# acceptance (see PR 0 of Item 10). The stable channel is promote.yml's
+# exclusive output and only ever runs from protected `main`.
+#
+# Candidate tag: v<release>-rc.<run_number>, a GitHub pre-release. The
+# plain v<release> tag and the `stable` channel metadata are never
+# created here.
+#
+# Every workflow_dispatch input is consumed through an `env:` binding,
+# never interpolated as ${{ inputs.* }} directly inside a `run:` script -
+# see GitHub's script-injection hardening guidance. `selection` is
+# additionally shape-checked before it reaches any tool.
 
 on:
   workflow_dispatch:
     inputs:
       release:
-        description: "Canonical stable semver (for example 1.2.3)"
+        description: "Canonical stable semver the candidate would promote to (for example 1.2.3)"
         required: true
       selection:
         description: "Repository-relative release-selection mapping"
@@ -12,14 +28,14 @@ on:
         default: "examples/release-selection.yml"
 
 concurrency:
-  group: release-${{ inputs.release }}
+  group: release-candidate-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  release:
+  candidate:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -31,6 +47,8 @@ jobs:
       statuses: read
     env:
       GH_TOKEN: ${{ github.token }}
+      RELEASE: ${{ inputs.release }}
+      SELECTION: ${{ inputs.selection }}
       SIGNING_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
     steps:
       - uses: actions/checkout@v4
@@ -47,18 +65,28 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - uses: sigstore/cosign-installer@v3
 
-      - name: Reject mutable or invalid platform release identifiers
-        env:
-          RELEASE: ${{ inputs.release }}
+      - name: Validate inputs and candidate-tag immutability
         run: |
-          node -e 'if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(process.env.RELEASE)) process.exit(1)'
-          if gh release view "v${RELEASE}" >/dev/null 2>&1; then
-            echo "GitHub Release v${RELEASE} already exists" >&2
-            exit 1
+          node -e 'if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(process.env.RELEASE)) { console.error("release must be canonical semver"); process.exit(1); }'
+          case "$SELECTION" in
+            /*|*..*) echo "selection must be a repo-relative path with no .. segments" >&2; exit 1 ;;
+          esac
+          if ! printf '%s' "$SELECTION" | grep -Eq '^[A-Za-z0-9._/-]+$'; then
+            echo "selection contains disallowed characters" >&2; exit 1
           fi
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${RELEASE}" >/dev/null 2>&1; then
-            echo "Git tag v${RELEASE} already exists" >&2
-            exit 1
+          if [ ! -f "$SELECTION" ]; then
+            echo "selection file does not exist: $SELECTION" >&2; exit 1
+          fi
+          CANDIDATE_TAG="v${RELEASE}-rc.${GITHUB_RUN_NUMBER}"
+          echo "CANDIDATE_TAG=${CANDIDATE_TAG}" >> "$GITHUB_ENV"
+          if gh release view "$CANDIDATE_TAG" >/dev/null 2>&1; then
+            echo "candidate ${CANDIDATE_TAG} already exists - candidates are immutable" >&2; exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" >/dev/null 2>&1; then
+            echo "git tag ${CANDIDATE_TAG} already exists" >&2; exit 1
+          fi
+          if gh release view "v${RELEASE}" >/dev/null 2>&1; then
+            echo "stable release v${RELEASE} already exists - pick an unreleased version" >&2; exit 1
           fi
 
       - name: Validate contracts and tests
@@ -67,67 +95,47 @@ jobs:
           pnpm test
 
       - name: Resolve and verify selected component releases
-        run: >-
-          node scripts/build-release-lock.mjs
-          --release "${{ inputs.release }}"
-          --selection "${{ inputs.selection }}"
-          --out release-lock.json
+        run: node scripts/build-release-lock.mjs --release "$RELEASE" --selection "$SELECTION" --out release-lock.json
 
       - name: Run pinned topology and Compose integration matrix
         run: node scripts/integration-matrix.mjs --lock release-lock.json --runtime
 
       - name: Reject component tag, revision, or digest drift
         run: |
-          node scripts/build-release-lock.mjs \
-            --release "${{ inputs.release }}" \
-            --selection "${{ inputs.selection }}" \
-            --out release-lock.recheck.json
+          node scripts/build-release-lock.mjs --release "$RELEASE" --selection "$SELECTION" --out release-lock.recheck.json
           cmp release-lock.json release-lock.recheck.json
           rm release-lock.recheck.json
 
-      - name: Build stable-channel metadata
-        run: >-
-          node scripts/build-channel-metadata.mjs
-          --release "${{ inputs.release }}"
-          --lock release-lock.json
-          --repository "${{ github.repository }}"
-          --out stable-channel.json
-
-      - name: Sign and verify release metadata
+      - name: Sign and verify the candidate release lock
         run: |
-          for artifact in release-lock.json stable-channel.json; do
-            cosign sign-blob --yes \
-              --output-signature "${artifact}.sig" \
-              --output-certificate "${artifact}.pem" \
-              "${artifact}"
-            cosign verify-blob \
-              --certificate "${artifact}.pem" \
-              --signature "${artifact}.sig" \
-              --certificate-identity "${SIGNING_IDENTITY}" \
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-              "${artifact}"
-          done
+          cosign sign-blob --yes \
+            --output-signature release-lock.json.sig \
+            --output-certificate release-lock.json.pem \
+            release-lock.json
+          cosign verify-blob \
+            --certificate release-lock.json.pem \
+            --signature release-lock.json.sig \
+            --certificate-identity "${SIGNING_IDENTITY}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            release-lock.json
 
-      - name: Confirm hofctl validate accepts the freshly signed release lock
+      - name: Confirm hofctl validate accepts the freshly signed candidate lock
         run: |
           node scripts/hofctl.mjs validate \
             --services examples/services.yml \
             --release-lock release-lock.json \
             --release-lock-identity "${SIGNING_IDENTITY}"
 
-      - name: Recheck release tag immutability before publication
-        env:
-          RELEASE: ${{ inputs.release }}
+      - name: Recheck candidate-tag immutability before publication
         run: |
-          ! gh release view "v${RELEASE}" >/dev/null 2>&1
-          ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${RELEASE}" >/dev/null 2>&1
+          ! gh release view "$CANDIDATE_TAG" >/dev/null 2>&1
+          ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" >/dev/null 2>&1
 
-      - name: Publish immutable GitHub Release and stable channel reference
+      - name: Publish the immutable release candidate (pre-release, never latest)
         run: |
-          gh release create "v${{ inputs.release }}" \
+          gh release create "$CANDIDATE_TAG" \
             release-lock.json release-lock.json.sig release-lock.json.pem \
-            stable-channel.json stable-channel.json.sig stable-channel.json.pem \
             --target "${GITHUB_SHA}" \
-            --latest \
-            --title "Hof Platform v${{ inputs.release }}" \
-            --notes "Signed immutable release lock and signed stable-channel metadata. See README.md for Cosign verification commands."
+            --prerelease \
+            --title "Hof Platform ${CANDIDATE_TAG}" \
+            --notes "Immutable release candidate for v${RELEASE}, built from ${GITHUB_SHA} on ${GITHUB_REF}. Not the stable channel: promote.yml signs and publishes stable-channel metadata only after real published-artifact acceptance. Verify the candidate lock with cosign verify-blob against certificate-identity ${SIGNING_IDENTITY}."

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/acceptance-evidence-v1.schema.json",
+  "title": "Hof published-artifact acceptance evidence",
+  "description": "Immutable record that a real acceptance run exercised one exact published candidate's own signed artifacts and either passed or failed. Consumed by the stable-promotion workflow as its gate - a candidate is never promoted to the stable channel without a schema-valid, succeeded evidence document that binds to the candidate's exact release-lock digest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "candidate",
+    "release",
+    "commit",
+    "releaseLockDigest",
+    "executionEnvironmentDigest",
+    "result",
+    "scenarios",
+    "acceptanceRunUrl",
+    "recordedAt"
+  ],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/acceptance-evidence/v1" },
+    "candidate": {
+      "type": "string",
+      "description": "The immutable candidate tag the acceptance run downloaded and exercised.",
+      "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-rc\\.[1-9][0-9]*$"
+    },
+    "release": {
+      "type": "string",
+      "description": "The plain platform release version the candidate would promote to (candidate tag minus the -rc.N suffix).",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "commit": {
+      "type": "string",
+      "description": "The exact hof-ops commit the candidate was built from.",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "releaseLockDigest": {
+      "type": "string",
+      "description": "SHA-256 of the candidate's published release-lock.json, byte for byte. Promotion refuses unless this equals the digest of the release-lock.json actually attached to the candidate release.",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "executionEnvironmentDigest": {
+      "type": "string",
+      "description": "The pinned Ansible Execution Environment image digest the candidate's release lock names, recorded so promotion can confirm acceptance ran the same EE the lock ships.",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "result": {
+      "enum": ["succeeded", "failed"],
+      "description": "Overall outcome. A failed document is still published and retained for the audit trail; promotion refuses it."
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Every distinct source->restore acceptance scenario the run executed against published artifacts only.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "source", "target", "result"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "source": { "enum": ["debian12", "ubuntu2404"] },
+          "target": { "enum": ["debian12", "ubuntu2404"] },
+          "result": { "enum": ["succeeded", "failed"] }
+        }
+      }
+    },
+    "acceptanceRunUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://github\\.com/",
+      "description": "The GitHub Actions run that produced this evidence."
+    },
+    "recordedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

@@ -1,0 +1,138 @@
+name: Promote candidate to stable
+
+# Moves ONE immutable release candidate to the `stable` channel. It
+# rebuilds nothing, re-resolves nothing, and pulls no images: promotion
+# publishes the exact release-lock.json bytes acceptance already
+# exercised, gated on a schema-valid, succeeded acceptance-evidence
+# document that binds to that lock's exact digest.
+#
+# Runs only from protected `main`. A candidate built on a feature branch
+# is promotable, but the promotion decision itself is a `main`-only act.
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: "Immutable candidate tag to promote (for example v1.2.3-rc.4)"
+        required: true
+      acceptance_run_id:
+        description: "GitHub Actions run id of the acceptance run that produced the evidence artifact"
+        required: true
+
+concurrency:
+  group: promote-stable
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CANDIDATE: ${{ inputs.candidate }}
+      ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+      STABLE_SIGNING_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/promote.yml@${{ github.ref }}
+    steps:
+      - name: Refuse promotion from any ref other than main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "stable promotion runs only from refs/heads/main, not ${GITHUB_REF}" >&2
+            exit 1
+          fi
+          case "$CANDIDATE" in
+            v*.*.*-rc.*) : ;;
+            *) echo "candidate must be an immutable candidate tag vX.Y.Z-rc.N: $CANDIDATE" >&2; exit 1 ;;
+          esac
+          case "$ACCEPTANCE_RUN_ID" in
+            ''|*[!0-9]*) echo "acceptance_run_id must be numeric" >&2; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.10.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Download the candidate's own signed artifacts (no rebuild)
+        run: |
+          mkdir candidate
+          gh release download "$CANDIDATE" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'release-lock.json' --pattern 'release-lock.json.sig' --pattern 'release-lock.json.pem' \
+            --dir candidate
+          COMMIT="$(gh release view "$CANDIDATE" --repo "$GITHUB_REPOSITORY" --json targetCommitish -q .targetCommitish)"
+          echo "CANDIDATE_COMMIT=${COMMIT}" >> "$GITHUB_ENV"
+
+      - name: Download the acceptance evidence produced by that run
+        run: |
+          mkdir evidence
+          gh run download "$ACCEPTANCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name acceptance-evidence --dir evidence
+
+      - name: Verify the candidate release lock's own Cosign signature (built by release.yml, some ref)
+        run: |
+          cosign verify-blob \
+            --certificate candidate/release-lock.json.pem \
+            --signature candidate/release-lock.json.sig \
+            --certificate-identity-regexp '^https://github\.com/vrubovoy/hof-ops/\.github/workflows/release\.yml@' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            candidate/release-lock.json
+
+      - name: Gate - acceptance evidence must bind to these exact bytes and be succeeded
+        run: |
+          RELEASE="$(node scripts/verify-promotion.mjs \
+            --candidate "$CANDIDATE" \
+            --release-lock candidate/release-lock.json \
+            --evidence evidence/acceptance-evidence.json \
+            --commit "$CANDIDATE_COMMIT")"
+          echo "RELEASE=${RELEASE}" >> "$GITHUB_ENV"
+
+      - name: Refuse if the stable release already exists (stable tags are immutable)
+        run: |
+          if gh release view "v${RELEASE}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "stable release v${RELEASE} already exists" >&2; exit 1
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${RELEASE}" >/dev/null 2>&1; then
+            echo "git tag v${RELEASE} already exists" >&2; exit 1
+          fi
+
+      - name: Build and sign stable-channel metadata from the untouched candidate lock
+        run: |
+          node scripts/build-channel-metadata.mjs \
+            --release "$RELEASE" \
+            --lock candidate/release-lock.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --out stable-channel.json
+          cosign sign-blob --yes \
+            --output-signature stable-channel.json.sig \
+            --output-certificate stable-channel.json.pem \
+            stable-channel.json
+          cosign verify-blob \
+            --certificate stable-channel.json.pem \
+            --signature stable-channel.json.sig \
+            --certificate-identity "${STABLE_SIGNING_IDENTITY}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            stable-channel.json
+
+      - name: Publish the stable release - same lock bytes, same candidate signature, new signed channel
+        run: |
+          gh release create "v${RELEASE}" --repo "$GITHUB_REPOSITORY" \
+            candidate/release-lock.json candidate/release-lock.json.sig candidate/release-lock.json.pem \
+            stable-channel.json stable-channel.json.sig stable-channel.json.pem \
+            --target "${CANDIDATE_COMMIT}" \
+            --latest \
+            --title "Hof Platform v${RELEASE}" \
+            --notes "Promoted from ${CANDIDATE} by promote.yml after acceptance run ${ACCEPTANCE_RUN_ID}. release-lock.json and its .sig/.pem are byte-identical to the candidate's - nothing was rebuilt or re-resolved. stable-channel.json is newly signed under ${STABLE_SIGNING_IDENTITY}. The ${CANDIDATE} pre-release is retained as-is for the audit trail."

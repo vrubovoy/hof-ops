@@ -107,6 +107,20 @@ import {
 } from "../scripts/target-mutate.mjs";
 import { loadAndValidateDeployment } from "../scripts/validate-deployment.mjs";
 
+// Mandatory opt-in (Item 10 PR 0). This file builds and runs a
+// --privileged systemd container, builds images, and creates Docker
+// networks - genuinely privileged work that has, once, disrupted a real
+// developer desktop (see the before() hook's own long note). It is safe
+// only on a disposable, single-purpose CI VM. Without HOF_ALLOW_PRIVILEGED_
+// ACCEPTANCE=1 in the environment it exits cleanly here, BEFORE any
+// docker command, image build, or test registration - a plain
+// `pnpm test:apply-ssh` on a workstation is a deliberate no-op.
+if (process.env.HOF_ALLOW_PRIVILEGED_ACCEPTANCE !== "1") {
+  console.log("# test:apply-ssh skipped - privileged Docker acceptance is opt-in.");
+  console.log("# Set HOF_ALLOW_PRIVILEGED_ACCEPTANCE=1 to run it (spins a --privileged systemd container; CI-only).");
+  process.exit(0);
+}
+
 const RECOVERY_AGE_RECIPIENT = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
 // The real platform release this test downloads and applies - see
 // releases/0.2.3.yml (reuses releases/0.2.0.yml's own app-component

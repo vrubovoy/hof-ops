@@ -38,6 +38,12 @@ jobs:
       - name: Real hofctl apply acceptance (ephemeral sudo-enabled sshd container, real signed release, real Execution Environment)
         env:
           GH_TOKEN: ${{ github.token }}
+          # test:apply-ssh spins a --privileged systemd container and is a
+          # no-op without this explicit opt-in (see test/apply-acceptance.mjs's
+          # own module-level guard). CI is a disposable single-purpose VM, so
+          # it opts in; a fork PR or a local run without the flag exits before
+          # Docker is ever touched.
+          HOF_ALLOW_PRIVILEGED_ACCEPTANCE: "1"
         run: pnpm test:apply-ssh
 
   ansible:

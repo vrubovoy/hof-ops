@@ -57,8 +57,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Refuse to overwrite an existing, immutable Execution Environment tag
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.image_tag }}
         run: |
-          ref="ghcr.io/vrubovoy/hof-ops-ee:${{ steps.version.outputs.image_tag }}"
+          ref="ghcr.io/vrubovoy/hof-ops-ee:${IMAGE_TAG}"
           if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
             echo "::error::${ref} already exists - Execution Environment tags are immutable, use a new version." >&2
             exit 1
@@ -80,7 +82,9 @@ jobs:
       # the signature in the public Rekor transparency log. Signs the
       # immutable digest, not a mutable tag.
       - name: Sign image with keyless Cosign
-        run: cosign sign --yes "ghcr.io/vrubovoy/hof-ops-ee@${{ steps.build.outputs.digest }}"
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/vrubovoy/hof-ops-ee@${IMAGE_DIGEST}"
 
       - name: Generate SBOM
         uses: anchore/sbom-action@v0

@@ -124,8 +124,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: release
+    # Only id-token (for keyless Cosign OIDC). The built-in GITHUB_TOKEN is
+    # read-only here: every write - the candidate tag and the release - goes
+    # through the release-App installation token minted below, and the
+    # "Restrict v* tag creation to the release App" ruleset means nothing
+    # else (a feature-branch GITHUB_TOKEN included) can create a v* tag.
     permissions:
-      contents: write
+      contents: read
       id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
@@ -137,6 +142,13 @@ jobs:
       - name: Re-assert main-only (the `release` environment policy is the real gate)
         run: |
           [ "$GITHUB_REF" = "refs/heads/main" ] || { echo "candidate publication runs only from main" >&2; exit 1; }
+
+      - name: Mint the release-App installation token (publication authority)
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.HOF_RELEASE_APP_ID }}
+          private-key: ${{ secrets.HOF_RELEASE_APP_PRIVATE_KEY }}
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -218,6 +230,8 @@ jobs:
 
       - name: Ensure the candidate tag exists at exactly this build's commit
         if: steps.state.outputs.mode != 'already-done'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           resolve_tag() {
             local tobj ttype tsha
@@ -238,10 +252,14 @@ jobs:
 
       - name: Remove a stale draft so publication is clean
         if: steps.state.outputs.mode == 'resume-draft'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: gh release delete "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --yes
 
       - name: Publish the immutable candidate as a draft, verify assets, then release it (pre-release, never latest)
         if: steps.state.outputs.mode != 'already-done'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           gh release create "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
             release-lock.json release-lock.json.sig release-lock.json.pem \

@@ -231,8 +231,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: promote
+    # id-token only for keyless Cosign. The built-in GITHUB_TOKEN is
+    # read-only; the stable tag and release are written with the
+    # release-App installation token, and the "Restrict v* tag creation to
+    # the release App" ruleset blocks any other identity from creating v*.
     permissions:
-      contents: write
+      contents: read
       id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
@@ -247,6 +251,13 @@ jobs:
       - name: Re-assert main-only
         run: |
           [ "$GITHUB_REF" = "refs/heads/main" ] || { echo "publish must run from main" >&2; exit 1; }
+
+      - name: Mint the release-App installation token (publication authority)
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.HOF_RELEASE_APP_ID }}
+          private-key: ${{ secrets.HOF_RELEASE_APP_PRIVATE_KEY }}
 
       - name: Classify the promotion target state authoritatively (idempotent resume)
         id: state
@@ -317,6 +328,8 @@ jobs:
 
       - name: Ensure refs/tags/v<release> exists at exactly the candidate commit
         if: steps.state.outputs.mode != 'already-done'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           resolve_tag() {
             local tobj ttype tsha
@@ -337,6 +350,8 @@ jobs:
 
       - name: Remove a stale draft release so publication is clean
         if: steps.state.outputs.mode == 'resume-draft'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           # Deletes only the draft release; --cleanup-tag defaults false, so
           # the protected tag we just re-verified stays put.
@@ -344,6 +359,8 @@ jobs:
 
       - name: Create the release as a draft, attach all six assets, verify the set, then publish
         if: steps.state.outputs.mode != 'already-done'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           gh release create "v${RELEASE}" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
             release-lock.json release-lock.json.sig release-lock.json.pem \

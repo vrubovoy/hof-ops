@@ -320,17 +320,16 @@ after a real published-artifact acceptance run. Both `release.yml` and
 privileged job runs under a GitHub **Environment** (`release` / `promote`)
 whose deployment branch policy allows protected branches only.
 
-For an **unmodified** workflow this means GitHub will not start the
-privileged job from anything but `main`. It is not an absolute boundary:
-because a feature branch controls its own copy of the workflow file, it
-could drop the `environment:` key and request `contents: write` /
-`id-token: write` directly. What that still cannot do is mint a Sigstore
-certificate with the `@refs/heads/main` identity `promote.yml` requires for
-stable, or create an `ee-v*` tag (repository ruleset). The residual
-exposure is limited to squatting a `v*` namespace or emitting
-branch-identity certificates — never forging stable release authority.
-Closing that last gap needs a GitHub App publisher plus a `v*`
-tag-creation ruleset that only the App can satisfy; see
+A feature branch controls its own copy of the workflow file, so the
+`environment:` key alone is not the whole boundary. Tag and release
+creation therefore does **not** use the built-in `GITHUB_TOKEN` at all:
+the privileged jobs mint a short-lived installation token for a dedicated
+**release GitHub App** (its private key is an Environment secret, released
+only to `environment: release` / `promote`, which are `main`-only), and
+the "Restrict v* tag creation to the release App" repository ruleset means
+no other identity — a feature-branch `GITHUB_TOKEN` included — can create a
+`v*` or `v*-rc.*` tag. The privileged jobs run with `contents: read`; the
+App token is their only write path. See
 [SECURITY.md](SECURITY.md#release-channel-integrity).
 
 ### 1. Build an immutable candidate

@@ -34,10 +34,17 @@ These must be configured and kept in place:
 - **Deployment Environments** `release`, `promote`, and
   `execution-environment` with deployment branch policies (configured):
   `release` / `promote` allow protected branches only;
-  `execution-environment` allows the tag pattern `ee-v*` only. Note this
-  gates an *unmodified* workflow — a feature branch controls its own
-  workflow file and could remove `environment:` and request `write`
-  scopes. See "Known residual risk" below.
+  `execution-environment` allows the tag pattern `ee-v*` only.
+- **A dedicated release GitHub App** (`HOF_RELEASE_APP_ID`, private key in
+  the `HOF_RELEASE_APP_PRIVATE_KEY` Environment secret on `release` and
+  `promote`). `release.yml` / `promote.yml` privileged jobs run with
+  `contents: read` and do every tag/release write through a short-lived
+  installation token for this App - never the built-in `GITHUB_TOKEN`.
+- **Ruleset "Restrict v* tag creation to the release App"** (configured):
+  `creation` on `refs/tags/v*` is blocked for every actor except that App.
+  A feature-branch workflow only ever holds a `GITHUB_TOKEN`, so it cannot
+  create a `v*` / `v*-rc.*` tag at all - and it cannot obtain the App key,
+  which is bound to the `main`-only Environments.
 - **Two tag rulesets** (configured): "Protect release and EE tags" blocks
   `deletion` / `non_fast_forward` / `update` on `refs/tags/v*` and
   `refs/tags/ee-v*` for everyone; "Restrict EE tag creation to a human
@@ -67,28 +74,17 @@ immutable artifact from being swapped underneath a valid signature.
 is an ancestor of `origin/main`, and pushes + fully signs the immutable
 digest *before* the consumable `ee-vX.Y.Z` tag is assigned to it.
 
-### Known residual risk
+### Residual notes
 
-A collaborator who can push a branch and run a workflow can, by editing
-their branch's copy of `release.yml` / `promote.yml`, obtain
-`contents: write` and `id-token: write` for that run despite the
-`environment:` policy (a branch controls its own workflow definition;
-the repo's default-token permission is a default, not a ceiling). They
-**cannot** forge the `@refs/heads/main` Sigstore identity `promote.yml`
-requires for stable, and **cannot** create an `ee-v*` tag (ruleset). The
-exposure is: squatting a `v*` / `v*-rc.*` tag namespace (which, once
-taken, the "Protect release and EE tags" ruleset then makes
-undeletable), and emitting branch-identity certificates into the public
-transparency log.
-
-Full closure needs publication authority moved off the built-in
-`GITHUB_TOKEN`: a dedicated **GitHub App** whose installation token the
-privileged jobs mint from an Environment secret, plus a `refs/tags/v*`
-creation ruleset whose only bypass actor is that App. Then a
-feature-branch workflow — which only ever holds a `GITHUB_TOKEN` — cannot
-create a `v*` tag at all. This is tracked as follow-up hardening; today
-the practical mitigation is that the sole collaborator is a repository
-admin.
+A collaborator who can push a branch and run a workflow can still, by
+editing their branch's copy of a workflow, request `id-token: write` and
+obtain a Sigstore certificate - but only ever with a
+`@refs/heads/<their-branch>` identity, which no consumer trusts (`hofctl`
+and `promote.yml` require `@refs/heads/main` for stable). They cannot
+create a `v*` or `ee-v*` tag (rulesets), cannot obtain the release App
+key (Environment-bound to `main`), and cannot publish a release without a
+tag. The remaining effect is transparency-log noise from unusable
+branch-identity certificates.
 
 ## Scope
 

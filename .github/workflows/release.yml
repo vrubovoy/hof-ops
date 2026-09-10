@@ -6,8 +6,11 @@ name: Release candidate
 #            revision from ANY ref. Resolves and re-verifies the release
 #            lock and runs the integration matrix, then uploads the
 #            UNSIGNED lock as an artifact. A feature branch can exercise
-#            this for CI, but it cannot mint a Sigstore certificate or
-#            create a GitHub release.
+#            this for CI; a feature-branch copy of the publish job could
+#            still obtain a Sigstore certificate, but only ever with an
+#            untrusted @refs/heads/<branch> identity, and it cannot create
+#            a v* tag (ruleset) or reach the release-App key
+#            (Environment-bound to main) - see SECURITY.md.
 #  - publish (contents: read + id-token: write, environment: release):
 #            the `release` environment's deployment branch policy
 #            (protected branches only) means GitHub will not start this
@@ -231,6 +234,8 @@ jobs:
             --certificate published/release-lock.json.pem --signature published/release-lock.json.sig \
             --certificate-identity "${SIGNING_IDENTITY}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository "${GITHUB_REPOSITORY}" \
+            --certificate-github-workflow-sha "${GITHUB_SHA}" \
             published/release-lock.json
           echo "::notice::${CANDIDATE_TAG} is already a complete, immutable, correctly-signed candidate for this commit."
 

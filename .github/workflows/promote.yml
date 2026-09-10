@@ -66,6 +66,7 @@ jobs:
       release: ${{ steps.gate.outputs.release }}
       candidate_commit: ${{ steps.candidate.outputs.commit }}
       lock_sha256: ${{ steps.channel.outputs.lock_sha256 }}
+      channel_sha256: ${{ steps.channel.outputs.channel_sha256 }}
     env:
       GH_TOKEN: ${{ github.token }}
       CANDIDATE: ${{ inputs.candidate }}
@@ -220,8 +221,8 @@ jobs:
           node scripts/build-channel-metadata.mjs \
             --release "$RELEASE" --lock release-lock.json \
             --repository "$GITHUB_REPOSITORY" --out stable-channel.json
-          lock_sha256="$(sha256sum release-lock.json | cut -d' ' -f1)"
-          echo "lock_sha256=${lock_sha256}" >> "$GITHUB_OUTPUT"
+          echo "lock_sha256=$(sha256sum release-lock.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "channel_sha256=$(sha256sum stable-channel.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Hand the verified lock bytes + channel to publish
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -253,6 +254,7 @@ jobs:
       RELEASE: ${{ needs.verify.outputs.release }}
       CANDIDATE_COMMIT: ${{ needs.verify.outputs.candidate_commit }}
       LOCK_SHA256: ${{ needs.verify.outputs.lock_sha256 }}
+      CHANNEL_SHA256: ${{ needs.verify.outputs.channel_sha256 }}
       STABLE_SIGNING_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/promote.yml@${{ github.ref }}
       WANT_ASSETS: "release-lock.json,release-lock.json.pem,release-lock.json.sig,stable-channel.json,stable-channel.json.pem,stable-channel.json.sig"
     steps:
@@ -312,7 +314,8 @@ jobs:
           mkdir -p published && gh release download "v${RELEASE}" --repo "$GITHUB_REPOSITORY" \
             --pattern 'release-lock.json' --pattern 'release-lock.json.sig' --pattern 'release-lock.json.pem' \
             --pattern 'stable-channel.json' --pattern 'stable-channel.json.sig' --pattern 'stable-channel.json.pem' --dir published
-          echo "${LOCK_SHA256}  published/release-lock.json" | sha256sum -c -
+          echo "${LOCK_SHA256}     published/release-lock.json"   | sha256sum -c -
+          echo "${CHANNEL_SHA256}  published/stable-channel.json" | sha256sum -c -
           for artifact in release-lock.json stable-channel.json; do
             cosign verify-blob \
               --certificate "published/${artifact}.pem" --signature "published/${artifact}.sig" \

@@ -127,10 +127,12 @@ jobs:
             --certificate-github-workflow-sha "${GITHUB_SHA}" >/dev/null
           gh attestation verify "oci://${img}" --repo "$GITHUB_REPOSITORY" \
             --predicate-type https://slsa.dev/provenance/v1 \
-            --cert-identity "$identity" >/dev/null
+            --cert-identity "$identity" \
+            --source-digest "$GITHUB_SHA" --source-ref "$GITHUB_REF" >/dev/null
           gh attestation verify "oci://${img}" --repo "$GITHUB_REPOSITORY" \
             --predicate-type https://spdx.dev/Document \
-            --cert-identity "$identity" >/dev/null
+            --cert-identity "$identity" \
+            --source-digest "$GITHUB_SHA" --source-ref "$GITHUB_REF" >/dev/null
           echo "::notice::${img} is already published for ${GIT_TAG} at ${GITHUB_SHA}, signed and attested - nothing to do."
 
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7

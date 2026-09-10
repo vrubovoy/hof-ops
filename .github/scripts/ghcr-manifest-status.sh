@@ -27,11 +27,14 @@ if [ -z "${token}" ]; then
   exit 0
 fi
 
-curl -sS -I -o /dev/null --max-time 20 -w '%{http_code}' \
+# curl writes %{http_code} even on a transport failure (it is "000"
+# then), so capture it once and print exactly that - never a doubled
+# "000000".
+status="$(curl -sS -I -o /dev/null --max-time 20 -w '%{http_code}' \
   -H "Authorization: Bearer ${token}" \
   -H 'Accept: application/vnd.oci.image.index.v1+json' \
   -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
   -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
   -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
-  "https://ghcr.io/v2/${repo}/manifests/${reference}" 2>/dev/null \
-  || printf '000'
+  "https://ghcr.io/v2/${repo}/manifests/${reference}" 2>/dev/null)" || true
+printf '%s' "${status:-000}"

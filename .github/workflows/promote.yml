@@ -314,8 +314,8 @@ jobs:
           mkdir -p published && gh release download "v${RELEASE}" --repo "$GITHUB_REPOSITORY" \
             --pattern 'release-lock.json' --pattern 'release-lock.json.sig' --pattern 'release-lock.json.pem' \
             --pattern 'stable-channel.json' --pattern 'stable-channel.json.sig' --pattern 'stable-channel.json.pem' --dir published
-          echo "${LOCK_SHA256}     published/release-lock.json"   | sha256sum -c -
-          echo "${CHANNEL_SHA256}  published/stable-channel.json" | sha256sum -c -
+          printf '%s  %s\n' "$LOCK_SHA256"    "published/release-lock.json"   | sha256sum -c -
+          printf '%s  %s\n' "$CHANNEL_SHA256" "published/stable-channel.json" | sha256sum -c -
           for artifact in release-lock.json stable-channel.json; do
             cosign verify-blob \
               --certificate "published/${artifact}.pem" --signature "published/${artifact}.sig" \
@@ -335,7 +335,7 @@ jobs:
       - name: Re-check the lock digest matches what verify approved
         if: steps.state.outputs.mode != 'already-done'
         run: |
-          echo "${LOCK_SHA256}  release-lock.json" | sha256sum -c -
+          printf '%s  %s\n' "$LOCK_SHA256" "release-lock.json" | sha256sum -c -
 
       - name: Sign the lock and the channel under promote.yml@refs/heads/main
         if: steps.state.outputs.mode != 'already-done'

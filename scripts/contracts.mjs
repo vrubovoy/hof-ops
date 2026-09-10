@@ -99,7 +99,7 @@ function validateReleaseSelection(selection, catalog) {
   return errors;
 }
 
-function validateCatalog(catalog) {
+export function validateCatalog(catalog) {
   const errors = [];
   const services = new Map();
   const artifacts = new Set();
@@ -187,7 +187,7 @@ function validateManifest(manifest, catalog) {
   return errors;
 }
 
-function validateReleaseLock(releaseLock, catalog) {
+export function validateReleaseLock(releaseLock, catalog) {
   const errors = [];
   const expected = new Set((catalog.services ?? []).flatMap((service) => service.artifacts ?? []));
   const actual = new Set(Object.keys(releaseLock.components ?? {}));

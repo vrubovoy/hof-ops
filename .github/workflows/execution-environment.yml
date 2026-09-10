@@ -24,6 +24,16 @@ jobs:
   publish:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # External enforcement: the `execution-environment` environment's
+    # deployment branch policy (tag pattern ee-v*) plus the "Restrict EE
+    # tag creation to a human admin" repository ruleset mean a GitHub
+    # Actions token cannot create an ee-v* tag, and this job only runs for
+    # one. In-workflow: the ancestry check, and the publish ordering -
+    # the immutable digest is pushed and fully signed/attested BEFORE the
+    # consumable ee-vX.Y.Z tag is assigned to it as the very last step, so
+    # a mid-run failure never leaves a tagged-but-unsigned image. The
+    # registry probe treats ONLY an explicit 404 as "free to build".
+    environment: execution-environment
     permissions:
       contents: read
       packages: write
@@ -33,8 +43,20 @@ jobs:
       # image-publishing workflow in this platform.
       id-token: write
       attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: The tagged commit must already be on main (no EE from an unreviewed commit)
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::ee-v* tag commit ${GITHUB_SHA} is not an ancestor of origin/main - tag a reviewed, merged commit." >&2
+            exit 1
+          fi
 
       - name: Derive the plain vX.Y.Z image tag from the ee-vX.Y.Z git tag
         id: version
@@ -44,46 +66,100 @@ jobs:
             echo "::error::Execution Environment tag must be ee-vX.Y.Z SemVer: $tag" >&2
             exit 1
           fi
+          echo "git_tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "image_tag=${tag#ee-}" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Refuse to overwrite an existing, immutable Execution Environment tag
+      - name: Probe - is this Execution Environment version already published? (real HTTP status)
+        id: probe
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.image_tag }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ref="ghcr.io/vrubovoy/hof-ops-ee:${{ steps.version.outputs.image_tag }}"
-          if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
-            echo "::error::${ref} already exists - Execution Environment tags are immutable, use a new version." >&2
-            exit 1
-          fi
+          status="$(.github/scripts/ghcr-manifest-status.sh vrubovoy/hof-ops-ee "${IMAGE_TAG}")"
+          case "$status" in
+            200)
+              echo "state=exists" >> "$GITHUB_OUTPUT" ;;
+            404)
+              # The ONLY signal that lets the build proceed.
+              echo "state=absent" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::GHCR manifest probe for ghcr.io/vrubovoy/hof-ops-ee:${IMAGE_TAG} returned '${status}', not a clean 200 or 404 - refusing to assume the immutable tag is free." >&2
+              exit 1 ;;
+          esac
 
-      - uses: docker/build-push-action@v7
+      - name: Resume - the existing tag must be THIS version, on THIS commit, fully signed and attested
+        if: steps.probe.outputs.state == 'exists'
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.image_tag }}
+          GIT_TAG: ${{ steps.version.outputs.git_tag }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Resolve the tag to its digest via a real authenticated request,
+          # then bind everything below to THAT digest.
+          digest="$(docker buildx imagetools inspect "ghcr.io/vrubovoy/hof-ops-ee:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')"
+          [ -n "$digest" ] || { echo "::error::could not resolve ghcr.io/vrubovoy/hof-ops-ee:${IMAGE_TAG} to a digest" >&2; exit 1; }
+          # Cross-check the digest exists on its own (defends against a tag
+          # that resolves but whose manifest 404s).
+          [ "$(.github/scripts/ghcr-manifest-status.sh vrubovoy/hof-ops-ee "${digest}")" = "200" ] || {
+            echo "::error::ghcr.io/vrubovoy/hof-ops-ee@${digest} is not a live manifest" >&2; exit 1; }
+          img="ghcr.io/vrubovoy/hof-ops-ee@${digest}"
+
+          # EXACT identity - this workflow, at exactly this ee-vX.Y.Z tag -
+          # AND the exact commit. An ee-v0.1.6 digest re-tagged as
+          # ee-v0.1.7 fails here (wrong identity ref, wrong workflow-sha).
+          identity="https://github.com/vrubovoy/hof-ops/.github/workflows/execution-environment.yml@refs/tags/${GIT_TAG}"
+          cosign verify "$img" \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository "${GITHUB_REPOSITORY}" \
+            --certificate-github-workflow-sha "${GITHUB_SHA}" >/dev/null
+          gh attestation verify "oci://${img}" --repo "$GITHUB_REPOSITORY" \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --cert-identity "$identity" \
+            --source-digest "$GITHUB_SHA" --source-ref "$GITHUB_REF" >/dev/null
+          gh attestation verify "oci://${img}" --repo "$GITHUB_REPOSITORY" \
+            --predicate-type https://spdx.dev/Document \
+            --cert-identity "$identity" \
+            --source-digest "$GITHUB_SHA" --source-ref "$GITHUB_REF" >/dev/null
+          echo "::notice::${img} is already published for ${GIT_TAG} at ${GITHUB_SHA}, signed and attested - nothing to do."
+
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         id: build
+        if: steps.probe.outputs.state == 'absent'
         with:
           context: ansible
           file: ansible/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: |
-            ghcr.io/vrubovoy/hof-ops-ee:${{ github.sha }}
-            ghcr.io/vrubovoy/hof-ops-ee:${{ steps.version.outputs.image_tag }}
+          # The immutable digest plus a provenance-only sha-<commit> tag.
+          # The consumable ee-vX.Y.Z tag is assigned LAST, after signing.
+          tags: ghcr.io/vrubovoy/hof-ops-ee:sha-${{ github.sha }}
 
       # Keyless: cosign mints a short-lived certificate from this
       # workflow's own OIDC identity (no stored signing key) and records
       # the signature in the public Rekor transparency log. Signs the
       # immutable digest, not a mutable tag.
       - name: Sign image with keyless Cosign
-        run: cosign sign --yes "ghcr.io/vrubovoy/hof-ops-ee@${{ steps.build.outputs.digest }}"
+        if: steps.probe.outputs.state == 'absent'
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/vrubovoy/hof-ops-ee@${IMAGE_DIGEST}"
 
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0
+        if: steps.probe.outputs.state == 'absent'
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           image: ghcr.io/vrubovoy/hof-ops-ee@${{ steps.build.outputs.digest }}
           format: spdx-json
@@ -91,7 +167,8 @@ jobs:
           upload-artifact: false
 
       - name: Attest SBOM
-        uses: actions/attest-sbom@v2
+        if: steps.probe.outputs.state == 'absent'
+        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2
         with:
           subject-name: ghcr.io/vrubovoy/hof-ops-ee
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -99,8 +176,35 @@ jobs:
           push-to-registry: true
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        if: steps.probe.outputs.state == 'absent'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ghcr.io/vrubovoy/hof-ops-ee
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+
+      - name: LAST - assign the immutable ee-vX.Y.Z image tag to the now-signed digest
+        if: steps.probe.outputs.state == 'absent'
+        env:
+          IMAGE_TAG: ${{ steps.version.outputs.image_tag }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ref="ghcr.io/vrubovoy/hof-ops-ee:${IMAGE_TAG}"
+          # Real HTTP status - 404 is the only "safe to create" answer.
+          # (There is no compare-and-swap in the OCI API; the workflow's own
+          # `concurrency` group serialises runs for this ref, and only an
+          # admin can create the ee-v* git tag that triggers a run at all,
+          # so this is the practical serialisation point - see the job
+          # comment.)
+          status="$(.github/scripts/ghcr-manifest-status.sh vrubovoy/hof-ops-ee "${IMAGE_TAG}")"
+          case "$status" in
+            404) : ;;
+            200) echo "::error::${ref} already exists right before the final tag assignment - aborting." >&2; exit 1 ;;
+            *)   echo "::error::pre-assignment probe for ${ref} returned '${status}', not a clean 404 - aborting." >&2; exit 1 ;;
+          esac
+          docker buildx imagetools create --tag "$ref" "ghcr.io/vrubovoy/hof-ops-ee@${IMAGE_DIGEST}"
+          got="$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')"
+          [ "$got" = "$IMAGE_DIGEST" ] || {
+            echo "::error::${ref} resolves to ${got}, not the signed digest ${IMAGE_DIGEST}" >&2; exit 1; }

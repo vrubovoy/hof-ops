@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/acceptance-evidence-v1.schema.json",
+  "title": "Hof published-artifact acceptance evidence",
+  "description": "Immutable, Cosign-signed record that a real acceptance run on protected main exercised one exact published candidate's own signed artifacts across the full required restore matrix and passed. Consumed by promote.yml as its gate: a candidate is never promoted to the stable channel without a schema-valid, succeeded evidence document that (a) is signed by the acceptance workflow's exact OIDC identity, (b) records the acceptance run's own GitHub-verifiable provenance, and (c) binds to the candidate's release-lock digest byte for byte.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "candidate",
+    "release",
+    "commit",
+    "releaseLockDigest",
+    "executionEnvironmentDigest",
+    "acceptanceWorkflowPath",
+    "acceptanceWorkflowRef",
+    "acceptanceRunId",
+    "acceptanceRunAttempt",
+    "acceptanceCommit",
+    "acceptanceRunUrl",
+    "result",
+    "scenarios",
+    "recordedAt"
+  ],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/acceptance-evidence/v1" },
+    "candidate": {
+      "type": "string",
+      "description": "The immutable candidate tag the acceptance run downloaded and exercised.",
+      "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-rc\\.[1-9][0-9]*$"
+    },
+    "release": {
+      "type": "string",
+      "description": "The plain platform release version the candidate would promote to (candidate tag minus the -rc.N suffix).",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "commit": {
+      "type": "string",
+      "description": "The exact hof-ops commit the candidate was built from. Promotion requires acceptanceCommit to equal this and the candidate release's own target commit.",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "releaseLockDigest": {
+      "type": "string",
+      "description": "SHA-256 of the candidate's published release-lock.json, byte for byte. Promotion refuses unless this equals the digest of the release-lock.json actually attached to the candidate release.",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "executionEnvironmentDigest": {
+      "type": "string",
+      "description": "The pinned Ansible Execution Environment image digest the candidate's release lock names, recorded so promotion can confirm acceptance ran the same EE the lock ships.",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "acceptanceWorkflowPath": {
+      "const": ".github/workflows/acceptance.yml",
+      "description": "Fixed. Promotion cross-checks the acceptance run's own .path against this and Cosign-verifies this evidence against acceptance.yml@refs/heads/main."
+    },
+    "acceptanceWorkflowRef": {
+      "const": "refs/heads/main",
+      "description": "Fixed. Acceptance runs only from protected main."
+    },
+    "acceptanceRunId": {
+      "type": "string",
+      "description": "The GitHub Actions run id that produced this evidence. Promotion is handed this id explicitly and refuses a mismatch.",
+      "pattern": "^[1-9][0-9]*$"
+    },
+    "acceptanceRunAttempt": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The run attempt. Promotion cross-checks the live run's own run_attempt."
+    },
+    "acceptanceCommit": {
+      "type": "string",
+      "description": "head_sha of the acceptance run. Must equal both the live run's head_sha and `commit`.",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "acceptanceRunUrl": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://github\\.com/",
+      "description": "html_url of the acceptance run. Promotion cross-checks the live run's own html_url."
+    },
+    "result": {
+      "enum": ["succeeded", "failed"],
+      "description": "Overall outcome: succeeded only when every required scenario and every destination inside it succeeded. A failed document is still published and retained for the audit trail; promotion refuses it."
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "description": "Exactly the two required whole-platform restore legs. Promotion additionally refuses duplicate scenarioIds and any missing leg.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scenarioId", "destinations", "result"],
+        "properties": {
+          "scenarioId": {
+            "enum": ["debian12-to-ubuntu2404", "ubuntu2404-to-debian12"],
+            "description": "Stable id: <source os>-to-<restore target os>."
+          },
+          "destinations": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["local", "s3"],
+            "description": "Both restic destinations are exercised and recorded explicitly in every leg.",
+            "properties": {
+              "local": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["result"],
+                "properties": { "result": { "enum": ["succeeded", "failed"] } }
+              },
+              "s3": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["result"],
+                "properties": { "result": { "enum": ["succeeded", "failed"] } }
+              }
+            }
+          },
+          "result": {
+            "enum": ["succeeded", "failed"],
+            "description": "succeeded only when both destinations in this leg succeeded."
+          }
+        }
+      }
+    },
+    "recordedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

@@ -18,6 +18,94 @@ use GitHub's private reporting flow:
 This is a small, mostly-solo project, so response time is best-effort, not
 contractual — but you can expect an initial reply within a few days.
 
+## Release channel integrity
+
+The two-stage release pipeline (`release.yml` builds an immutable
+`vX.Y.Z-rc.N` candidate; `promote.yml` moves one to `stable` after signed,
+provenance-checked acceptance — see [README](README.md#cutting-a-release))
+depends on repository-level settings that live outside this repo's files.
+These must be configured and kept in place:
+
+- **GitHub Immutable Releases** enabled (repository Settings → General —
+  not exposed by the REST API). `promote.yml` refuses to promote a
+  candidate whose release is not immutable **and** re-checks the stable
+  release's own `immutable` flag after publishing, so this is
+  load-bearing, not advisory: promotion stays inoperable until it is on.
+- **Deployment Environments** `release`, `promote`, and
+  `execution-environment` with deployment branch policies (configured):
+  `release` / `promote` allow protected branches only;
+  `execution-environment` allows the tag pattern `ee-v*` only.
+- **A dedicated release GitHub App** (`HOF_RELEASE_APP_ID`, private key in
+  the `HOF_RELEASE_APP_PRIVATE_KEY` Environment secret on `release` and
+  `promote`). `release.yml` / `promote.yml` privileged jobs run with
+  `contents: read` and do every tag/release write through a short-lived
+  installation token for this App - never the built-in `GITHUB_TOKEN`.
+- **Ruleset "Restrict v* tag creation to the release App"** (configured):
+  `creation` on `refs/tags/v*` is blocked for every actor except that App.
+  A feature-branch workflow only ever holds a `GITHUB_TOKEN`, so it cannot
+  create a `v*` / `v*-rc.*` tag at all - and it cannot obtain the App key,
+  which is bound to the `main`-only Environments.
+- **Two tag rulesets** (configured): "Protect release and EE tags" blocks
+  `deletion` / `non_fast_forward` / `update` on `refs/tags/v*` and
+  `refs/tags/ee-v*` for everyone; "Restrict EE tag creation to a human
+  admin" blocks `creation` on `refs/tags/ee-v*` for everyone but a
+  repository admin, so a `contents: write` Actions token cannot introduce
+  an `ee-v*` tag on an unreviewed commit.
+- **Require actions to be pinned to a full-length commit SHA** at the
+  repository level (`actions/permissions` → `sha_pinning_required: true`,
+  configured). Every workflow here is already SHA-pinned; the setting
+  stops a future unpinned `uses:` from running.
+- **`main` branch protection** with the `contracts` check required and
+  admins included (already configured).
+
+`promote.yml` additionally enforces, in code (from the pinned dispatch
+revision), that the candidate commit is an ancestor of that revision, that
+the candidate lock is schema-valid and passes the full cross-contract
+check against `main`'s own catalog, that both the candidate lock signature
+and the acceptance-evidence signature carry the candidate commit's own
+`github-workflow-sha`, that the evidence's recorded run metadata matches
+the live GitHub run, that the stable tag is created atomically at the
+candidate commit and re-verified before and after publishing, and that the
+stable `release-lock.json` is re-signed under `promote.yml@refs/heads/main`
+as its own authorization signature. None of that removes the need for the
+settings above — they are the layer that keeps an already-published
+immutable artifact from being swapped underneath a valid signature.
+`execution-environment.yml` likewise checks in code that its tagged commit
+is an ancestor of `origin/main`, and pushes + fully signs the immutable
+digest *before* the consumable `ee-vX.Y.Z` tag is assigned to it.
+
+### Threat model and residual risk
+
+**Same-repo collaborators with write access are trusted.** Today the only
+such collaborator is a repository admin. The App / ruleset / Environment
+layer defends against *tag-namespace squatting* and *publishing from an
+unreviewed commit*, not against a write-collaborator abusing GitHub's
+Releases API.
+
+A collaborator who can push a branch and run a workflow can, by editing
+their branch's copy of a workflow, request `id-token: write` and obtain a
+Sigstore certificate - but only ever with a `@refs/heads/<their-branch>`
+identity, which no consumer trusts (`hofctl` and `promote.yml` require
+`@refs/heads/main` for stable). They cannot create a `v*` or `ee-v*` tag
+(rulesets), cannot obtain the release-App key (Environment-bound to
+`main`), and cannot publish a release without a tag. What they *can* still
+do with a self-granted `contents: write` `GITHUB_TOKEN` is manipulate the
+Releases control plane: edit drafts and release assets, and re-point the
+`latest` flag - even of an immutable release - so an old, validly-signed
+release could be re-marked `latest`. `release.yml` / `promote.yml` mitigate
+the "false already-done" case by re-downloading the published
+`release-lock.json` and verifying its exact bytes and signature identity,
+not just asset names; they do not defend the `latest` flag itself.
+
+**If the threat model expands to untrusted write-collaborators**, the fix
+is to stop trusting GitHub's `latest`: make the `promote.yml@refs/heads/main`-
+signed `stable-channel.json` (which already pins one exact
+`releaseLockDigest`) the sole authoritative stable pointer, resolved and
+signature-checked by `hofctl`, with full asset-digest verification and
+tag/release/lock/channel cross-binding - or move publication to a separate
+distribution repo / credential boundary. That is tracked as follow-up
+hardening, not part of this PR.
+
 ## Scope
 
 hof-ops does not hold end-user data — it deploys the services that do. Its

@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/backup-plan-v1.schema.json",
+  "title": "Hof backup plan",
+  "description": "hofctl backup's own deterministic plan contract (ADR 0006) - the backup-kind analogue of plan-v2, bound to the target's host key, installationId, generation, and release-lock digest, plus this run's own exact consistency set and destinations. Never activates plan-v2's own dormant backup.create action - this is a wholly separate document kind with its own fixed, typed operation whitelist (see the operations $def below), because a backup needs to express a consistency set, multiple required destinations, and evidence that plan-v2 never had to.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion", "planId", "backupId", "trigger", "executable", "target", "installationId", "generation",
+    "releaseLockDigest", "backupToolLockDigest", "consistencySet", "destinations", "retention", "operations",
+    "warnings", "blockers"
+  ],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/backup-plan/v1" },
+    "planId": {
+      "description": "sha256 of this plan's own inputs+target binding+consistencySet+destinations, deterministic - never includes a timestamp. A host-key change, a different generation, or a changed destination set all produce a different planId, exactly as plan-v2's own planId already works.",
+      "$ref": "#/$defs/sha256"
+    },
+    "backupId": {
+      "description": "Deterministic, derived from this plan's own content - shared across every destination's own snapshot in this one run, so a partial-failure retry can recognize which destinations already have a snapshot under this exact id and which don't.",
+      "$ref": "#/$defs/sha256"
+    },
+    "trigger": {
+      "description": "manual: hofctl backup run directly, requires the operator's own explicit --approve-plan-id, exactly like apply. scheduled: the systemd timer firing an already-applied backup policy - no fresh interactive approval, since the policy itself was already approved when it was applied.",
+      "enum": ["manual", "scheduled"]
+    },
+    "executable": {
+      "description": "false when blockers is non-empty (drift detected, another operation already in progress, a stale/unreadable signed release or backup-tool-lock, ...) - the runner must refuse a plan that isn't executable, exactly like apply.",
+      "type": "boolean"
+    },
+    "target": { "$ref": "#/$defs/targetBinding" },
+    "installationId": { "type": "string", "minLength": 1 },
+    "generation": {
+      "description": "The generation actually being backed up - read from the target's own committed state under the mutex, immediately before this plan is built.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "releaseLockDigest": { "$ref": "#/$defs/sha256" },
+    "backupToolLockDigest": {
+      "description": "The signed backup-tool-lock this plan was verified against - independent of releaseLockDigest above (ADR 0006's own point: a backup-tool build moves independently of the platform release).",
+      "$ref": "#/$defs/sha256"
+    },
+    "consistencySet": {
+      "description": "Every volume this backup must snapshot together for a coherent restore - every enabled unit's own volume (from backup-inventory.json, see render-topology.mjs) PLUS every retainedServices volume (disabled-but-retained persistent services are explicitly in scope here, unlike a plain apply).",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/consistencySetEntry" }
+    },
+    "destinations": {
+      "description": "Resolved from services.yml's own backup.destinations at planning time - same local/s3 shape, copied here rather than $ref'd across files (this repo's own convention). All configured destinations are required for this operation's own overall success (ADR 0006) - a plan with zero destinations is never executable.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/destination" }
+    },
+    "retention": { "$ref": "#/$defs/retention" },
+    "operations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/operation" }
+    },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "blockers": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "operationId": {
+      "type": "string",
+      "pattern": "^[0-9]{3}\\.[a-z][a-z0-9.-]{0,80}$"
+    },
+    "targetBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "host", "port", "user", "hostKeySha256", "installationId", "baselineGeneration"],
+      "properties": {
+        "mode": { "enum": ["ssh", "local"] },
+        "host": { "type": ["string", "null"] },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "user": { "type": ["string", "null"] },
+        "hostKeySha256": { "type": ["string", "null"], "pattern": "^SHA256:[A-Za-z0-9+/]+=*$" },
+        "installationId": { "type": ["string", "null"] },
+        "baselineGeneration": { "type": "integer", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "ssh" } } },
+          "then": { "properties": { "hostKeySha256": { "type": "string" } } },
+          "else": { "properties": { "hostKeySha256": { "const": null } } }
+        }
+      ]
+    },
+    "consistencySetEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service", "unit", "volume", "retained"],
+      "properties": {
+        "service": { "$ref": "#/$defs/identifier" },
+        "unit": { "$ref": "#/$defs/identifier" },
+        "volume": { "$ref": "#/$defs/identifier" },
+        "retained": {
+          "description": "true for a disabled-but-retained persistent service's own volume (state.retainedServices) - false for a normally-enabled unit's volume. Both are in scope for this consistency set; this flag is purely informational (evidence/diagnostics), never changes how the volume is snapshotted.",
+          "type": "boolean"
+        }
+      }
+    },
+    "retention": {
+      "description": "Copied from services-v1alpha1.schema.json's own backup.retention shape (never $ref'd across files).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["daily", "weekly", "monthly"],
+      "properties": {
+        "daily": { "type": "integer", "minimum": 1 },
+        "weekly": { "type": "integer", "minimum": 0 },
+        "monthly": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "destination": {
+      "description": "Copied from services-v1alpha1.schema.json's own backup.destinations item shape (never $ref'd across files) - name is this installation's own unique destination identifier (services.yml's own contract test already refuses a duplicate name).",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "type", "path", "secretRef"],
+          "properties": {
+            "name": { "$ref": "#/$defs/identifier" },
+            "type": { "const": "local" },
+            "path": { "type": "string", "pattern": "^/[^\\u0000]+$" },
+            "secretRef": { "$ref": "#/$defs/identifier" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "type", "bucket", "secretRef"],
+          "properties": {
+            "name": { "$ref": "#/$defs/identifier" },
+            "type": { "const": "s3" },
+            "bucket": { "type": "string", "minLength": 3, "maxLength": 63 },
+            "prefix": { "type": "string", "pattern": "^[^/]?(?:.*[^/])?$" },
+            "endpoint": { "type": "string", "format": "uri", "pattern": "^https://" },
+            "region": { "type": "string", "minLength": 1 },
+            "secretRef": { "$ref": "#/$defs/identifier" }
+          }
+        }
+      ]
+    },
+    "operation": {
+      "description": "The Backup Flow's own fixed, typed operation whitelist (ADR 0006) - no generic executor, matching ADR 0004's own decision. Dispatched in list order, under the shared execution mutex.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "phase", "action", "resource", "reason"],
+      "properties": {
+        "id": { "$ref": "#/$defs/operationId" },
+        "phase": {
+          "enum": ["maintenance", "service", "staging", "snapshot", "retention", "readiness", "evidence"]
+        },
+        "action": {
+          "enum": [
+            "maintenance.enter", "service.stop", "staging.build", "snapshot.create", "retention.apply",
+            "service.start", "readiness.wait", "maintenance.exit", "evidence.write"
+          ]
+        },
+        "resource": {
+          "description": "The unit, the fixed staging-tree label, or the destination name this operation concerns, depending on action.",
+          "type": "string"
+        },
+        "destination": {
+          "description": "Only for snapshot.create - which configured destination this operation targets. One snapshot.create operation per destination, all sharing the plan's own backupId.",
+          "$ref": "#/$defs/identifier"
+        },
+        "condition": {
+          "description": "Only for readiness.wait - reuses plan-v2's own running/healthy vocabulary.",
+          "enum": ["running", "healthy"]
+        },
+        "reason": { "type": "string" }
+      }
+    }
+  }
+}

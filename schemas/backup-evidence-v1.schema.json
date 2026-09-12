@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/backup-evidence-v1.schema.json",
+  "title": "Hof backup evidence",
+  "description": "Written atomically once a backup operation reaches its own end, never touching current.json or the generation (ADR 0006's own Backup Flow step 12) - immutable once written. status distinguishes a real, useful middle case journal/operation-lock-v2 cannot: \"partial\" (at least one destination succeeded, at least one did not) is recorded honestly here even though the operation's own journal status is always \"failed\" whenever any configured destination failed - all destinations are required for the operation's own overall success (ADR 0006), but a partial result is never silently reported as a total one.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "operationId", "backupId", "target", "startedAt", "completedAt", "status", "perDestinationResults", "retentionApplied"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/backup-evidence/v1" },
+    "operationId": { "$ref": "#/$defs/operationId" },
+    "backupId": { "$ref": "#/$defs/sha256" },
+    "target": { "$ref": "#/$defs/targetBinding" },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "completedAt": { "type": "string", "format": "date-time" },
+    "status": {
+      "description": "succeeded: every configured destination succeeded. partial: at least one succeeded and at least one failed. failed: no destination succeeded at all (including the case where the operation crashed before any snapshot.create ever ran, leaving perDestinationResults empty).",
+      "enum": ["succeeded", "partial", "failed"]
+    },
+    "perDestinationResults": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/destinationResult" }
+    },
+    "retentionApplied": {
+      "description": "Whether retention.apply actually ran to completion this operation - false on a crash/failure before reaching it.",
+      "type": "boolean"
+    }
+  },
+  "allOf": [
+    {
+      "description": "status must faithfully reflect perDestinationResults' own real content - never a silent partial-as-success or partial-as-total-failure.",
+      "if": { "properties": { "status": { "const": "succeeded" } } },
+      "then": { "properties": { "perDestinationResults": { "type": "array", "not": { "contains": { "type": "object", "properties": { "status": { "const": "failed" } } } } } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "failed" } } },
+      "then": { "properties": { "perDestinationResults": { "type": "array", "not": { "contains": { "type": "object", "properties": { "status": { "const": "succeeded" } } } } } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "partial" } } },
+      "then": {
+        "properties": {
+          "perDestinationResults": {
+            "type": "array",
+            "allOf": [
+              { "contains": { "type": "object", "properties": { "status": { "const": "succeeded" } } } },
+              { "contains": { "type": "object", "properties": { "status": { "const": "failed" } } } }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "operationId": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "targetBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "host", "port", "user", "hostKeySha256", "installationId", "baselineGeneration"],
+      "properties": {
+        "mode": { "enum": ["ssh", "local"] },
+        "host": { "type": ["string", "null"] },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "user": { "type": ["string", "null"] },
+        "hostKeySha256": { "type": ["string", "null"], "pattern": "^SHA256:[A-Za-z0-9+/]+=*$" },
+        "installationId": { "type": ["string", "null"] },
+        "baselineGeneration": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "destinationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["destination", "status"],
+      "properties": {
+        "destination": { "$ref": "#/$defs/identifier" },
+        "status": { "enum": ["succeeded", "failed"] },
+        "snapshotId": { "type": "string", "minLength": 1 },
+        "verifiedAt": { "type": "string", "format": "date-time" },
+        "error": {
+          "description": "A short, sanitized diagnostic - never a raw exception dump, a secret value, or credential content.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "succeeded" } } },
+          "then": { "required": ["snapshotId", "verifiedAt"], "properties": { "error": false } },
+          "else": { "required": ["error"], "properties": { "snapshotId": false, "verifiedAt": false } }
+        }
+      ]
+    }
+  }
+}

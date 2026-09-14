@@ -12,17 +12,17 @@
   "properties": {
     "apiVersion": { "const": "hof.dev/backup-policy/v1" },
     "policyId": {
-      "description": "sha256 of this policy's own content (every field below) minus policyId itself, canonicalized - the exact same formula plan-v2's own planId already uses (scripts/backup-ids.mjs's canonicalContentId). Deterministic: re-applying an unchanged backup: section never mints a new policyId.",
+      "description": "sha256 of ONLY this policy's own actual content - installationId, schedule, destinations, retention, includeRetainedVolumes - canonicalized, via scripts/backup-ids.mjs's canonicalContentId excluding policyId itself AND appliedGeneration/appliedManifestDigest both. Those two are metadata about WHEN this policy was last reconfirmed current, never part of the policy's own identity: an apply that changes something unrelated (bumping the generation and the whole manifest's own digest) while leaving the backup: section byte-identical must re-stamp appliedGeneration/appliedManifestDigest without minting a new policyId, and conversely a genuine change to schedule/destinations/retention/includeRetainedVolumes must mint a new policyId even if, hypothetically, appliedGeneration/appliedManifestDigest happened not to change. Deterministic: re-applying an unchanged backup: section never mints a new policyId, regardless of what else that apply touched.",
       "$ref": "#/$defs/sha256"
     },
     "installationId": { "type": "string", "minLength": 1 },
     "appliedGeneration": {
-      "description": "The generation at which this exact policy became the currently-applied one - state.commit's own generation from that apply, never recomputed or inferred later.",
+      "description": "The generation of the most recent apply that reconfirmed this policy as current - NOT part of policyId's own identity (see policyId's own description). Updated every time an apply commits, whether or not the backup: section itself actually changed that time.",
       "type": "integer",
       "minimum": 1
     },
     "appliedManifestDigest": {
-      "description": "The services.yml manifestDigest whose backup: section this policy was copied from verbatim - lets a later backup plan confirm the policy it's binding to still matches (or has since diverged from) the currently-applied manifest, the same drift check that already gates a plain apply.",
+      "description": "The services.yml manifestDigest of that same most-recent reconfirming apply - NOT part of policyId's own identity (see policyId's own description). Lets a later backup plan confirm this policy document is still fresh (its own appliedGeneration matches the target's actual current generation), without that freshness check ever perturbing the policy's own identity.",
       "$ref": "#/$defs/sha256"
     },
     "schedule": {
@@ -54,6 +54,11 @@
   },
   "$defs": {
     "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
+    "destinationName": {
+      "description": "Exactly services-v1alpha1.schema.json's own $defs/name pattern (hyphens only, max 63 chars, no dots) - see backup-plan-v1.schema.json's own identical $def for why.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}$"
+    },
     "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
     "destination": {
       "oneOf": [
@@ -62,10 +67,10 @@
           "additionalProperties": false,
           "required": ["name", "type", "path", "secretRef"],
           "properties": {
-            "name": { "$ref": "#/$defs/identifier" },
+            "name": { "$ref": "#/$defs/destinationName" },
             "type": { "const": "local" },
             "path": { "type": "string", "pattern": "^/[^\\u0000]+$" },
-            "secretRef": { "$ref": "#/$defs/identifier" }
+            "secretRef": { "$ref": "#/$defs/destinationName" }
           }
         },
         {
@@ -73,7 +78,7 @@
           "additionalProperties": false,
           "required": ["name", "type", "bucket", "secretRef"],
           "properties": {
-            "name": { "$ref": "#/$defs/identifier" },
+            "name": { "$ref": "#/$defs/destinationName" },
             "type": { "const": "s3" },
             "bucket": { "type": "string", "minLength": 3, "maxLength": 63 },
             "prefix": { "type": "string", "pattern": "^[^/]?(?:.*[^/])?$" },
@@ -81,10 +86,10 @@
               "description": "Never carries an embedded credential (https://user:pass@host/...) - the secretRef above is the only way this destination's own credential reaches the runner.",
               "type": "string",
               "format": "uri",
-              "pattern": "^https://[^@\\s]+$"
+              "pattern": "^https://[^@?#\\s]+$"
             },
             "region": { "type": "string", "minLength": 1 },
-            "secretRef": { "$ref": "#/$defs/identifier" }
+            "secretRef": { "$ref": "#/$defs/destinationName" }
           }
         }
       ]

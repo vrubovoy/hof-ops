@@ -1,11 +1,15 @@
-// Schema-level coverage for the generic, kind-aware operation-lock-v2 /
-// operation-journal-v2 contracts ADR 0006 introduces - no real executor
-// exists yet (that's a later PR in this item's own sequence), so every
-// fixture here is hand-built, mirroring test/apply-contracts.test.mjs's
-// own pattern for operation-lock-v1/operation-journal-v1. The one piece
-// of genuinely new cross-cutting logic these two schemas add over their
-// v1 predecessors is the operationKind x status x committedGeneration
-// conditional matrix - that's this file's own centerpiece.
+// Schema-level coverage for operation-lock-v2 / operation-journal-v2 /
+// operation-event-v2 (ADR 0006) - all three scoped strictly to
+// operationKind backup/restore, never apply (a review round found the
+// prior draft's "apply is schema-valid too, just unused" shape was an
+// unresolved contradiction: the existing apply executor only ever reads
+// and writes v1, so a v2 apply document was schema-valid but could never
+// actually occur, and the various v1/v2 schemas' own descriptions
+// disagreed with each other about which event schema paired with which
+// journal kind). No real executor exists yet (that's a later PR in this
+// item's own sequence), so every fixture here is hand-built, mirroring
+// test/apply-contracts.test.mjs's own pattern for operation-lock-v1/
+// operation-journal-v1.
 
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -35,12 +39,16 @@ function targetBinding(overrides = {}) {
 const OPERATION_ID = "3b1f6c2e-6e35-4f7a-9c3b-000000000001";
 const PLAN_ID = "sha256:" + "a".repeat(64);
 
+function sha(fill) {
+  return "sha256:" + String(fill).repeat(64).slice(0, 64);
+}
+
 // --- operation-lock-v2 --------------------------------------------------
 
 function lockFixture(overrides = {}) {
   return {
     apiVersion: "hof.dev/operation-lock/v2",
-    operationKind: "apply",
+    operationKind: "backup",
     operationId: OPERATION_ID,
     approvedPlanId: PLAN_ID,
     target: targetBinding(),
@@ -50,19 +58,19 @@ function lockFixture(overrides = {}) {
   };
 }
 
-test("operation-lock-v2: an apply lock validates", async () => {
-  const validate = await validatorFor("operation-lock-v2.schema.json");
-  assert.ok(validate(lockFixture()), JSON.stringify(validate.errors));
-});
-
 test("operation-lock-v2: a backup lock validates", async () => {
   const validate = await validatorFor("operation-lock-v2.schema.json");
-  assert.ok(validate(lockFixture({ operationKind: "backup" })), JSON.stringify(validate.errors));
+  assert.ok(validate(lockFixture()), JSON.stringify(validate.errors));
 });
 
 test("operation-lock-v2: a restore lock validates", async () => {
   const validate = await validatorFor("operation-lock-v2.schema.json");
   assert.ok(validate(lockFixture({ operationKind: "restore" })), JSON.stringify(validate.errors));
+});
+
+test("operation-lock-v2: rejects operationKind apply - the existing apply executor only ever reads/writes operation-lock-v1, never this schema", async () => {
+  const validate = await validatorFor("operation-lock-v2.schema.json");
+  assert.equal(validate(lockFixture({ operationKind: "apply" })), false);
 });
 
 test("operation-lock-v2: rejects an unrecognized operationKind", async () => {
@@ -101,31 +109,50 @@ test("operation-lock-v2: rejects a local-mode target that still carries a host k
 
 // --- operation-journal-v2 -------------------------------------------------
 
-function journalFixture(overrides = {}) {
+function backupInputDigests(overrides = {}) {
   return {
-    apiVersion: "hof.dev/operation-journal/v2",
-    operationKind: "apply",
-    operationId: OPERATION_ID,
-    approvedPlanId: PLAN_ID,
-    target: targetBinding(),
-    plan: { apiVersion: "hof.dev/plan/v2", planId: PLAN_ID },
-    inputDigests: {
-      manifestDigest: "sha256:" + "1".repeat(64), releaseLockDigest: "sha256:" + "2".repeat(64),
-      catalogDigest: "sha256:" + "3".repeat(64), composeTemplateDigest: "sha256:" + "4".repeat(64),
-      executionEnvironmentDigest: "sha256:" + "5".repeat(64),
-    },
-    startedAt: "2026-09-04T10:00:00Z",
-    status: "in-progress",
-    committedGeneration: null,
+    releaseLockDigest: sha("1"), backupToolLockDigest: sha("2"), backupPolicyId: sha("3"),
     ...overrides,
   };
 }
 
-test("operation-journal-v2: an in-progress journal (any kind) validates with committedGeneration null", async () => {
+function restoreInputDigests(overrides = {}) {
+  return {
+    releaseLockDigest: sha("1"), backupToolLockDigest: sha("2"), manifestDigest: sha("4"), recoveryKitDigest: sha("5"),
+    ...overrides,
+  };
+}
+
+function journalFixture(overrides = {}) {
+  const operationKind = overrides.operationKind ?? "backup";
+  const base = {
+    apiVersion: "hof.dev/operation-journal/v2",
+    operationKind,
+    operationId: OPERATION_ID,
+    approvedPlanId: PLAN_ID,
+    target: targetBinding(),
+    plan: { apiVersion: operationKind === "restore" ? "hof.dev/restore-plan/v1" : "hof.dev/backup-plan/v1", planId: PLAN_ID },
+    inputDigests: operationKind === "restore" ? restoreInputDigests() : backupInputDigests(),
+    startedAt: "2026-09-04T10:00:00Z",
+    status: "in-progress",
+    committedGeneration: null,
+  };
+  return { ...base, ...overrides };
+}
+
+test("operation-journal-v2: an in-progress journal (either kind) validates with committedGeneration null", async () => {
   const validate = await validatorFor("operation-journal-v2.schema.json");
-  for (const operationKind of ["apply", "backup", "restore"]) {
+  for (const operationKind of ["backup", "restore"]) {
     assert.ok(validate(journalFixture({ operationKind })), `${operationKind}: ${JSON.stringify(validate.errors)}`);
   }
+});
+
+test("operation-journal-v2: rejects operationKind apply - the existing apply executor only ever reads/writes operation-journal-v1, never this schema", async () => {
+  const validate = await validatorFor("operation-journal-v2.schema.json");
+  const journal = journalFixture({ operationKind: "apply" });
+  journal.plan = { apiVersion: "hof.dev/plan/v2", planId: PLAN_ID };
+  journal.inputDigests = { manifestDigest: sha("1"), releaseLockDigest: sha("2"), catalogDigest: sha("3"), composeTemplateDigest: sha("4"), executionEnvironmentDigest: sha("5") };
+  assert.equal(validate(journal), false);
 });
 
 test("operation-journal-v2: rejects a journal with no operationKind at all - a pre-ADR-0006 journal is operation-journal-v1, never this schema", async () => {
@@ -140,13 +167,29 @@ test("operation-journal-v2: rejects an unrecognized operationKind", async () => 
   assert.equal(validate(journalFixture({ operationKind: "upgrade" })), false);
 });
 
-// The centerpiece: operationKind x status x committedGeneration.
-
-test("operation-journal-v2: a succeeded APPLY journal requires a real committed generation, exactly like v1", async () => {
+test("operation-journal-v2: rejects a backup journal embedding a restore-plan-v1 document, and vice versa", async () => {
   const validate = await validatorFor("operation-journal-v2.schema.json");
-  assert.ok(validate(journalFixture({ operationKind: "apply", status: "succeeded", committedGeneration: 3 })), JSON.stringify(validate.errors));
-  assert.equal(validate(journalFixture({ operationKind: "apply", status: "succeeded", committedGeneration: null })), false, "apply succeeded with no committed generation must be rejected");
+  const backupWithRestorePlan = journalFixture({ operationKind: "backup" });
+  backupWithRestorePlan.plan = { apiVersion: "hof.dev/restore-plan/v1", planId: PLAN_ID };
+  assert.equal(validate(backupWithRestorePlan), false);
+
+  const restoreWithBackupPlan = journalFixture({ operationKind: "restore" });
+  restoreWithBackupPlan.plan = { apiVersion: "hof.dev/backup-plan/v1", planId: PLAN_ID };
+  assert.equal(validate(restoreWithBackupPlan), false);
 });
+
+test("operation-journal-v2: rejects backup inputDigests on a restore journal, and vice versa", async () => {
+  const validate = await validatorFor("operation-journal-v2.schema.json");
+  const backupWithRestoreDigests = journalFixture({ operationKind: "backup" });
+  backupWithRestoreDigests.inputDigests = restoreInputDigests();
+  assert.equal(validate(backupWithRestoreDigests), false);
+
+  const restoreWithBackupDigests = journalFixture({ operationKind: "restore" });
+  restoreWithBackupDigests.inputDigests = backupInputDigests();
+  assert.equal(validate(restoreWithBackupDigests), false);
+});
+
+// The centerpiece: operationKind x status x committedGeneration.
 
 test("operation-journal-v2: a succeeded RESTORE journal requires a real committed generation - the restored source generation, carried forward", async () => {
   const validate = await validatorFor("operation-journal-v2.schema.json");
@@ -162,12 +205,22 @@ test("operation-journal-v2: a succeeded BACKUP journal REQUIRES committedGenerat
 
 test("operation-journal-v2: an in-progress or failed journal never carries a committed generation, regardless of kind", async () => {
   const validate = await validatorFor("operation-journal-v2.schema.json");
-  for (const operationKind of ["apply", "backup", "restore"]) {
+  for (const operationKind of ["backup", "restore"]) {
     for (const status of ["in-progress", "failed"]) {
       assert.equal(validate(journalFixture({ operationKind, status, committedGeneration: 1 })), false, `${operationKind}/${status} with a committed generation must be rejected`);
       assert.ok(validate(journalFixture({ operationKind, status, committedGeneration: null })), `${operationKind}/${status} with null: ${JSON.stringify(validate.errors)}`);
     }
   }
+});
+
+test("operation-journal-v2: status: failed always means evidence.write already ran - see this schema's own status field description", async () => {
+  const validate = await validatorFor("operation-journal-v2.schema.json");
+  // Schema-level, this is a documentation-only invariant (evidence
+  // itself is a separate document, checked by scripts/backup-flow.mjs's
+  // own bundle validators, not this schema) - this test only confirms
+  // failed remains schema-valid on its own, as the terminal state its
+  // own description now claims to be.
+  assert.ok(validate(journalFixture({ operationKind: "backup", status: "failed", committedGeneration: null })), JSON.stringify(validate.errors));
 });
 
 test("operation-journal-v2: rejects a secret value smuggled into inputDigests", async () => {
@@ -179,8 +232,8 @@ test("operation-journal-v2: rejects a secret value smuggled into inputDigests", 
 
 test("operation-journal-v2: rejects a missing input digest", async () => {
   const validate = await validatorFor("operation-journal-v2.schema.json");
-  const journal = journalFixture();
-  delete journal.inputDigests.executionEnvironmentDigest;
+  const journal = journalFixture({ operationKind: "restore" });
+  delete journal.inputDigests.recoveryKitDigest;
   assert.equal(validate(journal), false);
 });
 
@@ -214,9 +267,9 @@ test("operation-event-v2: a restore event validates", async () => {
   assert.ok(validate(eventFixture({ operationKind: "restore", step: "003.data.restore.schlussel" })), JSON.stringify(validate.errors));
 });
 
-test("operation-event-v2: an apply event is schema-valid (completeness with lock/journal-v2's own enum) even though no existing code ever produces one", async () => {
+test("operation-event-v2: rejects operationKind apply - the existing apply executor only ever emits operation-event-v1, never this schema", async () => {
   const validate = await validatorFor("operation-event-v2.schema.json");
-  assert.ok(validate(eventFixture({ operationKind: "apply", step: "003.service.start.gateway" })), JSON.stringify(validate.errors));
+  assert.equal(validate(eventFixture({ operationKind: "apply", step: "003.service.start.gateway" })), false);
 });
 
 test("operation-event-v2: rejects an unrecognized operationKind", async () => {
@@ -242,7 +295,11 @@ test("operation-event-v2: destination is only ever valid on a backup-kind event"
   const validate = await validatorFor("operation-event-v2.schema.json");
   assert.ok(validate(eventFixture({ operationKind: "backup", destination: "onsite" })), JSON.stringify(validate.errors));
   assert.equal(validate(eventFixture({ operationKind: "restore", step: "003.data.restore.schlussel", destination: "onsite" })), false, "restore never has a per-destination step");
-  assert.equal(validate(eventFixture({ operationKind: "apply", step: "003.service.start.gateway", destination: "onsite" })), false, "apply never has a per-destination step");
+});
+
+test("operation-event-v2: destination follows the services-v1alpha1-compatible destinationName pattern (hyphens only, max 63 chars), not the broader identifier pattern", async () => {
+  const validate = await validatorFor("operation-event-v2.schema.json");
+  assert.equal(validate(eventFixture({ operationKind: "backup", destination: "on.site" })), false);
 });
 
 test("operation-event-v2: rejects a raw exception dump or secret value smuggled into error", async () => {

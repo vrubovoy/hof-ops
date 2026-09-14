@@ -1,19 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hof.dev/schemas/operation-lock-v2.schema.json",
-  "title": "Hof operation lock (v2, kind-generic)",
-  "description": "/var/lib/hof/state/lock.json - exclusive ownership of an in-progress or interrupted operation against this host. Identical to operation-lock-v1 except for the added operationKind field (ADR 0006): apply, backup, and restore now all share one physical execution mutex, refusing each other in every direction, not just same-kind contention. A pre-existing lock.json written before this ADR has no operationKind field at all and does not validate against this schema - an executor reading it must treat that absence as an implicit \"apply\" (operation-lock-v1 is still valid, still readable, never deleted). Deliberately has no TTL/expiry field - the lock must survive the invoking process dying (an operator's laptop sleeping, a network drop), so it is only ever removed by a successful commit or reclaimed by --resume for the SAME operationId, never by simply waiting it out.",
+  "title": "Hof operation lock (v2, backup/restore only)",
+  "description": "/var/lib/hof/state/lock.json for a backup or restore operation - exclusive ownership of an in-progress or interrupted one against this host. Scoped strictly to operationKind backup/restore, never apply: the existing apply executor (scripts/operation-journal.mjs, unchanged by this item) reads and writes operation-lock-v1 exclusively and always will, for every apply run, old or new - there is no migration of apply onto v2 in this item, and no ambiguity about which schema an apply lock validates against. The cross-kind exclusion ADR 0006 promises (a backup/restore in progress refuses a concurrent apply, and vice versa) is enforced by the separate, lower-level physical execution mutex the ADR's own Decision describes - a later PR's executor primitive, not this document shape; v1 and v2 lock.json are two independent per-kind-family documents layered on top of that one shared mutex, never merged into one schema. Otherwise identical to operation-lock-v1 except for the added operationKind field. A pre-existing lock.json written before this ADR has no operationKind field at all and does not validate against this schema - an executor reading it must treat that absence as an implicit \"apply\" (operation-lock-v1 is still valid, still readable, never deleted). Deliberately has no TTL/expiry field - the lock must survive the invoking process dying (an operator's laptop sleeping, a network drop), so it is only ever removed by a successful commit or reclaimed by --resume for the SAME operationId, never by simply waiting it out.",
   "type": "object",
   "additionalProperties": false,
   "required": ["apiVersion", "operationKind", "operationId", "approvedPlanId", "target", "acquiredAt", "acquiredBy"],
   "properties": {
     "apiVersion": { "const": "hof.dev/operation-lock/v2" },
     "operationKind": {
-      "description": "Which of the three operation state machines this lock belongs to - the whole reason this schema exists rather than reusing operation-lock-v1 unchanged. A backup or restore in progress refuses a concurrent apply against the same target, and vice versa, exactly as an apply already refuses a concurrent apply.",
-      "enum": ["apply", "backup", "restore"]
+      "description": "Which of the two new operation state machines this lock belongs to - never apply (see this schema's own top-level description for why).",
+      "enum": ["backup", "restore"]
     },
     "operationId": {
-      "description": "This operation's own unique identifier - ties the lock to its operation journal (same field name) and to every event record it emits (operation-event-v2 for backup/restore, operation-event-v1 for apply - see operation-journal-v2.schema.json's own description).",
+      "description": "This operation's own unique identifier - ties the lock to its operation journal (same field name) and to every operation-event-v2 record it emits.",
       "$ref": "#/$defs/operationId"
     },
     "approvedPlanId": {

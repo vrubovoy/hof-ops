@@ -6,13 +6,14 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "apiVersion", "planId", "executable", "target", "backupId", "destinationName", "source",
-    "recoveryKitDigest", "backupToolLockDigest", "consistencySet", "networks", "operations", "warnings", "blockers"
+    "apiVersion", "planId", "executable", "target", "cleanObservation", "backupId", "destinationName", "snapshotId",
+    "manifestDigest", "source", "recoveryKitDigest", "backupToolLockDigest", "consistencySet", "networks",
+    "operations", "warnings", "blockers"
   ],
   "properties": {
     "apiVersion": { "const": "hof.dev/restore-plan/v1" },
     "planId": {
-      "description": "sha256 of this plan's own inputs+target binding+source+consistencySet, deterministic - never includes a timestamp.",
+      "description": "sha256 of this plan's own entire content minus planId itself (scripts/backup-ids.mjs's canonicalContentId) - target binding, cleanObservation, source, snapshotId, manifestDigest, consistencySet, networks all included, deterministic, never a timestamp. Pins not just WHICH backup this restore approves but WHAT will actually be restored (via snapshotId/manifestDigest) and that the target was actually observed clean (via cleanObservation), not merely claimed to be.",
       "$ref": "#/$defs/sha256"
     },
     "executable": {
@@ -23,10 +24,32 @@
       "description": "The NEW, clean target this restore will run against - its own freshly-observed host key, re-checked once more under the mutex before any restore operation is dispatched (never trusted from planning time alone).",
       "$ref": "#/$defs/targetBinding"
     },
+    "cleanObservation": {
+      "description": "What target.verify-clean actually found, at planning time, on the new target - structural proof of \"genuinely clean\" beyond target.installationId being null and target.baselineGeneration being 0 (which a caller could otherwise supply without any real observation behind them). Every list is required to be empty: a target-verify-clean.mjs a later PR writes populates these from a real observation and this plan is only ever built, and only ever approved, when every one of them came back empty. Re-checked once more under the mutex at target.verify-clean dispatch time, exactly like the host key above - never trusted from planning time alone either.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["containers", "volumes", "networks", "units", "generatedArtifacts"],
+      "properties": {
+        "containers": { "type": "array", "maxItems": 0 },
+        "volumes": { "type": "array", "maxItems": 0 },
+        "networks": { "type": "array", "maxItems": 0 },
+        "units": { "type": "array", "maxItems": 0 },
+        "generatedArtifacts": { "type": "array", "maxItems": 0 }
+      }
+    },
     "backupId": { "$ref": "#/$defs/sha256" },
     "destinationName": {
       "description": "Which of the historical backup's own configured destinations this snapshot is being read from.",
-      "$ref": "#/$defs/identifier"
+      "$ref": "#/$defs/destinationName"
+    },
+    "snapshotId": {
+      "description": "The exact restic snapshot id this plan pins at APPROVAL time (snapshot.verify resolved and verified it before the plan was ever built) - never re-resolved from backupId+destinationName again at dispatch time. Without this, an operator approving a plan by backupId+destinationName alone would be approving whatever the repository happens to contain at EXECUTION time, not what they actually reviewed - a repository's contents are not otherwise pinned by planId the way every other approved-then-dispatched document in this repo already is.",
+      "type": "string",
+      "minLength": 1
+    },
+    "manifestDigest": {
+      "description": "sha256 of the exact backup-manifest-v1 document embedded in that same pinned snapshot, verified at planning time - pins WHAT this restore will actually recreate (the consistencySet, the release, the generation) as firmly as snapshotId pins WHICH snapshot, so a manifest that could theoretically differ from what was reviewed at approval time is never silently substituted at dispatch time either.",
+      "$ref": "#/$defs/sha256"
     },
     "source": {
       "description": "The historical installation this backup was taken from - kept distinct from target's own identity for the whole lifetime of this plan and the operation it produces.",
@@ -85,6 +108,11 @@
   ],
   "$defs": {
     "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
+    "destinationName": {
+      "description": "Exactly services-v1alpha1.schema.json's own $defs/name pattern (hyphens only, max 63 chars, no dots) - see backup-plan-v1.schema.json's own identical $def for why.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}$"
+    },
     "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
     "operationId": {
       "type": "string",

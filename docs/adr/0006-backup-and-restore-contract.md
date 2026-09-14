@@ -54,11 +54,25 @@ This ADR covers scope, trust boundaries, the two new operation state
 machines (backup, restore), and failure semantics - the contracts and
 schemas only. No executor, target-side runner, Ansible role, or systemd
 unit exists yet; those are later PRs in this item's own sequence,
-exactly like ADR 0004's own sequencing. `scripts/backup-ids.mjs` (below)
-is the one exception: a small, pure, no-I/O module of id/binding
-formulas the schemas' own field descriptions already depend on - it
-allocates nothing and touches no target, so it belongs with the
-contracts rather than with a later executor PR.
+exactly like ADR 0004's own sequencing. `scripts/backup-ids.mjs` and
+`scripts/backup-flow.mjs` (below) are the one exception: small, pure,
+no-I/O modules of id/binding/flow-shape formulas the schemas' own field
+descriptions already depend on - they allocate nothing and touch no
+target, so they belong with the contracts rather than with a later
+executor PR. A second review round of this same PR found that JSON
+Schema alone cannot express two classes of real, load-bearing invariant
+this item needs: "this array's count of X must equal that other array's
+own length" (no schema in this repo uses `$data` references), and "this
+field over here must equal that field over there" (ditto) - a schema-
+valid backup-plan-v1 with only one `snapshot.create` for two configured
+destinations, or a schema-valid evidence document naming a manifest it
+never actually came from, is not a contradiction the schemas themselves
+can catch. `scripts/backup-flow.mjs`'s own operation-flow and bundle
+validators exist specifically to close that gap, and this item's
+contract tests build every "happy path" fixture by actually running it
+through the real id-computation functions rather than an arbitrary,
+unrelated placeholder value - a positive fixture that would fail its own
+bundle validator proves nothing.
 
 ## Decision
 
@@ -70,58 +84,94 @@ would mean overloading one action's worth of schema with an entirely
 different operation's shape. `plan-v2` and its own whitelist(s) are
 otherwise untouched by this item.
 
-**Two new, independent operation kinds - `backup` and `restore` -
-alongside `apply`.** `operation-lock-v2.schema.json` and
-`operation-journal-v2.schema.json` add a required `operationKind: enum
-["apply", "backup", "restore"]` field; everything else about their
-shape is unchanged from `operation-lock-v1`/`operation-journal-v1`,
-except that both now also enforce the SSH-mode/`hostKeySha256` pairing
-their own `targetBinding` already documented in prose but never actually
-enforced (a real, if minor, schema gap `backup-plan-v1`/`restore-plan-v1`
-below do not repeat) - `operation-lock-v1`/`operation-journal-v1`
-themselves are untouched, gap and all, since this item never revisits a
-v1 schema in place. A pre-existing on-target `lock.json`/journal
-document has no `operationKind` field at all (it predates this ADR) -
-the executor a later PR introduces must still read and safely resume it
-as an implicit `apply`, never refuse it outright just because the field
-is absent.
+**Two new, independent operation kinds - `backup` and `restore` - each
+with their own v2 lock/journal/event family, scoped to those two kinds
+ONLY, never `apply`.** `operation-lock-v2.schema.json`,
+`operation-journal-v2.schema.json`, and `operation-event-v2.schema.json`
+add a required `operationKind: enum ["backup", "restore"]` field - a
+second review round found the first draft's `enum ["apply", "backup",
+"restore"]`, "schema-valid for completeness, just never produced by
+apply" shape was an unresolved contradiction, not a harmless
+generalization: the existing apply executor (`scripts/
+operation-journal.mjs`, unchanged by this item) reads and writes
+`operation-lock-v1`/`operation-journal-v1`/`operation-event-v1`
+exclusively, for every apply run, old or new, forever within this
+item's own scope - there is no migration path, no code that could ever
+produce a `operationKind: "apply"` v2 document, and the v1/v2 schemas'
+own descriptions disagreed with each other about which event schema
+paired with which journal kind. Removing `apply` from all three v2
+enums resolves that: `operation-lock-v1`/`operation-journal-v1`/
+`operation-event-v1` are apply's own family, permanently, unchanged;
+`operation-lock-v2`/`operation-journal-v2`/`operation-event-v2` are
+backup/restore's own family, exclusively. Both v2 lock/journal also now
+enforce the SSH-mode/`hostKeySha256` pairing their own `targetBinding`
+already documented in prose but never actually enforced (a real, if
+minor, schema gap `backup-plan-v1`/`restore-plan-v1` below do not
+repeat) - `operation-lock-v1`/`operation-journal-v1` themselves are
+untouched, gap and all, since this item never revisits a v1 schema in
+place. A pre-existing on-target `lock.json`/journal document has no
+`operationKind` field at all (it predates this ADR) - the executor a
+later PR introduces must still read and safely resume it as an implicit
+`apply`, never refuse it outright just because the field is absent;
+that case is unaffected by v2 being backup/restore-only, since a
+pre-ADR document was always an apply document anyway.
+`operation-journal-v2` additionally checks, per `operationKind`, that
+its own embedded `plan.apiVersion` (`backup-plan-v1` for backup,
+`restore-plan-v1` for restore) and its own `inputDigests` shape (backup:
+`releaseLockDigest`/`backupToolLockDigest`/`backupPolicyId`; restore:
+`releaseLockDigest`/`backupToolLockDigest`/`manifestDigest`/
+`recoveryKitDigest`) actually match - a backup journal can no longer
+embed a restore plan, or vice versa, and inputDigests can no longer
+silently mix the two kinds' own fixed input sets (this item's earlier
+draft required all five of apply's own digest names unconditionally,
+regardless of `operationKind` - a real gap this closes). `approvedPlanId
+== plan.planId` is the one binding schema genuinely cannot check without
+a `$data` reference (none are used anywhere in this repo) -
+`scripts/backup-flow.mjs`'s own bundle validators and this item's
+contract tests enforce it instead.
 
-**`operation-event-v2`, alongside the unchanged `operation-event-v1` -
-not because lock/journal gained a v2, but because backup and restore
-need a genuinely different resumability contract.** `operation-event-v1`
-hard-codes apply's own all-or-nothing rule directly into its prose
-contract: for a given step, an unresolved `started` blocks resume
-entirely, and `failed` is always fatal short of a fresh bootstrap. That
-rule is wrong for the two new kinds by this ADR's own later design: a
-backup may crash after `snapshot.create` succeeded for some destinations
-and not others, and a resumed run must recognize exactly which,
-continuing the rest rather than refusing outright; a restore has exactly
-one privileged checkpoint (`checkpoint.data-restored`) and is otherwise
-safely restartable from nothing before it, never rewritten after it (see
-Failure semantics below) - neither shape fits "any unresolved step is a
-global block." `operation-event-v2` is used for every `backup` and
-`restore` event; the existing apply executor is unchanged and keeps
-emitting `operation-event-v1` exclusively - there is no migration of
-apply's own event stream in this item. Concretely, `operation-event-v2`
-drops v1's own universal resumability verdict from its schema
-description; which step+attempt is terminal versus resumable is decided
-by the journal's own `operationKind`-specific reconciliation (a later
-PR's executor) using this log purely as evidence, not by the event
-schema itself. It also carries the new required `operationKind` field
-(so a consumer reading raw stdout NDJSON can interpret `step`/`phase`
-without first cross-referencing the journal, and can confirm an event's
-own claimed kind actually matches the journal/lock it says it belongs
-to) and an optional `destination` field for a backup-kind event about a
+**`operation-event-v2` exists alongside the unchanged
+`operation-event-v1` for a semantic reason, not because lock/journal
+happened to gain a v2 too.** `operation-event-v1` hard-codes apply's own
+all-or-nothing rule directly into its prose contract: for a given step,
+an unresolved `started` blocks resume entirely, and `failed` is always
+fatal short of a fresh bootstrap. That rule is wrong for the two new
+kinds by this ADR's own later design: a backup may crash after
+`snapshot.create` succeeded for some destinations and not others, and a
+resumed run must recognize exactly which, continuing the rest rather
+than refusing outright; a restore has exactly one privileged checkpoint
+(`checkpoint.data-restored`) and is otherwise safely restartable from
+nothing before it, never rewritten after it (see Failure semantics
+below) - neither shape fits "any unresolved step is a global block."
+`operation-event-v2` is used for every `backup` and `restore` event; the
+existing apply executor is unchanged and keeps emitting
+`operation-event-v1` exclusively - there is no migration of apply's own
+event stream in this item. Concretely, `operation-event-v2` drops v1's
+own universal resumability verdict from its schema description; which
+step+attempt is terminal versus resumable is decided by the journal's
+own `operationKind`-specific reconciliation (a later PR's executor)
+using this log purely as evidence, not by the event schema itself. It
+also carries the new required `operationKind` field (so a consumer
+reading raw stdout NDJSON can interpret `step`/`phase` without first
+cross-referencing the journal, and can confirm an event's own claimed
+kind actually matches the journal/lock it says it belongs to) and an
+optional `destination` field for a backup-kind event about a
 per-destination step, identifying a partial failure without
 cross-referencing the plan.
 
-**One physical execution mutex, shared across all three kinds.** A
-`backup` in progress refuses a concurrent `apply` or `restore` against
-the same target, and vice versa, in every direction - not just
-same-kind contention. The mutex is a lower-level primitive than any one
-kind's own durable lock/journal (mirroring ADR 0004's own execution-lease
-vs. durable-lock split): it is what lets an operation's own cleanup run
-to completion even if the SSH connection or the operator's workstation
+**One physical execution mutex, shared across both new kinds and
+`apply`.** A `backup` in progress refuses a concurrent `apply` or
+`restore` against the same target, and vice versa, in every direction -
+not just same-kind contention. This mutex is a genuinely separate,
+lower-level primitive from any of the lock/journal document families
+above (mirroring ADR 0004's own execution-lease vs. durable-lock split);
+it is NOT `operation-lock-v2` itself, which is why scoping v2 to
+backup/restore only (above) does not weaken this guarantee - apply's own
+mutex acquisition (a later PR touches `scripts/operation-journal.mjs`
+for this, unchanged today) and backup/restore's each acquire the one
+shared, lower-level primitive before ever touching their own kind-
+specific lock.json. It is what lets an operation's own cleanup run to
+completion even if the SSH connection or the operator's workstation
 drops mid-backup, by moving execution onto a target-side, signed runner
 process rather than depending on the workstation's own SSH session
 staying open for the operation's entire duration.
@@ -153,46 +203,110 @@ exactly as it already refuses to start on an unpinned `restic`/`sops`/
 `age` binary.
 
 **`backup-policy-v1` - the immutable, approved policy a scheduled run
-binds to.** Created or replaced only when an apply commits a
-`services.yml` carrying a changed `backup:` section, never per backup
-run - copies that section's `schedule`/`destinations`/`retention`
-verbatim, plus the fixed platform rule that every disabled-but-retained
-volume is always included alongside every enabled unit's own volume
-(`includeRetainedVolumes`, pinned `true` for this policy version). Both
-a manual `hofctl backup` and the systemd timer's own scheduled run bind
-to whichever policy is currently applied via `backup-plan-v1`'s own
+binds to. `policyId` excludes its own freshness metadata.** Created or
+replaced only when an apply commits a `services.yml` carrying a changed
+`backup:` section, never per backup run - copies that section's
+`schedule`/`destinations`/`retention` verbatim, plus the fixed platform
+rule that every disabled-but-retained volume is always included
+alongside every enabled unit's own volume (`includeRetainedVolumes`,
+pinned `true` for this policy version). `appliedGeneration` and
+`appliedManifestDigest` record which apply most recently reconfirmed
+this policy as current - genuinely useful freshness metadata, but NOT
+part of `policyId`'s own identity: a second review round found the
+first draft's `policyId` included both, which meant an unrelated apply
+(bumping the generation and the whole manifest's own digest while
+leaving `backup:` itself byte-identical) would either go stale
+(`appliedGeneration` no longer matching reality, if the policy document
+is kept unchanged) or mint a new `policyId` for a policy whose actual
+content never changed (if it's naively re-derived every apply) -
+neither is coherent with "created or replaced only when `backup:`
+itself changes." `policyId` is now a content-id over
+`schedule`/`destinations`/`retention`/`includeRetainedVolumes`/
+`installationId` alone (`scripts/backup-ids.mjs`'s `canonicalContentId`,
+which now accepts more than one excluded field for exactly this case);
+`appliedGeneration`/`appliedManifestDigest` are re-stamped every apply
+that reconfirms the policy, whether or not `backup:` itself actually
+changed that time, without ever perturbing `policyId`. Both a manual
+`hofctl backup` and the systemd timer's own scheduled run bind to
+whichever policy is currently applied via `backup-plan-v1`'s own
 `backupPolicyId` - never a plan-local synthetic one - which is what lets
 a scheduled run skip fresh interactive approval: the policy itself was
 already approved when it was applied.
 
 **`backupId` is a domain-separated digest, never a content-id of the
-plan - and a new, monotonic `backupSequence` is why.** Every other id in
-this repository (`planId`, and now `policyId`) is a content-id: a
-canonicalized hash of the document's own fields. `backupId` cannot be,
-because a content-id would make two genuinely different backup attempts
-for an unchanged installation - an operator retry, or a scheduled run
-firing twice in one generation, both completely realistic - collide on
-the exact same id, making resume's own "which destinations already have
-a snapshot under this backupId" question undecidable. `backup-plan-v1`
-instead adds a required `backupSequence`: monotonic per installation,
-allocated and rechecked under the mutex immediately before a plan is
-built (that allocation is executor work, a later PR - this ADR fixes
-only the contract). `backupId` is computed
-(`scripts/backup-ids.mjs`'s `computeBackupId`) as a domain-separated
-digest of exactly `installationId`, `generation`, `backupPolicyId`, and
-`backupSequence` - never plan content, so a purely repeat run of an
-otherwise-identical plan still mints a fresh, distinguishable id.
+plan - and a new, monotonic `backupSequence` is why. `backupSequence`
+is allocated once per NEW operationId, never once per attempt within
+one.** Every other id in this repository (`planId`, and now `policyId`)
+is a content-id: a canonicalized hash of the document's own fields.
+`backupId` cannot be, because a content-id would make two genuinely
+different backup attempts for an unchanged installation - an operator
+starting a fresh `hofctl backup` after an earlier one already finished,
+or a scheduled run firing again a day later, both completely realistic
+- collide on the exact same id. `backup-plan-v1` instead adds a required
+`backupSequence`: monotonic per installation, allocated and rechecked
+under the mutex immediately before a plan is built (that allocation is
+executor work, a later PR - this ADR fixes only the contract).
+Critically, that allocation happens exactly once per NEW operationId -
+a `--resume` of an EXISTING, still in-progress one (journal status
+`in-progress`, meaning `evidence.write` has not yet run) reuses its own
+already-allocated sequence, and so the same `backupId`, which is
+precisely what lets it recognize which destinations already have a
+snapshot under that id and continue rather than starting over; only a
+genuinely new operationId, started after the previous one already
+reached its own terminal, evidence-written state, allocates the next
+sequence value. `backupId` is computed (`scripts/backup-ids.mjs`'s
+`computeBackupId`) as a domain-separated digest of exactly
+`installationId`, `generation`, `backupPolicyId`, and `backupSequence` -
+never plan content, so two independently-taken snapshots never silently
+share one id, and a genuinely repeated backup (as opposed to a resumed
+one) always mints a fresh, distinguishable id.
+
+**A journal's own `status: failed` always means `evidence.write` already
+ran - it is never a mid-operation, still-resumable state.** `evidence.
+write` is the fixed final step of both flows' own `finally` block, which
+this ADR's own Failure semantics section (below) already requires to run
+regardless of how a backup fails. So by construction, journal `status`
+only ever transitions away from `in-progress` once evidence for
+whatever this operationId actually achieved - including a real partial
+backup result - is already durably, immutably recorded. `--resume` is
+therefore only ever valid while `status` is still `in-progress`; a
+`failed` (or `succeeded`) journal is always terminal, and a retried
+attempt after either is always a genuinely new operationId (see
+`backupSequence` above), never a `--resume` of the old one. This was a
+real ambiguity in this item's own first draft, where `failed`'s prose
+("never blindly retry this same journal") read as an absolute rule with
+no stated reason, leaving open whether a mid-flight partial failure -
+one destination's `snapshot.create` succeeding, another's crashing -
+should also be `failed` and so non-resumable, contradicting this same
+ADR's own promise that such a crash is safely resumable. It is not a
+contradiction: that mid-flight crash never reaches `evidence.write` at
+all, so its journal is still `in-progress`, not `failed` - `failed`
+proper is reserved for the case where the whole operation, including its
+own `finally` block, already concluded (however that conclusion reads in
+`backup-evidence-v1`'s own honest `succeeded`/`partial`/`failed`
+status).
 
 **`recovery-kit-v1` - the encrypted recovery envelope itself, private
-identity always external.** A self-contained, portable document: public
-age recipient and its fingerprint, a closed `contentInventory` of fixed
-categories only (`application-secrets`, `tls-private-keys`,
+identity always external. Schema alone cannot prove `ciphertext` is real
+- `scripts/backup-flow.mjs`'s `verifyRecoveryKit()` does.** A
+self-contained, portable document: public age recipient and its
+fingerprint, a closed `contentInventory` of fixed categories only
+(`application-secrets`, `tls-private-keys`,
 `backup-destination-credentials` - never a specific secret's own name),
 the age-encrypted ciphertext itself (base64), and an independent
 `ciphertextDigest` of just that ciphertext. The matching private age
 identity is never generated, stored, or transmitted by any Hof artifact
 - it lives with the operator alone, for the entire lifetime of every
-recovery kit this item ever produces.
+recovery kit this item ever produces. `ciphertext`'s own schema pattern
+can only check its base64 alphabet, which any short plaintext string
+(a leaked password, say) trivially satisfies too - `verifyRecoveryKit()`
+is the real check: it decodes `ciphertext`, confirms the decoded bytes
+actually begin with age's own real binary-format magic header
+(`age-encryption.org/v1\n`), recomputes `ciphertextDigest` from those
+same decoded bytes, and recomputes `ageRecipientFingerprint` from
+`ageRecipient`. A document that is schema-valid but fails
+`verifyRecoveryKit()` is never a real recovery kit, only a decoy shaped
+like one.
 
 **Backup Flow - the fixed, typed operation whitelist
 `backup-plan-v1.schema.json` encodes.** Planning-time (never dispatched
@@ -229,23 +343,51 @@ succeeded, at least one did not) is recorded faithfully in evidence
 (including, per destination, whether its own `retention.apply` actually
 completed - independent of that destination's own snapshot outcome) but
 the operation itself still returns failure, never a silent partial
-success.
+success. `succeeded` additionally requires the `finally` block itself to
+have genuinely completed (`backup-evidence-v1`'s own required
+`readinessConfirmedAt`, non-null only on success) - every destination's
+own snapshot succeeding is not the same claim as the platform actually
+having been left healthy; a broken `service.start`/`readiness.wait`/
+`maintenance.exit` must never hide behind a claimed backup success. And
+because JSON Schema alone cannot check that `operations` actually
+contains the complete, correctly-ordered, correctly-counted flow above
+(the required count of `snapshot.create`/`retention.apply` legs depends
+on `destinations`' own length, which no schema in this repo can
+reference from a sibling array without a `$data` extension - none are
+used anywhere in this repo), completeness and ordering are checked
+separately by `scripts/backup-flow.mjs`'s own pure
+`validateBackupPlanOperations()`, exercised by this item's own contract
+tests.
 
 **Restore Flow - the fixed, typed operation whitelist
 `restore-plan-v1.schema.json` encodes, against a *second*, clean
-target.** Planning-time: obtain the recovery kit, the recovery age
-identity, the destination, and the `backupId`; verify the restic
-snapshot, the backup manifest embedded in it (confirming the manifest's
-own `recoveryKitDigest` matches the kit actually obtained, before
-trusting anything else in the snapshot), and the signed historical
-release lock it names (a release lock from `v0.2.1`, say, restored onto
-a target running today's tooling, still verifies against exactly the
-signature identity it was originally signed with); pin the new target's
-own freshly-observed SSH host key and require it be genuinely clean (no
-prior Hof state at all - this is never an in-place restore); build and
-require explicit approval of a restore plan naming the source
+target. Approval pins WHAT will be restored, not merely WHICH backup.**
+Planning-time: obtain the recovery kit, the recovery age identity, the
+destination, and the `backupId`; verify the restic snapshot, the backup
+manifest embedded in it (confirming the manifest's own
+`recoveryKitDigest` matches the kit actually obtained, before trusting
+anything else in the snapshot), and the signed historical release lock
+it names (a release lock from `v0.2.1`, say, restored onto a target
+running today's tooling, still verifies against exactly the signature
+identity it was originally signed with); pin the new target's own
+freshly-observed SSH host key and confirm it is genuinely clean via a
+real observation, structurally recorded (`cleanObservation`: containers/
+volumes/networks/units/generatedArtifacts, every list required empty -
+`target.installationId: null` and `target.baselineGeneration: 0` alone
+were a claim a caller could satisfy without any real observation behind
+it; `cleanObservation` is what an actual `target-verify-clean.mjs` a
+later PR writes populates, re-checked once more under the mutex at
+`target.verify-clean` dispatch time, exactly like the host key); build
+and require explicit approval of a restore plan naming the source
 `installationId`/`generation`/`release` distinctly from the new target's
-own identity. Dispatched under the mutex: `runner.install` (the signed
+own identity, and pinning the exact `snapshotId` `snapshot.verify`
+resolved and the exact `manifestDigest` of the manifest embedded in it -
+without both pinned at approval time, an operator approving a plan by
+`backupId`+`destinationName` alone would be approving whatever the
+repository happens to contain at EXECUTION time, not what they actually
+reviewed; every other approved-then-dispatched document in this repo
+already pins its own exact content via `planId`, and a restic repository
+is not otherwise pinned that way. Dispatched under the mutex: `runner.install` (the signed
 runner itself, from the `backup-tool-lock`); `target.verify-clean`
 (re-checked once more under the mutex, not trusted from planning time
 alone); `snapshot.verify`; `network.create` and `volume.create`
@@ -268,7 +410,13 @@ that this generation's data arrived via a restore, from which backup,
 onto which new host - is recorded separately from `current.json`, never
 folded into the generation history itself); `service.start`
 (dependencies-first, gateway last), `readiness.wait`; finally
-`evidence.write`.
+`evidence.write`. Completeness and ordering (every `network.create` per
+configured network, every `volume.create`/`data.restore` per
+consistency-set volume, and above all that `checkpoint.data-restored`
+is the sole privileged boundary - every `data.restore` before it, every
+`config.restore`/`secret.materialize`/`state.restore` after) are checked
+by `scripts/backup-flow.mjs`'s own pure `validateRestorePlanOperations()`,
+the restore-side sibling of the backup one above.
 
 **Failure semantics and resumability.** All configured destinations are
 required for a backup's own overall success, exactly as stated above.
@@ -308,49 +456,89 @@ existing `backup.destinations[].type: "local"`.
   - New: `backup-plan-v1`, `restore-plan-v1`, `backup-manifest-v1`
     (written into the snapshot itself), `backup-evidence-v1`,
     `restore-evidence-v1`, `backup-tool-lock-v1` (independently signed,
-    under its own `backup-tool-vX.Y.Z` tag namespace), `backup-policy-v1`
-    (the approved, applied policy a scheduled run binds to),
-    `recovery-kit-v1` (the encrypted envelope itself), and
+    under its own `backup-tool-vX.Y.Z` tag namespace, now also declaring
+    a required `compatibility` object), `backup-policy-v1` (the
+    approved, applied policy a scheduled run binds to - `policyId`
+    excludes its own freshness metadata), `recovery-kit-v1` (the
+    encrypted envelope itself, `ciphertext` genuinely verified only by
+    `scripts/backup-flow.mjs`'s own `verifyRecoveryKit()`), and
     `operation-event-v2` (backup/restore's own resumability contract -
-    not merely a kind-tagged copy of v1). None cross-reference another
-    schema file by `$id` (this repo's own convention; shared shapes like
-    `targetBinding`, `identifier`, and the `local`/`s3` destination
-    split are each copied independently).
+    not merely a kind-tagged copy of v1, and scoped to those two kinds
+    only). None cross-reference another schema file by `$id` (this
+    repo's own convention; shared shapes like `targetBinding`,
+    `identifier`, `destinationName`, and the `local`/`s3` destination
+    split are each copied independently) - `destinationName` in
+    particular is now its own, narrower $def (services-v1alpha1's exact
+    `name` pattern) everywhere a real destination/secretRef name
+    appears, distinct from the broader `identifier` pattern volumes/
+    units/services use, and every `local`/`s3` destination's own
+    `endpoint` now rejects an embedded credential via userinfo, query
+    string, or fragment alike.
   - Revised: `operation-lock-v2`, `operation-journal-v2` (both already
     existed from an earlier draft of this same PR; this revision adds
     the SSH/local `hostKeySha256` conditional their own prose already
-    claimed but never enforced, and updates their own description of
-    which event schema pairs with which `operationKind`).
+    claimed but never enforced, scopes `operationKind` to
+    `["backup", "restore"]` only - removing `apply` entirely, closing an
+    unresolved contradiction a second review round found - and, for
+    `operation-journal-v2`, makes `plan.apiVersion` and `inputDigests`'
+    own shape actually conditional on `operationKind` instead of always
+    requiring apply's own five-digest shape regardless of kind).
 - A real signed artifact, `backup-tool-lock-v1`, that this item's later
   PRs must build a new CI workflow to produce, exactly as
   `execution-environment.yml`/`release.yml` already do for the Execution
   Environment and the platform release.
-- `operation-lock-v1`/`operation-journal-v1` are superseded by
-  `operation-lock-v2`/`operation-journal-v2` for every *new* operation
-  from this item onward, but are never deleted or made unreadable - the
-  executor PR that follows this one must keep reading and safely
-  resuming a pre-existing v1 document with no `operationKind` field.
-  `operation-event-v1` is not superseded either - it remains the only
-  event schema the existing apply executor ever produces; only backup
-  and restore ever produce `operation-event-v2`.
+- `operation-lock-v1`/`operation-journal-v1`/`operation-event-v1` remain
+  apply's own family, permanently and exclusively - never superseded,
+  never touched by this item, and never paired with any v2 document.
+  `operation-lock-v2`/`operation-journal-v2`/`operation-event-v2` are
+  backup/restore's own family, exclusively - the two families never mix,
+  and a pre-existing on-target `lock.json`/journal document with no
+  `operationKind` field is still read and safely resumed as an implicit
+  apply v1 document by whatever executor PR follows this one.
 - `plan-v2.schema.json`'s own `backup.create` action, and the two
   bootstrap/applied action whitelists, are completely unchanged by this
   item - dead code remains dead code, on purpose.
 - `scripts/digest.mjs` gains a shared, exported `canonicalize()` (moved
   out of `plan-v2.mjs`, which now imports it - `computePlanId()`'s own
-  behavior is unchanged, covered by its existing regression tests) and
-  a new `scripts/backup-ids.mjs` (`canonicalContentId`, `computeBackupId`,
-  `exactSetEquals`, `consistencySetEntryKey`) - small, pure, no-I/O
-  functions the new schemas' own field descriptions depend on, shared so
-  `backup-plan-v1`/`restore-plan-v1`/`backup-policy-v1`'s own ids and
-  every consistency-set binding compute identically wherever a later PR
-  needs them, rather than each reimplementing its own formula.
+  behavior is unchanged, covered by its existing regression tests). Two
+  new pure, no-I/O modules:
+  - `scripts/backup-ids.mjs`: `canonicalContentId` (now accepting one or
+    several excluded fields), `canonicalDocumentDigest` (a whole-document
+    digest for `backup-manifest-v1`/`recovery-kit-v1`, which carry no
+    self-referential id field to strip), `computeBackupId`,
+    `exactSetEquals`, `consistencySetEntryKey`, `hasDuplicates`.
+  - `scripts/backup-flow.mjs`: `validateBackupPlanOperations`/
+    `validateRestorePlanOperations` (flow completeness, per-destination/
+    per-network/per-volume cardinality, and ordering - what schemas
+    cannot check without `$data`), `validateBackupBundle`/
+    `validateRestoreBundle` (cross-document id/digest bindings across
+    policy/plan/manifest/evidence - including that a `succeeded`
+    backup's evidence names every configured destination, exactly, not
+    a subset), and `verifyRecoveryKit` (ciphertext round-trip, age magic
+    header, digest/fingerprint recomputation). This item's own contract
+    tests build every "happy path" fixture through these same functions
+    rather than an arbitrary placeholder value, so a passing positive
+    test is real evidence the fixture is internally coherent, not merely
+    that each field's own shape is individually valid.
+- `restore-plan-v1` now pins `snapshotId` and `manifestDigest` at
+  approval time (not merely `backupId`+`destinationName`, which a
+  repository's own contents are not otherwise bound to), and records a
+  structural `cleanObservation` (five categories, all required empty) as
+  proof the new target was actually observed clean, not merely claimed
+  to be via `installationId: null`/`baselineGeneration: 0` alone.
+  `backup-evidence-v1` now requires `readinessConfirmedAt`, non-null
+  only when `status: succeeded` - a snapshot succeeding at every
+  destination is not the same claim as the platform's own `finally`
+  block (`service.start`/`readiness.wait`/`maintenance.exit`) actually
+  completing.
 - No executor, target-side runner, Ansible role, systemd unit, CLI
   surface (`hofctl backup`/`hofctl restore`), or CI workflow exists yet.
   The `backupSequence` allocation-and-recheck-under-mutex logic
   `computeBackupId` depends on is explicitly executor work, not fixed
-  here. The contracts and schemas introduced here, and the contract
-  tests covering them, are this PR's entire scope - every later PR in
-  this item's own sequence builds on top of them, never revisits this
-  ADR's own Decision in place (only appends dated Errata, exactly like
-  ADRs 0004 and 0005 already do).
+  here - this ADR fixes only that allocation happens once per new
+  operationId, never once per `--resume` attempt within one. The
+  contracts and schemas introduced here, and the contract tests covering
+  them, are this PR's entire scope - every later PR in this item's own
+  sequence builds on top of them, never revisits this ADR's own Decision
+  in place (only appends dated Errata, exactly like ADRs 0004 and 0005
+  already do).

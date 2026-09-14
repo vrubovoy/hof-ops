@@ -25,9 +25,10 @@
       "$ref": "#/$defs/sha256"
     },
     "backupSequence": {
-      "description": "Monotonic, per-installation, allocated and rechecked under the mutex immediately before this plan is built (the allocation and recheck logic is a later PR's executor work - ADR 0006's own Decision scopes this PR to contracts only). Never resets on a generation change; strictly increasing across every backup this installation has ever attempted, successful or not, so a retried or repeated backup always gets a fresh backupId even when every other input is unchanged.",
+      "description": "Monotonic, per-installation. Allocated exactly once per NEW operationId, under the mutex, immediately before that operation's plan is built (the allocation and recheck logic is a later PR's executor work - ADR 0006's own Decision scopes this PR to contracts only). Never resets on a generation change. A --resume of an EXISTING, still in-progress operationId reuses its own already-allocated sequence (and so the same backupId) - it is only ever a genuinely NEW operationId, started after the previous one reached its own terminal, evidence-written state, that allocates the next one. This is what lets a resumed run recognize partial per-destination progress under one shared backupId, while a truly repeated backup (a fresh hofctl backup invocation after an earlier one already finished) still gets a fresh, distinguishable one.",
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "maximum": 9007199254740991
     },
     "trigger": {
       "description": "manual: hofctl backup run directly, requires the operator's own explicit --approve-plan-id, exactly like apply. scheduled: the systemd timer firing an already-applied backup policy - no fresh interactive approval, since the policy itself was already approved when it was applied.",
@@ -84,6 +85,11 @@
   ],
   "$defs": {
     "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
+    "destinationName": {
+      "description": "Exactly services-v1alpha1.schema.json's own $defs/name pattern (hyphens only, max 63 chars, no dots) - not the broader plan-v2-style identifier used for services/units/volumes elsewhere in this document. A destination name copied here always originated in a real services.yml, so a name this pattern would reject could never have actually come from one.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}$"
+    },
     "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
     "operationId": {
       "type": "string",
@@ -143,10 +149,10 @@
           "additionalProperties": false,
           "required": ["name", "type", "path", "secretRef"],
           "properties": {
-            "name": { "$ref": "#/$defs/identifier" },
+            "name": { "$ref": "#/$defs/destinationName" },
             "type": { "const": "local" },
             "path": { "type": "string", "pattern": "^/[^\\u0000]+$" },
-            "secretRef": { "$ref": "#/$defs/identifier" }
+            "secretRef": { "$ref": "#/$defs/destinationName" }
           }
         },
         {
@@ -154,7 +160,7 @@
           "additionalProperties": false,
           "required": ["name", "type", "bucket", "secretRef"],
           "properties": {
-            "name": { "$ref": "#/$defs/identifier" },
+            "name": { "$ref": "#/$defs/destinationName" },
             "type": { "const": "s3" },
             "bucket": { "type": "string", "minLength": 3, "maxLength": 63 },
             "prefix": { "type": "string", "pattern": "^[^/]?(?:.*[^/])?$" },
@@ -162,10 +168,10 @@
               "description": "Never carries an embedded credential (https://user:pass@host/...) - the secretRef above is the only way this destination's own credential reaches the runner.",
               "type": "string",
               "format": "uri",
-              "pattern": "^https://[^@\\s]+$"
+              "pattern": "^https://[^@?#\\s]+$"
             },
             "region": { "type": "string", "minLength": 1 },
-            "secretRef": { "$ref": "#/$defs/identifier" }
+            "secretRef": { "$ref": "#/$defs/destinationName" }
           }
         }
       ]
@@ -192,7 +198,7 @@
         },
         "destination": {
           "description": "Only for snapshot.create and retention.apply - which configured destination this operation targets. One snapshot.create and one retention.apply operation per destination (a local repository and an S3 repository each carry entirely independent retention state), all snapshot.create legs sharing the plan's own backupId.",
-          "$ref": "#/$defs/identifier"
+          "$ref": "#/$defs/destinationName"
         },
         "condition": {
           "description": "Only for readiness.wait - reuses plan-v2's own running/healthy vocabulary.",

@@ -12,37 +12,66 @@ import { canonicalize, sha256 } from "./digest.mjs";
 
 // The generic canonical content-id formula plan-v2.mjs's own
 // computePlanId() already established: canonicalize the document minus
-// its own id field, then hash. Shared here so backup-plan-v1's planId,
-// restore-plan-v1's planId, and backup-policy-v1's policyId all compute
-// identically to plan-v2's own planId - one formula, not three parallel
-// reimplementations that could quietly drift apart.
-export function canonicalContentId(docWithoutId, idField) {
-  const { [idField]: _ignored, ...rest } = docWithoutId;
+// its own id field (and, for backup-policy-v1 specifically, minus every
+// other field that is metadata ABOUT the policy rather than part of its
+// own identity - see excludedFields below), then hash. Shared here so
+// backup-plan-v1's planId, restore-plan-v1's planId, and
+// backup-policy-v1's policyId all compute identically to plan-v2's own
+// planId - one formula, not three parallel reimplementations that could
+// quietly drift apart. excludedFields may be a single field name
+// (idField only, plan-v2/backup-plan-v1/restore-plan-v1's own case) or
+// an array of field names (backup-policy-v1's own case - see
+// schemas/backup-policy-v1.schema.json's own policyId description for
+// why appliedGeneration/appliedManifestDigest must never be part of the
+// policy's own identity).
+export function canonicalContentId(docWithoutId, excludedFields) {
+  const fields = Array.isArray(excludedFields) ? excludedFields : [excludedFields];
+  const rest = { ...docWithoutId };
+  for (const field of fields) delete rest[field];
   return sha256(Buffer.from(JSON.stringify(canonicalize(rest))));
+}
+
+// A whole-document digest - unlike canonicalContentId, no field is
+// excluded, because the documents this is for (backup-manifest-v1,
+// recovery-kit-v1) carry no self-referential id field of their own to
+// strip; their own digest is instead recorded EXTERNALLY, by whichever
+// document references them (backup-evidence-v1's own manifestDigest,
+// restore-plan-v1's own recoveryKitDigest/manifestDigest). Still the
+// same canonicalize-then-hash formula, so a reference computed this way
+// and the referenced document's own actual bytes can be verified to
+// agree, purely, with no I/O of their own.
+export function canonicalDocumentDigest(doc) {
+  return sha256(Buffer.from(JSON.stringify(canonicalize(doc))));
 }
 
 // backupId is deliberately NOT a canonicalContentId of the whole backup
 // plan - a plan built from unchanged inputs (same installation, same
 // generation, same consistency set, same destinations) is a completely
 // realistic repeat: an operator re-running `hofctl backup` right after
-// an earlier manual run, or a scheduled run firing twice in one
-// generation. A content-id over plan content alone would give both runs
-// the exact same backupId, and two independently-taken snapshots sharing
-// one id is exactly the ambiguity ADR 0006's own resume/retry semantics
-// must never allow (which destinations already have a snapshot "under
-// this backupId" becomes undecidable). backupId is instead a
+// an earlier one already reached its own terminal state, or a scheduled
+// run firing again a day later. A content-id over plan content alone
+// would give both runs the exact same backupId, and two independently-
+// taken snapshots sharing one id is exactly the ambiguity ADR 0006's own
+// resume/retry semantics must never allow. backupId is instead a
 // domain-separated digest of only the four facts that must legitimately
-// distinguish one backup attempt from every other one for the same
+// distinguish one backup ATTEMPT (one operationId, one journal, one
+// eventual evidence.write) from every other one for the same
 // installation: the installation itself, the generation being backed
 // up, the exact approved backup policy in force (backup-policy-v1 is
 // created/updated whenever an apply commits a services.yml carrying a
-// backup: section - manual and scheduled runs alike are always bound to
-// whichever policy is currently applied, never a plan-local synthetic
-// one), and a monotonic, per-installation backupSequence a
-// later PR's executor allocates and rechecks under the mutex before
-// this id is ever computed. The domain-separation tag is fixed and
-// versioned (not the schema's own apiVersion) so this formula can change
-// independently of backup-plan-v1's own document shape.
+// changed backup: section - manual and scheduled runs alike are always
+// bound to whichever policy is currently applied, never a plan-local
+// synthetic one), and backupSequence - allocated exactly once per NEW
+// operationId (a later PR's executor work, under the mutex, before this
+// id is ever computed), never per --resume of an EXISTING, still
+// in-progress one. A --resume reuses its own operation's already-
+// allocated sequence and so the same backupId, which is precisely what
+// lets it recognize which destinations already have a snapshot under
+// that id; only a genuinely new operationId - started after the
+// previous one already reached evidence.write - allocates the next
+// sequence value. The domain-separation tag is fixed and versioned (not
+// the schema's own apiVersion) so this formula can change independently
+// of backup-plan-v1's own document shape.
 const BACKUP_ID_DOMAIN = "hof.dev/backup-id/v1";
 
 export function computeBackupId({ installationId, generation, backupPolicyId, backupSequence }) {

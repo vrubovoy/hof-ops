@@ -1,54 +1,49 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hof.dev/schemas/operation-journal-v2.schema.json",
-  "title": "Hof operation journal (v2, kind-generic)",
-  "description": "/var/lib/hof/state/journal/<operationId>.json - the durable, per-operation-run header record on the target. Identical to operation-journal-v1 except for the added operationKind field (ADR 0006) and its own committedGeneration semantics below. Written once at operation start (immutable except `status`/`committedGeneration`, updated only by the same operationId that created it); individual attempts are recorded separately as an append-only event log this journal's own operationId ties them to - operation-event-v2 for operationKind backup/restore (a genuinely different resumability contract from apply's own - see operation-event-v2.schema.json's own description for why), operation-event-v1 (unchanged) for operationKind apply, exactly as operation-journal-v1 already used. A pre-existing journal written before this ADR has no operationKind field and does not validate against this schema - an executor must still read and safely resume it as operation-journal-v1 (implicit \"apply\"), never refuse it outright just because the field is absent. Never holds a secret value, decrypted content, an environment dump, or an SSH private-key path - safe to read, copy, or attach to a bug report without a second sanitization pass.",
+  "title": "Hof operation journal (v2, backup/restore only)",
+  "description": "/var/lib/hof/state/journal/<operationId>.json for a backup or restore operation - the durable, per-operation-run header record on the target. Scoped strictly to operationKind backup/restore, never apply: the existing apply executor (scripts/operation-journal.mjs, unchanged by this item) reads and writes operation-journal-v1 exclusively and always will, for every apply run, old or new - there is no migration of apply onto v2 in this item. Written once at operation start (immutable except `status`/`committedGeneration`, updated only by the same operationId that created it); individual attempts are recorded separately as an append-only operation-event-v2 log this journal's own operationId ties them to (a genuinely different resumability contract from apply's own operation-event-v1 - see operation-event-v2.schema.json's own description for why). A pre-existing journal written before this ADR has no operationKind field and does not validate against this schema - an executor must still read and safely resume it as operation-journal-v1 (implicit \"apply\"), never refuse it outright just because the field is absent; that case is unaffected by this schema being backup/restore-only, since a pre-ADR journal was always an apply journal anyway. Never holds a secret value, decrypted content, an environment dump, or an SSH private-key path - safe to read, copy, or attach to a bug report without a second sanitization pass.",
   "type": "object",
   "additionalProperties": false,
   "required": ["apiVersion", "operationKind", "operationId", "approvedPlanId", "target", "plan", "inputDigests", "startedAt", "status", "committedGeneration"],
   "properties": {
     "apiVersion": { "const": "hof.dev/operation-journal/v2" },
     "operationKind": {
-      "description": "Which of the three operation state machines produced this journal. Decides which plan schema `plan` below was validated against before being embedded (plan-v2 for apply, backup-plan-v1 for backup, restore-plan-v1 for restore) and this journal's own committedGeneration semantics (see below).",
-      "enum": ["apply", "backup", "restore"]
+      "description": "Which of the two new operation state machines produced this journal - never apply (see this schema's own top-level description). Decides which plan schema `plan` below was validated against before being embedded (backup-plan-v1 for backup, restore-plan-v1 for restore - enforced below, not merely documented) and this journal's own committedGeneration semantics (see below).",
+      "enum": ["backup", "restore"]
     },
     "operationId": { "$ref": "#/$defs/operationId" },
     "approvedPlanId": {
-      "description": "The exact plan this run was approved against (--approve-plan-id) - equal to plan.planId below by construction, regardless of operationKind.",
+      "description": "The exact plan this run was approved against (--approve-plan-id) - equal to plan.planId below by construction, regardless of operationKind. Schema cannot compare the two fields directly (no $data references are used in this repo); scripts/backup-ids.mjs's own bundle validators and this item's contract tests enforce the equality that would otherwise only ever be prose.",
       "$ref": "#/$defs/planId"
     },
     "target": { "$ref": "#/$defs/targetBinding" },
     "plan": {
-      "description": "The full, exact plan document this operation was approved against - not just its planId. Loosely typed here on purpose (no schema in this repo cross-references another by $id) - already validated against the schema matching operationKind before ever being embedded.",
-      "type": "object"
+      "description": "The full, exact plan document this operation was approved against - not just its planId. Loosely typed here on purpose (no schema in this repo cross-references another by $id) - already validated against the schema matching operationKind before ever being embedded. Its own apiVersion is still constrained below (backup-plan-v1 for backup, restore-plan-v1 for restore) - the one piece of the embedded document's own shape this schema can and does check directly, even without a full cross-schema $ref.",
+      "type": "object",
+      "required": ["apiVersion"],
+      "properties": {
+        "apiVersion": { "type": "string" }
+      }
     },
     "inputDigests": {
-      "description": "Every input this specific run is bound to, fixed at journal creation and never recomputed from a live file again mid-run. executionEnvironmentDigest is the EE image actually dispatched from - for backup/restore this is the backup-tool-lock's own pinned image, not necessarily the platform release's ansibleEnvironment image (ADR 0006's whole point: a backup/restore tool build moves independently of the platform release).",
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["manifestDigest", "releaseLockDigest", "catalogDigest", "composeTemplateDigest", "executionEnvironmentDigest"],
-      "properties": {
-        "manifestDigest": { "$ref": "#/$defs/sha256" },
-        "releaseLockDigest": { "$ref": "#/$defs/sha256" },
-        "catalogDigest": { "$ref": "#/$defs/sha256" },
-        "composeTemplateDigest": { "$ref": "#/$defs/sha256" },
-        "executionEnvironmentDigest": { "$ref": "#/$defs/sha256" }
-      }
+      "description": "Every input this specific run is bound to, fixed at journal creation and never recomputed from a live file again mid-run - independent of, and a defense-in-depth check against, the same values plan above already embeds. Shape depends on operationKind (enforced below): backup binds the signed release, the signed backup-tool-lock, and the exact applied backup-policy-v1 this plan was built against; restore binds the HISTORICAL signed release the backup was originally taken under, the signed backup-tool-lock, the backup-manifest-v1 embedded in the pinned snapshot, and the recovery kit.",
+      "type": "object"
     },
     "startedAt": { "type": "string", "format": "date-time" },
     "status": {
-      "description": "in-progress: the operation is running or was interrupted and not yet resolved either way. succeeded: every dispatched operation completed (for backup, every configured destination - a partial result is a failure here, recorded separately in backup-evidence-v1). failed: a fatal, unresumable outcome - the operator must diagnose per this operationKind's own recovery rules, never blindly retry this same journal.",
+      "description": "in-progress: the operation is running, or was interrupted before its own evidence.write step ever ran - the only state in which --resume of this SAME operationId is valid, since evidence is not yet durably recorded. succeeded: the finally block and evidence.write both completed, and for backup every configured destination's own snapshot succeeded (a partial result is a failure here, recorded separately, honestly, in backup-evidence-v1's own status field). failed: evidence.write already ran (so evidence for whatever this operationId actually achieved - including a real partial backup result - is already durably, immutably recorded), and this specific journal is terminal: a retried attempt is always a genuinely NEW operationId (and so a fresh backupSequence/backupId for backup), never a --resume of this one. \"failed\" is therefore never a mid-operation, still-resumable state - that state is always in-progress.",
       "enum": ["in-progress", "succeeded", "failed"]
     },
     "committedGeneration": {
-      "description": "apply: the newly-committed generation once state.commit succeeds, exactly as operation-journal-v1. backup: always null, even on success - a backup never mutates current.json or the generation at all. restore: the restored SOURCE generation once state.restore succeeds, carried forward verbatim, never incremented - this is the same installation's history continuing on new hardware, not a new applied change. Null for the entire lifetime of a run that never reaches its own commit point, including every failed one, regardless of kind.",
+      "description": "backup: always null, even on success - a backup never mutates current.json or the generation at all. restore: the restored SOURCE generation once state.restore succeeds, carried forward verbatim, never incremented - this is the same installation's history continuing on new hardware, not a new applied change. Null for the entire lifetime of a run that never reaches its own commit point, including every failed one, regardless of kind.",
       "type": ["integer", "null"],
       "minimum": 1
     }
   },
   "allOf": [
     {
-      "description": "The status/committedGeneration/operationKind pairing this schema's own field descriptions above already document, actually enforced - reusing operation-journal-v1's own already-reviewed if/then/else mechanism (2026-08-31), extended one level for operationKind's own backup exception.",
+      "description": "The status/committedGeneration/operationKind pairing this schema's own field descriptions above already document, actually enforced - reusing operation-journal-v1's own already-reviewed if/then/else mechanism (2026-08-31).",
       "if": { "properties": { "status": { "const": "succeeded" } } },
       "then": {
         "if": { "properties": { "operationKind": { "const": "backup" } } },
@@ -56,6 +51,45 @@
         "else": { "properties": { "committedGeneration": { "type": "integer", "minimum": 1 } } }
       },
       "else": { "properties": { "committedGeneration": { "type": "null" } } }
+    },
+    {
+      "description": "plan.apiVersion must actually match operationKind - a backup journal can never embed a restore-plan-v1 document or vice versa.",
+      "if": { "properties": { "operationKind": { "const": "backup" } } },
+      "then": { "properties": { "plan": { "type": "object", "properties": { "apiVersion": { "const": "hof.dev/backup-plan/v1" } } } } },
+      "else": { "properties": { "plan": { "type": "object", "properties": { "apiVersion": { "const": "hof.dev/restore-plan/v1" } } } } }
+    },
+    {
+      "description": "inputDigests is a closed, kind-specific shape - never the other kind's fields, never both at once.",
+      "if": { "properties": { "operationKind": { "const": "backup" } } },
+      "then": {
+        "properties": {
+          "inputDigests": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["releaseLockDigest", "backupToolLockDigest", "backupPolicyId"],
+            "properties": {
+              "releaseLockDigest": { "$ref": "#/$defs/sha256" },
+              "backupToolLockDigest": { "$ref": "#/$defs/sha256" },
+              "backupPolicyId": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "inputDigests": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["releaseLockDigest", "backupToolLockDigest", "manifestDigest", "recoveryKitDigest"],
+            "properties": {
+              "releaseLockDigest": { "$ref": "#/$defs/sha256" },
+              "backupToolLockDigest": { "$ref": "#/$defs/sha256" },
+              "manifestDigest": { "$ref": "#/$defs/sha256" },
+              "recoveryKitDigest": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      }
     }
   ],
   "$defs": {

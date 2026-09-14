@@ -21,31 +21,37 @@ jobs:
     # took ~4.5 minutes on its own before this).
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.10.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - run: pnpm validate
       - run: pnpm test
       - name: Real SSH transport acceptance (ephemeral pinned Debian 12 sshd container)
         run: pnpm test:ssh
       - name: Real hofctl apply acceptance (ephemeral sudo-enabled sshd container, real signed release, real Execution Environment)
+        # Only for a push to this repo or a same-repo PR - never a fork PR.
+        # test:apply-ssh spins a --privileged systemd container; the opt-in
+        # below is what turns it on, and a fork PR must not get it (matching
+        # test/apply-acceptance.mjs's own no-op-without-opt-in contract).
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ github.token }}
+          HOF_ALLOW_PRIVILEGED_ACCEPTANCE: "1"
         run: pnpm test:apply-ssh
 
   ansible:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
       - run: pip install ansible-core==2.17.*

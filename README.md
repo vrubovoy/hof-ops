@@ -35,8 +35,11 @@ item 9, applied-mode reconciliation against an already-applied installation
 optional service). restic backup/restore and a local installer UI remain
 later delivery items. It contains no application source code of its own and
 does not extend any service with generic host access: Schlüssel, Schloss,
-and Wächter never receive a Docker socket, an SSH key, or a shell from
-this repo. See [ADR 0001](docs/adr/0001-scope-and-trust-boundaries.md) for
+and the Wächter API never receive a Docker socket, an SSH key, or a shell
+from this repo. The only Docker socket the rendered topology mounts goes
+solely to the isolated `wachter-agent` unit — on its own internal network,
+with a fixed list/stats/restart vocabulary — never the Wächter API
+container. See [ADR 0001](docs/adr/0001-scope-and-trust-boundaries.md) for
 why, and [`Hof/PLATFORM-OPS-PLAN.md`](https://github.com/zudaR107/Hof/blob/main/PLATFORM-OPS-PLAN.md)
 for the full plan this repo implements in stages.
 
@@ -47,9 +50,14 @@ JSON Schemas, the first service catalog, and cross-contract
 validation that schemas alone can't express. Every image-publishing repo
 signs its published digests (keyless Cosign) and attests an SBOM and build
 provenance; `scripts/build-release-lock.mjs` resolves and independently
-re-verifies all of that into a real, schema-valid `release-lock.json`, and
-[`.github/workflows/release.yml`](.github/workflows/release.yml) signs that
-file itself and publishes it as a GitHub Release
+re-verifies all of that into a real, schema-valid `release-lock.json`, which
+[`.github/workflows/release.yml`](.github/workflows/release.yml) signs and
+publishes as an **immutable release candidate** (`vX.Y.Z-rc.N`, a GitHub
+pre-release). The `stable` channel is never written by that workflow:
+[`.github/workflows/promote.yml`](.github/workflows/promote.yml) signs and
+publishes stable-channel metadata for a candidate only after a real
+published-artifact acceptance run, from protected `main` only, moving the
+exact bytes acceptance exercised without rebuilding anything
 (`gh release list --repo vrubovoy/hof-ops`).
 
 `hofctl`'s read-only pipeline is implemented end to end: `hofctl validate`
@@ -101,20 +109,21 @@ immutable per-generation snapshot (`generations/NNNNNN/*`) before either
 mutable pointer file - see `ansible/README.md` for exactly what's verified
 for real in CI versus locally. The Execution Environment image itself has
 been cut and published for real multiple times as the pipeline grew - most
-recently `ghcr.io/vrubovoy/hof-ops-ee:v0.1.4` for item 9 (real keyless
+recently `ghcr.io/vrubovoy/hof-ops-ee:v0.1.7` for item 9 (real keyless
 Cosign signature and SBOM/provenance attestations, independently
 re-verified - see `ansible/README.md`'s own Versioning section), selected by
-platform release `v0.2.0`. Item 8 closed with a bootstrap onto a genuinely
-clean host, start to finish; item 9 closes with reconciliation against an
+platform release `v0.2.3`. Item 8 closed with a bootstrap onto a genuinely
+clean host, start to finish; item 9 closed with reconciliation against an
 already-applied one, real end to end in CI (bootstrap, enable an optional
 persistent service, an applied no-op, disable-with-retain, another no-op,
 re-enable, the retained volume and its real data surviving the whole round
-trip) - though, given item 8's own five premature closure calls on this
-exact same lock/journal/event foundation, item 9's own independent review is
-still outstanding as of this writing; treat it as the currently-best-
-verified state, not a guarantee. Backup/restore, upgrade/rollback,
-first-admin bootstrap, and the installer UI are later delivery items - see
-the Delivery Order in the plan linked above.
+trip), through five independent-review rounds plus the Required Gate's own
+real `test:apply-ssh` acceptance against the signed `v0.2.3` release (PR
+#58, merged with no waiver). Given item 8's own five premature closure calls
+on this exact same lock/journal/event foundation, treat it as the
+currently-best-verified state, not a guarantee. Backup/restore (item 10, in
+progress), upgrade/rollback, first-admin bootstrap, and the installer UI are
+later delivery items - see the Delivery Order in the plan linked above.
 
 ## The three contracts
 
@@ -224,7 +233,7 @@ historical, informational-only `plan-v1` shape it used to.
 node scripts/hofctl.mjs plan \
   --services examples/services.yml \
   --release-lock examples/release-lock.json \
-  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/tags/v1.0.0" \
+  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/promote.yml@refs/heads/main" \
   --known-hosts ~/.ssh/known_hosts \
   --recovery-age-recipient age1...
 ```
@@ -258,7 +267,7 @@ exact content you approved:
 node scripts/hofctl.mjs plan \
   --services examples/services.yml \
   --release-lock examples/release-lock.json \
-  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/tags/v1.0.0" \
+  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/promote.yml@refs/heads/main" \
   --known-hosts ~/.ssh/known_hosts \
   --recovery-age-recipient age1... \
   > plan.json
@@ -266,7 +275,7 @@ node scripts/hofctl.mjs plan \
 node scripts/hofctl.mjs apply \
   --services examples/services.yml \
   --release-lock examples/release-lock.json \
-  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/tags/v1.0.0" \
+  --release-lock-identity "https://github.com/vrubovoy/hof-ops/.github/workflows/promote.yml@refs/heads/main" \
   --known-hosts ~/.ssh/known_hosts \
   --identity-file ~/.ssh/id_ed25519 \
   --recovery-age-recipient age1... \
@@ -304,39 +313,131 @@ host's; a loopback SSH target is the way to exercise `apply` locally (see
 
 ## Cutting a release
 
+Releases are cut in two stages: an immutable **candidate**, then a
+**promotion** to the `stable` channel that only `main` can perform and only
+after a real published-artifact acceptance run. Both `release.yml` and
+`promote.yml` split into a read-only job and a privileged publish job; the
+privileged job runs under a GitHub **Environment** (`release` / `promote`)
+whose deployment branch policy allows protected branches only.
+
+A feature branch controls its own copy of the workflow file, so the
+`environment:` key alone is not the whole boundary. Tag and release
+creation therefore does **not** use the built-in `GITHUB_TOKEN` at all:
+the privileged jobs mint a short-lived installation token for a dedicated
+**release GitHub App** (its private key is an Environment secret, released
+only to `environment: release` / `promote`, which are `main`-only), and
+the "Restrict v* tag creation to the release App" repository ruleset means
+no other identity — a feature-branch `GITHUB_TOKEN` included — can create a
+`v*` or `v*-rc.*` tag. The privileged jobs run with `contents: read`; the
+App token is their only write path. See
+[SECURITY.md](SECURITY.md#release-channel-integrity).
+
+### 1. Build an immutable candidate
+
 ```sh
-gh workflow run release.yml --repo vrubovoy/hof-ops \
+gh workflow run release.yml --repo vrubovoy/hof-ops --ref main \
   -f release=1.0.0 -f selection=examples/release-selection.yml
 ```
 
-The workflow accepts only canonical stable semver and refuses an existing tag
-or GitHub Release. For each explicit component selection it resolves the
-immutable source tag and image tag to a commit and digest, directly checks the
-named GitHub checks on that commit, runs `cosign verify` with the exact expected
-workflow identity and OIDC issuer, verifies SBOM and SLSA provenance
-attestations, and rejects subject, repository, or revision mismatches. It then
-records config schema, database before/after and rollback compatibility where
-applicable, minimum `hofctl`, catalog, Compose renderer, and optional Ansible
-environment pins in `release-lock.json`.
+`release.yml`'s `build` job (any ref, `contents: read`, no OIDC) accepts
+only canonical stable semver and refuses if the stable `v<release>`
+release or the `v<release>-rc.<run>` candidate tag already exists. Every
+workflow input is consumed through an `env:` binding, never interpolated
+into a shell line; `selection` is shape-checked (repo-relative, no `..`, a
+restricted character set, must exist). It resolves the immutable source and
+image tags to commits and digests, checks the named GitHub checks, runs
+`cosign verify` with the exact expected workflow identity and OIDC issuer,
+verifies SBOM and SLSA provenance attestations, records compatibility
+metadata and pins in `release-lock.json`, re-resolves once more to reject
+tag drift, and uploads the **unsigned** lock as an artifact. The `publish`
+job (`environment: release`, `contents: read` + `id-token: write`) then
+mints a short-lived release-App installation token, signs that exact
+artifact with keyless Cosign, creates the `v<release>-rc.<run_number>` tag
+via the App token, and publishes it as a GitHub **pre-release** (draft →
+verify assets → publish, then re-check the tag SHA and the release's own
+`immutable` flag). It holds no `contents: write`, never writes
+stable-channel metadata, and never marks a release `latest`.
 
-The pinned lock is consumed by a core/full topology matrix. The production
-renderer emits Compose for each fixture; `docker compose config`, pull, and
-container-create contracts run against only the selected digests. The workflow
-re-resolves everything to reject tag drift, signs the lock and stable-channel
-metadata with keyless Cosign, and publishes them in one GitHub Release. Verify a
-published lock file yourself:
+### 2. Promote a candidate to stable
+
+After a real acceptance run against the published candidate artifacts (see
+`scripts/build-acceptance-evidence.mjs` and the `acceptance-evidence-v1`
+schema), promote it — from `main` only:
+
+```sh
+gh workflow run promote.yml --repo vrubovoy/hof-ops --ref main \
+  -f candidate=v1.0.0-rc.4 -f acceptance_run_id=123456789
+```
+
+`promote.yml`'s `verify` job (`contents: read`, `actions: read`) checks out
+the **exact dispatch revision** (`github.sha`) and refuses any ref but
+`refs/heads/main`; refuses if `.github/workflows/acceptance.yml` does not
+exist yet (the real acceptance workflow is a later Item 10 PR — until then
+promotion is deliberately inoperable); resolves the candidate tag to a full
+40-character commit and requires it be an **ancestor of that revision**;
+requires the candidate release's GitHub **`immutable`** flag; Cosign-
+verifies the candidate `release-lock.json` against `release.yml`'s identity,
+the repository, **and** `--certificate-github-workflow-sha <candidate
+commit>`; downloads the acceptance run's `acceptance-evidence.json` +
+`.sig` + `.pem` and Cosign-verifies it against **exactly**
+`acceptance.yml@refs/heads/main` on that same candidate commit; then
+`scripts/verify-promotion.mjs` cross-checks: evidence schema-valid and
+`succeeded`; the acceptance run's live `path` / `head_branch` / `head_sha`
+/ `status` / `conclusion` / `run_attempt` / `id` / `html_url` all match
+what the evidence recorded; `commit` == `acceptanceCommit` == the candidate
+commit; the recorded release-lock digest equals the SHA-256 of the
+downloaded lock byte for byte; the lock is schema-valid **and passes the
+full cross-contract check against `main`'s own catalog** (every catalog
+artifact present, no unknown component) with `catalogDigest` /
+`composeTemplateDigest` matching `main`'s catalog and renderer; and the
+restore matrix is exactly the two required legs
+(`debian12-to-ubuntu2404`, `ubuntu2404-to-debian12`), no duplicates, every
+destination (`local`, `s3`) green. `verify` also builds `stable-channel.json`
+and hands it, plus the verified lock bytes and their digest, to `publish`.
+
+`publish` (`environment: promote`, `contents: read` + `id-token: write`)
+runs **no checkout, no `pnpm install`, no repository scripts**, and holds
+**no `contents: write`** — the stable tag and release are written with a
+short-lived release-App installation token. It re-checks the artifact
+digest against what `verify` approved, classifies the target with the App
+token (so a draft from a crashed prior run is visible: `fresh` /
+`resume-draft` / `already-done`, or fail-closed on a conflicting tag or a
+mutable/incomplete published release), **re-signs the identical lock bytes
+and the channel under `promote.yml@refs/heads/main`** (an authorization
+signature — not a rebuild), ensures `refs/tags/v<release>` exists at
+exactly the candidate commit via the Git Refs API, creates the release as
+a **draft**, verifies the full six-asset set, flips it to
+published + `latest` (immutable atomically with that set), and re-checks
+the resolved protected tag SHA and the release's own `immutable` flag
+(`target_commitish` is **not** asserted — GitHub documents it as unused
+once the tag exists). An `already-done` resume additionally re-downloads
+the published lock + channel and verifies their bytes and
+`promote.yml@refs/heads/main` signatures. The candidate's own `release.yml`
+signature stays on the `v<release>-rc.N` pre-release for provenance.
+
+Verify a published **stable** lock file — its signature identity is
+`promote.yml`, on `main`:
 
 ```sh
 cosign verify-blob \
   --certificate release-lock.json.pem --signature release-lock.json.sig \
-  --certificate-identity 'https://github.com/vrubovoy/hof-ops/.github/workflows/release.yml@refs/heads/main' \
+  --certificate-identity 'https://github.com/vrubovoy/hof-ops/.github/workflows/promote.yml@refs/heads/main' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   release-lock.json
 ```
 
-Run the local, no-pull portion with `pnpm integration`. The release job adds
-`--runtime`, which pulls and creates containers without starting a platform or
-requiring the future reconciler.
+The signed `stable-channel.json` carries the same `promote.yml@refs/heads/main`
+identity. A `v<release>-rc.N` **candidate** lock instead verifies against
+`release.yml@refs/heads/<the branch it was built from>` — an unpromoted
+candidate and a promoted stable lock are byte-identical but
+cryptographically distinct in exactly this way.
+
+Run the local, no-pull portion with `pnpm integration`. The candidate job
+adds `--runtime`, which pulls and creates containers without starting a
+platform or requiring the future reconciler.
+
+Promotion assumes repository-level release integrity settings are in
+place — see [SECURITY.md](SECURITY.md#release-channel-integrity).
 
 Third-party artifacts are an explicit exception. The current Caddy gateway is
 resolved and pinned by registry digest under a `digest-only` policy, but Hof
@@ -353,8 +454,14 @@ pnpm validate   # schema + cross-contract validation
 pnpm test       # node --test
 pnpm integration # render fixtures and run pinned Compose config contracts
 pnpm test:ssh   # real ephemeral-container SSH transport acceptance (needs Docker)
-pnpm test:apply-ssh # real ephemeral-container hofctl apply acceptance (needs Docker)
+HOF_ALLOW_PRIVILEGED_ACCEPTANCE=1 pnpm test:apply-ssh # real hofctl apply acceptance
 ```
+
+`pnpm test:apply-ssh` spins a `--privileged` systemd container and is a
+deliberate no-op without `HOF_ALLOW_PRIVILEGED_ACCEPTANCE=1` in the
+environment — it exits before touching Docker. CI sets the flag because a
+GitHub runner is a disposable single-purpose VM; run it locally only in a
+throwaway VM, never on a workstation you care about.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.
 

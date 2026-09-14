@@ -1,10 +1,39 @@
-name: Release
+name: Release candidate
+
+# Builds and publishes an IMMUTABLE release candidate - never the stable
+# channel. Two jobs:
+#  - build   (contents: read, no OIDC): runs on the exact dispatch
+#            revision from ANY ref. Resolves and re-verifies the release
+#            lock and runs the integration matrix, then uploads the
+#            UNSIGNED lock as an artifact. A feature branch can exercise
+#            this for CI; a feature-branch copy of the publish job could
+#            still obtain a Sigstore certificate, but only ever with an
+#            untrusted @refs/heads/<branch> identity, and it cannot create
+#            a v* tag (ruleset) or reach the release-App key
+#            (Environment-bound to main) - see SECURITY.md.
+#  - publish (contents: read + id-token: write, environment: release):
+#            the `release` environment's deployment branch policy
+#            (protected branches only) means GitHub will not start this
+#            job from anything but `main` - the in-file check is defense
+#            in depth. It holds NO contents:write - the candidate tag and
+#            the release are written with a short-lived installation token
+#            for the release GitHub App (the "Restrict v* tag creation to
+#            the release App" ruleset blocks any other identity). id-token
+#            is only for keyless Cosign. It signs the artifact `build`
+#            produced and publishes it as a vX.Y.Z-rc.<run_number>
+#            pre-release. It never writes stable-channel metadata and
+#            never marks a release `latest`; that is promote.yml's job,
+#            from `main`, after signed acceptance.
+#
+# Every workflow_dispatch input is consumed through an `env:` binding,
+# never interpolated into a `run:` script. `selection` is shape-checked.
+# Every action is pinned by commit SHA.
 
 on:
   workflow_dispatch:
     inputs:
       release:
-        description: "Canonical stable semver (for example 1.2.3)"
+        description: "Canonical stable semver the candidate would promote to (for example 1.2.3)"
         required: true
       selection:
         description: "Repository-relative release-selection mapping"
@@ -12,53 +41,68 @@ on:
         default: "examples/release-selection.yml"
 
 concurrency:
-  group: release-${{ inputs.release }}
+  group: release-candidate-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
-      contents: write
-      id-token: write
-      attestations: read
-      packages: read
+      contents: read
       checks: read
       statuses: read
+      packages: read
+    outputs:
+      candidate_tag: ${{ steps.inputs.outputs.candidate_tag }}
     env:
       GH_TOKEN: ${{ github.token }}
-      SIGNING_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+      RELEASE: ${{ inputs.release }}
+      SELECTION: ${{ inputs.selection }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.10.0
-
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
-
       - run: pnpm install --frozen-lockfile
-      - uses: sigstore/cosign-installer@v3
 
-      - name: Reject mutable or invalid platform release identifiers
-        env:
-          RELEASE: ${{ inputs.release }}
+      - name: Validate inputs and candidate-tag availability
+        id: inputs
         run: |
-          node -e 'if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(process.env.RELEASE)) process.exit(1)'
-          if gh release view "v${RELEASE}" >/dev/null 2>&1; then
-            echo "GitHub Release v${RELEASE} already exists" >&2
-            exit 1
+          node -e 'if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(process.env.RELEASE)) { console.error("release must be canonical semver"); process.exit(1); }'
+          case "$SELECTION" in
+            /*|*..*) echo "selection must be a repo-relative path with no .. segments" >&2; exit 1 ;;
+          esac
+          if ! printf '%s' "$SELECTION" | grep -Eq '^[A-Za-z0-9._/-]+$'; then
+            echo "selection contains disallowed characters" >&2; exit 1
           fi
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${RELEASE}" >/dev/null 2>&1; then
-            echo "Git tag v${RELEASE} already exists" >&2
-            exit 1
+          if [ ! -f "$SELECTION" ]; then
+            echo "selection file does not exist: $SELECTION" >&2; exit 1
+          fi
+          CANDIDATE_TAG="v${RELEASE}-rc.${GITHUB_RUN_NUMBER}"
+          echo "candidate_tag=${CANDIDATE_TAG}" >> "$GITHUB_OUTPUT"
+          # A re-run keeps GITHUB_RUN_NUMBER, so CANDIDATE_TAG is the same:
+          # a tag left by a prior attempt of THIS run is fine as long as it
+          # points at this exact commit. Anything else is a real conflict.
+          if tobj="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" 2>/dev/null)"; then
+            ttype="$(printf '%s' "$tobj" | jq -r .object.type)"
+            tsha="$(printf '%s' "$tobj" | jq -r .object.sha)"
+            [ "$ttype" = "tag" ] && tsha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tsha}" -q .object.sha)"
+            [ "$tsha" = "$GITHUB_SHA" ] || {
+              echo "candidate tag ${CANDIDATE_TAG} already exists at ${tsha}, not this build's commit ${GITHUB_SHA}" >&2; exit 1; }
+          fi
+          if gh release view "v${RELEASE}" >/dev/null 2>&1; then
+            echo "stable release v${RELEASE} already exists - pick an unreleased version" >&2; exit 1
           fi
 
       - name: Validate contracts and tests
@@ -67,67 +111,207 @@ jobs:
           pnpm test
 
       - name: Resolve and verify selected component releases
-        run: >-
-          node scripts/build-release-lock.mjs
-          --release "${{ inputs.release }}"
-          --selection "${{ inputs.selection }}"
-          --out release-lock.json
+        run: node scripts/build-release-lock.mjs --release "$RELEASE" --selection "$SELECTION" --out release-lock.json
 
       - name: Run pinned topology and Compose integration matrix
         run: node scripts/integration-matrix.mjs --lock release-lock.json --runtime
 
       - name: Reject component tag, revision, or digest drift
         run: |
-          node scripts/build-release-lock.mjs \
-            --release "${{ inputs.release }}" \
-            --selection "${{ inputs.selection }}" \
-            --out release-lock.recheck.json
+          node scripts/build-release-lock.mjs --release "$RELEASE" --selection "$SELECTION" --out release-lock.recheck.json
           cmp release-lock.json release-lock.recheck.json
           rm release-lock.recheck.json
 
-      - name: Build stable-channel metadata
-        run: >-
-          node scripts/build-channel-metadata.mjs
-          --release "${{ inputs.release }}"
-          --lock release-lock.json
-          --repository "${{ github.repository }}"
-          --out stable-channel.json
+      - name: Hand the unsigned lock to publish
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: candidate-lock
+          path: release-lock.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
 
-      - name: Sign and verify release metadata
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    # Only id-token (for keyless Cosign OIDC). The built-in GITHUB_TOKEN is
+    # read-only here: every write - the candidate tag and the release - goes
+    # through the release-App installation token minted below, and the
+    # "Restrict v* tag creation to the release App" ruleset means nothing
+    # else (a feature-branch GITHUB_TOKEN included) can create a v* tag.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE: ${{ inputs.release }}
+      CANDIDATE_TAG: ${{ needs.build.outputs.candidate_tag }}
+      SIGNING_IDENTITY: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+      WANT_ASSETS: "release-lock.json,release-lock.json.pem,release-lock.json.sig"
+    steps:
+      - name: Re-assert main-only (the `release` environment policy is the real gate)
         run: |
-          for artifact in release-lock.json stable-channel.json; do
-            cosign sign-blob --yes \
-              --output-signature "${artifact}.sig" \
-              --output-certificate "${artifact}.pem" \
-              "${artifact}"
-            cosign verify-blob \
-              --certificate "${artifact}.pem" \
-              --signature "${artifact}.sig" \
-              --certificate-identity "${SIGNING_IDENTITY}" \
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-              "${artifact}"
-          done
+          [ "$GITHUB_REF" = "refs/heads/main" ] || { echo "candidate publication runs only from main" >&2; exit 1; }
 
-      - name: Confirm hofctl validate accepts the freshly signed release lock
+      - name: Mint the release-App installation token (publication authority)
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.HOF_RELEASE_APP_ID }}
+          private-key: ${{ secrets.HOF_RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.10.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Take the unsigned lock from build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: candidate-lock
+          path: .
+
+      - name: Classify the candidate target state (idempotent; App token so drafts are visible)
+        id: state
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          T="$CANDIDATE_TAG"; R="$GITHUB_REPOSITORY"
+          if gh release view "v${RELEASE}" --repo "$R" >/dev/null 2>&1; then
+            echo "::error::stable release v${RELEASE} already exists - pick an unreleased version" >&2; exit 1
+          fi
+          if tobj="$(gh api "repos/$R/git/ref/tags/$T" 2>/dev/null)"; then
+            ttype="$(printf '%s' "$tobj" | jq -r .object.type)"
+            tsha="$(printf '%s' "$tobj" | jq -r .object.sha)"
+            [ "$ttype" = "tag" ] && tsha="$(gh api "repos/$R/git/tags/$tsha" -q .object.sha)"
+            [ "$tsha" = "$GITHUB_SHA" ] || {
+              echo "::error::candidate tag $T already exists at $tsha, not this build's commit $GITHUB_SHA - conflicting state, refusing" >&2; exit 1; }
+            tag_state="matching"
+          else
+            tag_state="absent"
+          fi
+          if rel="$(gh release view "$T" --repo "$R" --json isDraft,assets 2>/dev/null)"; then
+            isdraft="$(printf '%s' "$rel" | jq -r .isDraft)"
+            have="$(printf '%s' "$rel" | jq -r '[.assets[].name] | sort | join(",")')"
+            if [ "$isdraft" = "true" ]; then
+              mode="resume-draft"
+            else
+              imm="$(gh api "repos/$R/releases/tags/$T" -q .immutable)"
+              if [ "$imm" = "true" ] && [ "$have" = "$WANT_ASSETS" ] && [ "$tag_state" = "matching" ]; then
+                mode="already-done"
+              else
+                echo "::error::candidate release $T already exists but is not a complete, immutable publication of this build (immutable=$imm, tag=$tag_state, assets=[$have]) - refusing" >&2; exit 1
+              fi
+            fi
+          else
+            mode="fresh"
+          fi
+          echo "mode=${mode}" >> "$GITHUB_OUTPUT"
+          echo "::notice::candidate target state: tag=${tag_state}, mode=${mode}"
+
+      - name: Already published - the published lock must be the exact bytes this build produced
+        if: steps.state.outputs.mode == 'already-done'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          want="$(sha256sum release-lock.json | cut -d' ' -f1)"
+          mkdir -p published && gh release download "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'release-lock.json' --pattern 'release-lock.json.sig' --pattern 'release-lock.json.pem' --dir published
+          got="$(sha256sum published/release-lock.json | cut -d' ' -f1)"
+          [ "$got" = "$want" ] || {
+            echo "::error::${CANDIDATE_TAG} is published but its release-lock.json ($got) is not this build's ($want)" >&2; exit 1; }
+          cosign verify-blob \
+            --certificate published/release-lock.json.pem --signature published/release-lock.json.sig \
+            --certificate-identity "${SIGNING_IDENTITY}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository "${GITHUB_REPOSITORY}" \
+            --certificate-github-workflow-sha "${GITHUB_SHA}" \
+            published/release-lock.json
+          echo "::notice::${CANDIDATE_TAG} is already a complete, immutable, correctly-signed candidate for this commit."
+
+      - name: Sign and verify the candidate release lock
+        if: steps.state.outputs.mode != 'already-done'
+        run: |
+          cosign sign-blob --yes \
+            --output-signature release-lock.json.sig \
+            --output-certificate release-lock.json.pem \
+            release-lock.json
+          cosign verify-blob \
+            --certificate release-lock.json.pem \
+            --signature release-lock.json.sig \
+            --certificate-identity "${SIGNING_IDENTITY}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            release-lock.json
+
+      - name: Confirm hofctl validate accepts the freshly signed candidate lock
+        if: steps.state.outputs.mode != 'already-done'
         run: |
           node scripts/hofctl.mjs validate \
             --services examples/services.yml \
             --release-lock release-lock.json \
             --release-lock-identity "${SIGNING_IDENTITY}"
 
-      - name: Recheck release tag immutability before publication
+      - name: Ensure the candidate tag exists at exactly this build's commit
+        if: steps.state.outputs.mode != 'already-done'
         env:
-          RELEASE: ${{ inputs.release }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          ! gh release view "v${RELEASE}" >/dev/null 2>&1
-          ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${RELEASE}" >/dev/null 2>&1
+          resolve_tag() {
+            local tobj ttype tsha
+            tobj="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" 2>/dev/null)" || { printf 'absent'; return 0; }
+            ttype="$(printf '%s' "$tobj" | jq -r .object.type)"
+            tsha="$(printf '%s' "$tobj" | jq -r .object.sha)"
+            [ "$ttype" = "tag" ] && tsha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tsha}" -q .object.sha)"
+            printf '%s' "$tsha"
+          }
+          cur="$(resolve_tag)"
+          if [ "$cur" = "absent" ]; then
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/${CANDIDATE_TAG}" -f "sha=${GITHUB_SHA}"
+            cur="$(resolve_tag)"
+          fi
+          [ "$cur" = "$GITHUB_SHA" ] || {
+            echo "::error::candidate tag ${CANDIDATE_TAG} resolves to ${cur}, not ${GITHUB_SHA}" >&2; exit 1; }
 
-      - name: Publish immutable GitHub Release and stable channel reference
+      - name: Remove a stale draft so publication is clean
+        if: steps.state.outputs.mode == 'resume-draft'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh release delete "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --yes
+
+      - name: Publish the immutable candidate as a draft, verify assets, then release it (pre-release, never latest)
+        if: steps.state.outputs.mode != 'already-done'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          gh release create "v${{ inputs.release }}" \
+          gh release create "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
             release-lock.json release-lock.json.sig release-lock.json.pem \
-            stable-channel.json stable-channel.json.sig stable-channel.json.pem \
-            --target "${GITHUB_SHA}" \
-            --latest \
-            --title "Hof Platform v${{ inputs.release }}" \
-            --notes "Signed immutable release lock and signed stable-channel metadata. See README.md for Cosign verification commands."
+            --title "Hof Platform ${CANDIDATE_TAG}" \
+            --notes "Immutable release candidate for v${RELEASE}, built from ${GITHUB_SHA} on ${GITHUB_REF}. Not the stable channel: promote.yml signs and publishes stable-channel metadata only after real published-artifact acceptance. Verify the candidate lock with cosign verify-blob against certificate-identity ${SIGNING_IDENTITY}."
+          have="$(gh release view "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '[.assets[].name] | sort | join(",")')"
+          [ "$have" = "$WANT_ASSETS" ] || {
+            echo "::error::draft ${CANDIDATE_TAG} does not carry the full asset set - have [$have], want [$WANT_ASSETS]" >&2; exit 1; }
+          gh release edit "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
+
+      - name: Post-publish - the candidate tag SHA and the release's own immutability must hold
+        if: steps.state.outputs.mode != 'already-done'
+        run: |
+          tobj="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}")"
+          ttype="$(printf '%s' "$tobj" | jq -r .object.type)"
+          tsha="$(printf '%s' "$tobj" | jq -r .object.sha)"
+          [ "$ttype" = "tag" ] && tsha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tsha}" -q .object.sha)"
+          [ "$tsha" = "$GITHUB_SHA" ] || {
+            echo "::error::after publish, ${CANDIDATE_TAG} resolves to ${tsha}, not ${GITHUB_SHA}" >&2; exit 1; }
+          immutable="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${CANDIDATE_TAG}" -q '.immutable')"
+          [ "$immutable" = "true" ] || {
+            echo "::error::candidate ${CANDIDATE_TAG} is not immutable (immutable=${immutable}) - GitHub Immutable Releases must be enabled" >&2; exit 1; }

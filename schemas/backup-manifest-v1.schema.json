@@ -8,11 +8,14 @@
   "required": [
     "apiVersion", "backupId", "createdAt", "installationId", "generation", "release", "manifestDigest",
     "releaseLockDigest", "catalogDigest", "composeTemplateDigest", "backupToolLockDigest", "consistencySet",
-    "sanitizedManifestIncluded", "recoveryStoreIncluded"
+    "sanitizedManifestDigest", "recoveryKitDigest"
   ],
   "properties": {
     "apiVersion": { "const": "hof.dev/backup-manifest/v1" },
-    "backupId": { "$ref": "#/$defs/sha256" },
+    "backupId": {
+      "description": "This plan's own backupId (backup-plan-v1) - a domain-separated digest of installationId+generation+backupPolicyId+backupSequence, never a content-id of this manifest itself (scripts/backup-ids.mjs's computeBackupId).",
+      "$ref": "#/$defs/sha256"
+    },
     "createdAt": { "type": "string", "format": "date-time" },
     "installationId": { "type": "string", "minLength": 1 },
     "generation": { "type": "integer", "minimum": 1 },
@@ -28,13 +31,13 @@
       "minItems": 1,
       "items": { "$ref": "#/$defs/consistencySetEntry" }
     },
-    "sanitizedManifestIncluded": {
-      "description": "Whether the staging tree included a sanitized copy of services.yml (secretRef names only, never a resolved secret value).",
-      "type": "boolean"
+    "sanitizedManifestDigest": {
+      "description": "sha256 of the sanitized copy of services.yml actually written into this snapshot's own staging tree (secretRef names only, never a resolved secret value) - a digest, not a boolean, so its presence is itself the proof of inclusion; there is no legitimate real backup where this artifact is absent.",
+      "$ref": "#/$defs/sha256"
     },
-    "recoveryStoreIncluded": {
-      "description": "Whether the staging tree included the encrypted recovery copy of application/TLS/backup secrets - always true for a real backup; false only ever appears on a fixture/test document.",
-      "type": "boolean"
+    "recoveryKitDigest": {
+      "description": "sha256 of the recovery-kit-v1 document actually written into this snapshot's own staging tree - the same digest restore-plan-v1's own recoveryKitDigest must match before restore ever trusts the kit it obtained separately. A digest, not a boolean: its presence is the proof of inclusion, and restore can confirm the two match rather than merely trusting an unverifiable claim that some kit was included.",
+      "$ref": "#/$defs/sha256"
     }
   },
   "$defs": {

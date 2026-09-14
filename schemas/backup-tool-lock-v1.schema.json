@@ -5,7 +5,10 @@
   "description": "Independent of release-lock-v1 (ADR 0006) - pins the exact signed Execution Environment image, and the exact restic/sops/age versions baked into it, that hofctl backup/restore actually trusts and dispatches its target-side runner from. Deliberately versioned under its own backup-tool-vX.Y.Z tag namespace, distinct from both platform vX.Y.Z releases and ee-vX.Y.Z Execution Environment tags, so a backup-tool fix can ship - and v0.2.3 (already published, no backup path at all) can get a real one - without cutting a new platform release at all, breaking what would otherwise be an upgrade-needs-backup-needs-upgrade cycle. Never $ref's release-lock-v1.schema.json (this repo's own no-cross-file-$ref convention) - the shared artifact shape is copied independently.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["apiVersion", "source", "revision", "sourceTag", "image", "signatureIdentity", "signatureOidcIssuer", "provenanceDigest", "sbomDigest", "pinnedTools"],
+  "required": [
+    "apiVersion", "source", "revision", "sourceTag", "toolVersion", "image", "signatureIdentity",
+    "signatureOidcIssuer", "provenanceDigest", "sbomDigest", "pinnedTools", "compatibility"
+  ],
   "properties": {
     "apiVersion": { "const": "hof.dev/backup-tool-lock/v1" },
     "source": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/" },
@@ -14,6 +17,11 @@
       "description": "backup-tool-vX.Y.Z - never plain vX.Y.Z (a platform release) or ee-vX.Y.Z (the Execution Environment alone) - three independent tag namespaces in one repository must never be able to collide.",
       "type": "string",
       "pattern": "^backup-tool-v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "toolVersion": {
+      "description": "Canonical semver, no leading v - the exact same value embedded in sourceTag, duplicated here as its own field so a caller comparing versions (an upgrade path, a --min-tool-version guard) never has to parse it back out of the tag string.",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
     },
     "image": {
       "description": "Digest-pinned, never a tag - the same Execution Environment image the runner and its pinned restic/sops/age binaries are delivered from.",
@@ -37,6 +45,24 @@
         "restic": { "type": "string", "minLength": 1 },
         "sops": { "type": "string", "minLength": 1 },
         "age": { "type": "string", "minLength": 1 }
+      }
+    },
+    "compatibility": {
+      "description": "The exact document apiVersions this specific tool build understands and produces - a backup-tool-lock predating some later plan/journal/event schema revision must never be silently trusted against a document shape it was never built to interpret; the runner refuses to start if what it actually finds on disk doesn't match this declaration, exactly like pinnedTools above.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backupPlanApiVersion", "restorePlanApiVersion", "backupPolicyApiVersion", "recoveryKitApiVersion",
+        "operationLockApiVersion", "operationJournalApiVersion", "operationEventApiVersion"
+      ],
+      "properties": {
+        "backupPlanApiVersion": { "const": "hof.dev/backup-plan/v1" },
+        "restorePlanApiVersion": { "const": "hof.dev/restore-plan/v1" },
+        "backupPolicyApiVersion": { "const": "hof.dev/backup-policy/v1" },
+        "recoveryKitApiVersion": { "const": "hof.dev/recovery-kit/v1" },
+        "operationLockApiVersion": { "const": "hof.dev/operation-lock/v2" },
+        "operationJournalApiVersion": { "const": "hof.dev/operation-journal/v2" },
+        "operationEventApiVersion": { "const": "hof.dev/operation-event/v2" }
       }
     }
   },

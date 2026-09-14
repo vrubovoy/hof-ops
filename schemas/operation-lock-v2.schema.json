@@ -13,7 +13,7 @@
       "enum": ["apply", "backup", "restore"]
     },
     "operationId": {
-      "description": "This operation's own unique identifier - ties the lock to its operation journal (same field name) and to every operation-event-v1 record it emits.",
+      "description": "This operation's own unique identifier - ties the lock to its operation journal (same field name) and to every event record it emits (operation-event-v2 for backup/restore, operation-event-v1 for apply - see operation-journal-v2.schema.json's own description).",
       "$ref": "#/$defs/operationId"
     },
     "approvedPlanId": {
@@ -55,7 +55,15 @@
         },
         "installationId": { "type": ["string", "null"] },
         "baselineGeneration": { "type": "integer", "minimum": 0 }
-      }
+      },
+      "allOf": [
+        {
+          "description": "ADR 0006 review: operation-lock-v1's own targetBinding left this pairing unenforced by schema (prose-only) - v2 (this schema) closes it. Not backported to operation-lock-v1 itself, which stays untouched.",
+          "if": { "properties": { "mode": { "const": "ssh" } } },
+          "then": { "properties": { "hostKeySha256": { "type": "string" } } },
+          "else": { "properties": { "hostKeySha256": { "const": null } } }
+        }
+      ]
     }
   }
 }

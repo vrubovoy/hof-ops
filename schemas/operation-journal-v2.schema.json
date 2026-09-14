@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://hof.dev/schemas/operation-journal-v2.schema.json",
   "title": "Hof operation journal (v2, kind-generic)",
-  "description": "/var/lib/hof/state/journal/<operationId>.json - the durable, per-operation-run header record on the target. Identical to operation-journal-v1 except for the added operationKind field (ADR 0006) and its own committedGeneration semantics below. Written once at operation start (immutable except `status`/`committedGeneration`, updated only by the same operationId that created it); individual attempts are recorded separately as an append-only operation-event-v1 log (unchanged, kind-agnostic) this journal's own operationId ties them to. A pre-existing journal written before this ADR has no operationKind field and does not validate against this schema - an executor must still read and safely resume it as operation-journal-v1 (implicit \"apply\"), never refuse it outright just because the field is absent. Never holds a secret value, decrypted content, an environment dump, or an SSH private-key path - safe to read, copy, or attach to a bug report without a second sanitization pass.",
+  "description": "/var/lib/hof/state/journal/<operationId>.json - the durable, per-operation-run header record on the target. Identical to operation-journal-v1 except for the added operationKind field (ADR 0006) and its own committedGeneration semantics below. Written once at operation start (immutable except `status`/`committedGeneration`, updated only by the same operationId that created it); individual attempts are recorded separately as an append-only event log this journal's own operationId ties them to - operation-event-v2 for operationKind backup/restore (a genuinely different resumability contract from apply's own - see operation-event-v2.schema.json's own description for why), operation-event-v1 (unchanged) for operationKind apply, exactly as operation-journal-v1 already used. A pre-existing journal written before this ADR has no operationKind field and does not validate against this schema - an executor must still read and safely resume it as operation-journal-v1 (implicit \"apply\"), never refuse it outright just because the field is absent. Never holds a secret value, decrypted content, an environment dump, or an SSH private-key path - safe to read, copy, or attach to a bug report without a second sanitization pass.",
   "type": "object",
   "additionalProperties": false,
   "required": ["apiVersion", "operationKind", "operationId", "approvedPlanId", "target", "plan", "inputDigests", "startedAt", "status", "committedGeneration"],
@@ -74,7 +74,15 @@
         "hostKeySha256": { "type": ["string", "null"], "pattern": "^SHA256:[A-Za-z0-9+/]+=*$" },
         "installationId": { "type": ["string", "null"] },
         "baselineGeneration": { "type": "integer", "minimum": 0 }
-      }
+      },
+      "allOf": [
+        {
+          "description": "ADR 0006 review: operation-journal-v1's own targetBinding left this pairing unenforced by schema (prose-only) - v2 (this schema) closes it. Not backported to operation-journal-v1 itself, which stays untouched.",
+          "if": { "properties": { "mode": { "const": "ssh" } } },
+          "then": { "properties": { "hostKeySha256": { "type": "string" } } },
+          "else": { "properties": { "hostKeySha256": { "const": null } } }
+        }
+      ]
     }
   }
 }

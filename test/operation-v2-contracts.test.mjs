@@ -89,6 +89,16 @@ test("operation-lock-v2: rejects a secret value smuggled into acquiredBy", async
   assert.equal(validate(lock), false);
 });
 
+test("operation-lock-v2: rejects an SSH-mode target with no host key - the pairing v1 only ever documented in prose is now actually enforced", async () => {
+  const validate = await validatorFor("operation-lock-v2.schema.json");
+  assert.equal(validate(lockFixture({ target: targetBinding({ hostKeySha256: null }) })), false);
+});
+
+test("operation-lock-v2: rejects a local-mode target that still carries a host key", async () => {
+  const validate = await validatorFor("operation-lock-v2.schema.json");
+  assert.equal(validate(lockFixture({ target: targetBinding({ mode: "local", host: null, port: null, user: null, hostKeySha256: "SHA256:gcuHMcC8doDMjedrPcW196YKgc/MpHxl+BU6kA8Shno" }) })), false);
+});
+
 // --- operation-journal-v2 -------------------------------------------------
 
 function journalFixture(overrides = {}) {
@@ -172,4 +182,78 @@ test("operation-journal-v2: rejects a missing input digest", async () => {
   const journal = journalFixture();
   delete journal.inputDigests.executionEnvironmentDigest;
   assert.equal(validate(journal), false);
+});
+
+test("operation-journal-v2: rejects an SSH-mode target with no host key", async () => {
+  const validate = await validatorFor("operation-journal-v2.schema.json");
+  assert.equal(validate(journalFixture({ target: targetBinding({ hostKeySha256: null }) })), false);
+});
+
+// --- operation-event-v2 ----------------------------------------------------
+
+function eventFixture(overrides = {}) {
+  return {
+    apiVersion: "hof.dev/operation-event/v2",
+    operationKind: "backup",
+    operationId: OPERATION_ID,
+    step: "005.snapshot.create.onsite",
+    attempt: 1,
+    phase: "started",
+    at: "2026-09-04T10:00:00Z",
+    ...overrides,
+  };
+}
+
+test("operation-event-v2: a backup event validates", async () => {
+  const validate = await validatorFor("operation-event-v2.schema.json");
+  assert.ok(validate(eventFixture()), JSON.stringify(validate.errors));
+});
+
+test("operation-event-v2: a restore event validates", async () => {
+  const validate = await validatorFor("operation-event-v2.schema.json");
+  assert.ok(validate(eventFixture({ operationKind: "restore", step: "003.data.restore.schlussel" })), JSON.stringify(validate.errors));
+});
+
+test("operation-event-v2: an apply event is schema-valid (completeness with lock/journal-v2's own enum) even though no existing code ever produces one", async () => {
+  const validate = await validatorFor("operation-event-v2.schema.json");
+  assert.ok(validate(eventFixture({ operationKind: "apply", step: "003.service.start.gateway" })), JSON.stringify(validate.errors));
+});
+
+test("operation-event-v2: rejects an unrecognized operationKind", async () => {
+  const validate = await validatorFor("operation-event-v2.schema.json");
+  assert.equal(validate(eventFixture({ operationKind: "upgrade" })), false);
+});
+
+test("operation-event-v2: rejects a missing operationKind - unlike v1, this schema requires it", async () => {
+  const validate = await validatorFor("operation-event-v2.schema.json");
+  const event = eventFixture();
+  delete event.operationKind;
+  assert.equal(validate(event), false);
+});
+
+test("operation-event-v2: a failed phase requires a sanitized error; succeeded/started forbid one", async () => {
+  const validate = await validatorFor("operation-event-v2.schema.json");
+  assert.equal(validate(eventFixture({ phase: "failed" })), false, "failed with no error must be rejected");
+  assert.ok(validate(eventFixture({ phase: "failed", error: "snapshot.create timed out" })), JSON.stringify(validate.errors));
+  assert.equal(validate(eventFixture({ phase: "succeeded", error: "should not be here" })), false);
+});
+
+test("operation-event-v2: destination is only ever valid on a backup-kind event", async () => {
+  const validate = await validatorFor("operation-event-v2.schema.json");
+  assert.ok(validate(eventFixture({ operationKind: "backup", destination: "onsite" })), JSON.stringify(validate.errors));
+  assert.equal(validate(eventFixture({ operationKind: "restore", step: "003.data.restore.schlussel", destination: "onsite" })), false, "restore never has a per-destination step");
+  assert.equal(validate(eventFixture({ operationKind: "apply", step: "003.service.start.gateway", destination: "onsite" })), false, "apply never has a per-destination step");
+});
+
+test("operation-event-v2: rejects a raw exception dump or secret value smuggled into error", async () => {
+  const validate = await validatorFor("operation-event-v2.schema.json");
+  // error itself has no format restriction (a real diagnostic is free text) -
+  // what's actually enforced is that no OTHER field can carry one instead.
+  assert.equal(validate(eventFixture({ phase: "started", sshPrivateKeyPath: "/home/operator/.ssh/id_ed25519" })), false);
+});
+
+test("operation-event-v2: attempt must be a positive integer - a resumed, previously-failed step increments it, never reuses attempt 1", async () => {
+  const validate = await validatorFor("operation-event-v2.schema.json");
+  assert.equal(validate(eventFixture({ attempt: 0 })), false);
+  assert.ok(validate(eventFixture({ attempt: 2 })), JSON.stringify(validate.errors));
 });

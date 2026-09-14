@@ -5,11 +5,36 @@
   "description": "Written atomically once a restore operation reaches its own end (ADR 0006's own Restore Flow step 12) - immutable once written. Kept entirely separate from the restored installation's own generation history (state-v1.schema.json has no restore-provenance field at all, by design - a restored installationId/generation must read exactly as if that generation had always lived on this hardware, with the fact that it arrived via a restore recorded only here, never folded into current.json itself).",
   "type": "object",
   "additionalProperties": false,
-  "required": ["apiVersion", "operationId", "backupId", "source", "target", "startedAt", "completedAt", "status", "dataRestoredCheckpointAt", "readinessConfirmedAt"],
+  "required": [
+    "apiVersion", "operationId", "planId", "backupId", "snapshotId", "manifestDigest", "recoveryKitDigest",
+    "backupToolLockDigest", "source", "target", "startedAt", "completedAt", "status",
+    "dataRestoredCheckpointAt", "readinessConfirmedAt"
+  ],
   "properties": {
     "apiVersion": { "const": "hof.dev/restore-evidence/v1" },
     "operationId": { "$ref": "#/$defs/operationId" },
+    "planId": {
+      "description": "The restore-plan-v1 planId this evidence resulted from.",
+      "$ref": "#/$defs/sha256"
+    },
     "backupId": { "$ref": "#/$defs/sha256" },
+    "snapshotId": {
+      "description": "The exact restic snapshot id actually restored from - restore-plan-v1 itself only names backupId+destinationName; this is the concrete snapshot snapshot.verify resolved and pinned before any data.restore ran.",
+      "type": "string",
+      "minLength": 1
+    },
+    "manifestDigest": {
+      "description": "sha256 of the backup-manifest-v1 document embedded in the restored snapshot, verified before trusting anything else in it.",
+      "$ref": "#/$defs/sha256"
+    },
+    "recoveryKitDigest": {
+      "description": "sha256 of the recovery-kit-v1 document actually used - must equal both restore-plan-v1's own recoveryKitDigest and the manifest's own recoveryKitDigest, confirmed before secret.materialize ever ran.",
+      "$ref": "#/$defs/sha256"
+    },
+    "backupToolLockDigest": {
+      "description": "The signed backup-tool-lock this restore actually ran under.",
+      "$ref": "#/$defs/sha256"
+    },
     "source": {
       "description": "The historical installation this restore recovered - see restore-plan-v1's own identical shape.",
       "type": "object",

@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/backup-policy-v1.schema.json",
+  "title": "Hof backup policy",
+  "description": "The immutable, approved backup policy currently in force for one installation (ADR 0006) - created or replaced only when an apply commits a services.yml carrying a changed backup: section, never per backup run. Both a manual `hofctl backup` and the systemd timer's own scheduled run bind to whichever policy is currently applied (backup-plan-v1's own backupPolicyId) - this is what lets a scheduled run skip fresh interactive approval: the policy itself was already approved when it was applied. Never cross-references another schema file by $id (this repo's own convention); the schedule/destinations/retention shapes are copied from services-v1alpha1.schema.json's own backup object, not $ref'd.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion", "policyId", "installationId", "appliedGeneration", "appliedManifestDigest",
+    "schedule", "destinations", "retention", "includeRetainedVolumes"
+  ],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/backup-policy/v1" },
+    "policyId": {
+      "description": "sha256 of this policy's own content (every field below) minus policyId itself, canonicalized - the exact same formula plan-v2's own planId already uses (scripts/backup-ids.mjs's canonicalContentId). Deterministic: re-applying an unchanged backup: section never mints a new policyId.",
+      "$ref": "#/$defs/sha256"
+    },
+    "installationId": { "type": "string", "minLength": 1 },
+    "appliedGeneration": {
+      "description": "The generation at which this exact policy became the currently-applied one - state.commit's own generation from that apply, never recomputed or inferred later.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "appliedManifestDigest": {
+      "description": "The services.yml manifestDigest whose backup: section this policy was copied from verbatim - lets a later backup plan confirm the policy it's binding to still matches (or has since diverged from) the currently-applied manifest, the same drift check that already gates a plain apply.",
+      "$ref": "#/$defs/sha256"
+    },
+    "schedule": {
+      "description": "The target's own local time, HH:MM - copied from services-v1alpha1.schema.json's own backup.schedule (same pattern). Hof never converts this to UTC or any other zone.",
+      "type": "string",
+      "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$"
+    },
+    "destinations": {
+      "description": "Copied from services-v1alpha1.schema.json's own backup.destinations (same local/s3 shape as backup-plan-v1's own destinations - copied there too, never $ref'd across files).",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/destination" }
+    },
+    "retention": {
+      "description": "Copied from services-v1alpha1.schema.json's own backup.retention shape.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["daily", "weekly", "monthly"],
+      "properties": {
+        "daily": { "type": "integer", "minimum": 1 },
+        "weekly": { "type": "integer", "minimum": 0 },
+        "monthly": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "includeRetainedVolumes": {
+      "description": "Always true for this policy version - ADR 0006's own fixed platform rule that a backup's consistency set always includes every disabled-but-retained persistent service's own volume, alongside every enabled unit's volume. Kept as an explicit field, not an implicit assumption, so a future policy schema version could vary it without changing this field's own meaning.",
+      "const": true
+    }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "destination": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "type", "path", "secretRef"],
+          "properties": {
+            "name": { "$ref": "#/$defs/identifier" },
+            "type": { "const": "local" },
+            "path": { "type": "string", "pattern": "^/[^\\u0000]+$" },
+            "secretRef": { "$ref": "#/$defs/identifier" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "type", "bucket", "secretRef"],
+          "properties": {
+            "name": { "$ref": "#/$defs/identifier" },
+            "type": { "const": "s3" },
+            "bucket": { "type": "string", "minLength": 3, "maxLength": 63 },
+            "prefix": { "type": "string", "pattern": "^[^/]?(?:.*[^/])?$" },
+            "endpoint": {
+              "description": "Never carries an embedded credential (https://user:pass@host/...) - the secretRef above is the only way this destination's own credential reaches the runner.",
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https://[^@\\s]+$"
+            },
+            "region": { "type": "string", "minLength": 1 },
+            "secretRef": { "$ref": "#/$defs/identifier" }
+          }
+        }
+      ]
+    }
+  }
+}

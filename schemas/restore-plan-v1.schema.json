@@ -7,7 +7,7 @@
   "additionalProperties": false,
   "required": [
     "apiVersion", "planId", "executable", "target", "backupId", "destinationName", "source",
-    "recoveryKitDigest", "backupToolLockDigest", "consistencySet", "operations", "warnings", "blockers"
+    "recoveryKitDigest", "backupToolLockDigest", "consistencySet", "networks", "operations", "warnings", "blockers"
   ],
   "properties": {
     "apiVersion": { "const": "hof.dev/restore-plan/v1" },
@@ -57,6 +57,12 @@
       "minItems": 1,
       "items": { "$ref": "#/$defs/consistencySetEntry" }
     },
+    "networks": {
+      "description": "Every network this restore's own network.create operations must create before any volume.create or data.restore runs - a clean target has none of Hof's usual infrastructure yet, unlike a plain apply, where the shared network is long-lived, externally-provisioned infrastructure the Ansible network role owns and Compose/plan-v2 never creates (render-topology.mjs's own physicalNetworkName()). Restore is the one flow that must actually create it, matching ADR 0006's own \"operation-owned volumes and networks only\" - it never adopts a pre-existing network either, exactly like it never adopts a pre-existing volume.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/identifier" }
+    },
     "operations": {
       "type": "array",
       "items": { "$ref": "#/$defs/operation" }
@@ -64,6 +70,19 @@
     "warnings": { "type": "array", "items": { "type": "string" } },
     "blockers": { "type": "array", "items": { "type": "string" } }
   },
+  "allOf": [
+    {
+      "description": "executable must faithfully reflect blockers - never a silent mismatch between the two. A plan with any blocker can never claim to be executable, and a plan with none must.",
+      "if": { "properties": { "blockers": { "type": "array", "minItems": 1 } } },
+      "then": { "properties": { "executable": { "const": false } } },
+      "else": { "properties": { "executable": { "const": true } } }
+    },
+    {
+      "description": "An executable plan always has at least one operation to dispatch - a plan claiming executable: true with an empty operations list is never legitimate.",
+      "if": { "properties": { "executable": { "const": true } } },
+      "then": { "properties": { "operations": { "type": "array", "minItems": 1 } } }
+    }
+  ],
   "$defs": {
     "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
     "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
@@ -124,13 +143,14 @@
         },
         "action": {
           "enum": [
-            "runner.install", "target.verify-clean", "snapshot.verify", "volume.create", "data.restore",
-            "manifest.verify", "database.integrity-check", "checkpoint.data-restored", "config.restore",
-            "secret.materialize", "state.restore", "service.start", "readiness.wait", "evidence.write"
+            "runner.install", "target.verify-clean", "snapshot.verify", "network.create", "volume.create",
+            "data.restore", "manifest.verify", "database.integrity-check", "checkpoint.data-restored",
+            "config.restore", "secret.materialize", "state.restore", "service.start", "readiness.wait",
+            "evidence.write"
           ]
         },
         "resource": {
-          "description": "The unit, volume, or fixed checkpoint/config label this operation concerns, depending on action.",
+          "description": "The network, unit, volume, or fixed checkpoint/config label this operation concerns, depending on action.",
           "type": "string"
         },
         "condition": {
@@ -138,7 +158,58 @@
           "enum": ["running", "healthy"]
         },
         "reason": { "type": "string" }
-      }
+      },
+      "allOf": [
+        {
+          "description": "phase and action are a fixed 1:1 mapping - never an inconsistent combination.",
+          "if": { "properties": { "phase": { "const": "runner" } } },
+          "then": { "properties": { "action": { "const": "runner.install" } } }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "target" } } },
+          "then": { "properties": { "action": { "const": "target.verify-clean" } } }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "snapshot" } } },
+          "then": { "properties": { "action": { "const": "snapshot.verify" } } }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "data" } } },
+          "then": { "properties": { "action": { "enum": ["network.create", "volume.create", "data.restore"] } } }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "verification" } } },
+          "then": { "properties": { "action": { "enum": ["manifest.verify", "database.integrity-check"] } } }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "checkpoint" } } },
+          "then": { "properties": { "action": { "const": "checkpoint.data-restored" } } }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "config" } } },
+          "then": { "properties": { "action": { "const": "config.restore" } } }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "secret" } } },
+          "then": { "properties": { "action": { "const": "secret.materialize" } } }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "state" } } },
+          "then": { "properties": { "action": { "const": "state.restore" } } }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "service" } } },
+          "then": { "properties": { "action": { "const": "service.start" } } }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "readiness" } } },
+          "then": { "properties": { "action": { "const": "readiness.wait" } }, "required": ["condition"] }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "evidence" } } },
+          "then": { "properties": { "action": { "const": "evidence.write" } } }
+        }
+      ]
     }
   }
 }

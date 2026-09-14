@@ -6,19 +6,28 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "apiVersion", "planId", "backupId", "trigger", "executable", "target", "installationId", "generation",
-    "releaseLockDigest", "backupToolLockDigest", "consistencySet", "destinations", "retention", "operations",
-    "warnings", "blockers"
+    "apiVersion", "planId", "backupId", "backupPolicyId", "backupSequence", "trigger", "executable", "target",
+    "installationId", "generation", "releaseLockDigest", "backupToolLockDigest", "consistencySet", "destinations",
+    "retention", "operations", "warnings", "blockers"
   ],
   "properties": {
     "apiVersion": { "const": "hof.dev/backup-plan/v1" },
     "planId": {
-      "description": "sha256 of this plan's own inputs+target binding+consistencySet+destinations, deterministic - never includes a timestamp. A host-key change, a different generation, or a changed destination set all produce a different planId, exactly as plan-v2's own planId already works.",
+      "description": "sha256 of this plan's own inputs+target binding+consistencySet+destinations, deterministic - never includes a timestamp. A host-key change, a different generation, or a changed destination set all produce a different planId, exactly as plan-v2's own planId already works (scripts/backup-ids.mjs's canonicalContentId - the same formula, not a parallel one).",
       "$ref": "#/$defs/sha256"
     },
     "backupId": {
-      "description": "Deterministic, derived from this plan's own content - shared across every destination's own snapshot in this one run, so a partial-failure retry can recognize which destinations already have a snapshot under this exact id and which don't.",
+      "description": "NOT a content-id of this plan (unlike planId above) - two otherwise-identical backup plans for the same installation/generation must still get different ids, since re-running hofctl backup twice in a row (an operator retry, or a scheduled run firing twice) is a completely realistic case, and two independently-taken snapshots silently sharing one id would make resume's own 'which destinations already have a snapshot under this backupId' question undecidable. Computed instead as a domain-separated digest of exactly installationId, generation, backupPolicyId, and backupSequence (scripts/backup-ids.mjs's computeBackupId) - shared across every destination's own snapshot in this one run.",
       "$ref": "#/$defs/sha256"
+    },
+    "backupPolicyId": {
+      "description": "The currently-applied backup-policy-v1's own policyId this plan is bound to - both a manual and a scheduled run always bind to whichever policy is currently applied (never a plan-local synthetic one), so a manual run can never silently diverge from what was actually approved via apply.",
+      "$ref": "#/$defs/sha256"
+    },
+    "backupSequence": {
+      "description": "Monotonic, per-installation, allocated and rechecked under the mutex immediately before this plan is built (the allocation and recheck logic is a later PR's executor work - ADR 0006's own Decision scopes this PR to contracts only). Never resets on a generation change; strictly increasing across every backup this installation has ever attempted, successful or not, so a retried or repeated backup always gets a fresh backupId even when every other input is unchanged.",
+      "type": "integer",
+      "minimum": 1
     },
     "trigger": {
       "description": "manual: hofctl backup run directly, requires the operator's own explicit --approve-plan-id, exactly like apply. scheduled: the systemd timer firing an already-applied backup policy - no fresh interactive approval, since the policy itself was already approved when it was applied.",
@@ -60,6 +69,19 @@
     "warnings": { "type": "array", "items": { "type": "string" } },
     "blockers": { "type": "array", "items": { "type": "string" } }
   },
+  "allOf": [
+    {
+      "description": "executable must faithfully reflect blockers - never a silent mismatch between the two. A plan with any blocker can never claim to be executable, and a plan with none must.",
+      "if": { "properties": { "blockers": { "type": "array", "minItems": 1 } } },
+      "then": { "properties": { "executable": { "const": false } } },
+      "else": { "properties": { "executable": { "const": true } } }
+    },
+    {
+      "description": "An executable plan always has at least one operation to dispatch - a plan claiming executable: true with an empty operations list is never legitimate.",
+      "if": { "properties": { "executable": { "const": true } } },
+      "then": { "properties": { "operations": { "type": "array", "minItems": 1 } } }
+    }
+  ],
   "$defs": {
     "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
     "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
@@ -136,7 +158,12 @@
             "type": { "const": "s3" },
             "bucket": { "type": "string", "minLength": 3, "maxLength": 63 },
             "prefix": { "type": "string", "pattern": "^[^/]?(?:.*[^/])?$" },
-            "endpoint": { "type": "string", "format": "uri", "pattern": "^https://" },
+            "endpoint": {
+              "description": "Never carries an embedded credential (https://user:pass@host/...) - the secretRef above is the only way this destination's own credential reaches the runner.",
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https://[^@\\s]+$"
+            },
             "region": { "type": "string", "minLength": 1 },
             "secretRef": { "$ref": "#/$defs/identifier" }
           }
@@ -164,7 +191,7 @@
           "type": "string"
         },
         "destination": {
-          "description": "Only for snapshot.create - which configured destination this operation targets. One snapshot.create operation per destination, all sharing the plan's own backupId.",
+          "description": "Only for snapshot.create and retention.apply - which configured destination this operation targets. One snapshot.create and one retention.apply operation per destination (a local repository and an S3 repository each carry entirely independent retention state), all snapshot.create legs sharing the plan's own backupId.",
           "$ref": "#/$defs/identifier"
         },
         "condition": {
@@ -172,7 +199,38 @@
           "enum": ["running", "healthy"]
         },
         "reason": { "type": "string" }
-      }
+      },
+      "allOf": [
+        {
+          "description": "phase and action are a fixed 1:1 (or 1:2, for the enter/exit and stop/start pairs) mapping - never an inconsistent combination.",
+          "if": { "properties": { "phase": { "const": "maintenance" } } },
+          "then": { "properties": { "action": { "enum": ["maintenance.enter", "maintenance.exit"] } } }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "service" } } },
+          "then": { "properties": { "action": { "enum": ["service.stop", "service.start"] } } }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "staging" } } },
+          "then": { "properties": { "action": { "const": "staging.build" } } }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "snapshot" } } },
+          "then": { "properties": { "action": { "const": "snapshot.create" } }, "required": ["destination"] }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "retention" } } },
+          "then": { "properties": { "action": { "const": "retention.apply" } }, "required": ["destination"] }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "readiness" } } },
+          "then": { "properties": { "action": { "const": "readiness.wait" } }, "required": ["condition"] }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "evidence" } } },
+          "then": { "properties": { "action": { "const": "evidence.write" } } }
+        }
+      ]
     }
   }
 }

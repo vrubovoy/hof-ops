@@ -311,6 +311,62 @@ test("appendEvent: serializes through the same target-side flock guard as update
   assert.match(script, /flock -x 9/);
 });
 
+// PR 2 (item 10) review, critical finding 2: updateJournalStatus()/
+// appendEvent() used to trust their own caller's cached isLost() check
+// alone, with no fencing of their own at all on the target - a real
+// TOCTOU gap a client-side check cannot close. Both now take an optional
+// leaseToken and, when given, embed a real, target-side, atomic check
+// (under the same flock guard) that the owner record still holds
+// exactly that token before ever writing - see leaseFencingScript()'s
+// own comment.
+const LEASE_TOKEN = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
+test("updateJournalStatus: with a leaseToken, embeds a real target-side fencing check against the owner record before ever writing; without one, the script is unchanged", async () => {
+  const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "succeeded", committedGeneration: 1 };
+  const fenced = mockRun({ sshStdout: "HOF_MUTATE_UPDATED\n" });
+  await updateJournalStatus({ ...SSH_TARGET, run: fenced.run }, journalDoc, LEASE_TOKEN);
+  const fencedScript = fenced.calls.find((c) => c.command === "ssh").input;
+  assert.match(fencedScript, /exec\.lease\.owner/);
+  assert.match(fencedScript, new RegExp(`!= '${LEASE_TOKEN}'`));
+  assert.match(fencedScript, /HOF_MUTATE_LEASE_MISMATCH/);
+
+  const unfenced = mockRun({ sshStdout: "HOF_MUTATE_UPDATED\n" });
+  await updateJournalStatus({ ...SSH_TARGET, run: unfenced.run }, journalDoc);
+  const unfencedScript = unfenced.calls.find((c) => c.command === "ssh").input;
+  assert.doesNotMatch(unfencedScript, /exec\.lease\.owner/, "omitting leaseToken must leave the write completely unguarded, exactly like before this review");
+});
+
+test("updateJournalStatus: a real HOF_MUTATE_LEASE_MISMATCH response is refused with a clear, distinct error - never silently treated as success", async () => {
+  const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "succeeded", committedGeneration: 1 };
+  const { run } = mockRun({ sshStdout: "HOF_MUTATE_LEASE_MISMATCH\n" });
+  await assert.rejects(
+    () => updateJournalStatus({ ...SSH_TARGET, run }, journalDoc, LEASE_TOKEN),
+    /execution lease no longer matches this write's own token/,
+  );
+});
+
+test("updateJournalStatus: rejects a malformed leaseToken before ever building a script", async () => {
+  const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "succeeded", committedGeneration: 1 };
+  await assert.rejects(
+    () => updateJournalStatus({ ...SSH_TARGET, run: async () => { throw new Error("must not be called"); } }, journalDoc, "not-a-token; rm -rf /"),
+    /is not a valid execution-lease token/,
+  );
+});
+
+test("appendEvent: with a leaseToken, embeds the same real target-side fencing check; a HOF_MUTATE_LEASE_MISMATCH response is refused with a clear, distinct error", async () => {
+  const event = { apiVersion: "hof.dev/operation-event/v1", operationId: OPERATION_ID, step: "001.host.prepare", attempt: 1, phase: "started", at: "2026-08-27T10:00:00Z" };
+  const fenced = mockRun({ sshStdout: "HOF_MUTATE_APPENDED\n" });
+  await appendEvent({ ...SSH_TARGET, run: fenced.run }, OPERATION_ID, event, LEASE_TOKEN);
+  const fencedScript = fenced.calls.find((c) => c.command === "ssh").input;
+  assert.match(fencedScript, /exec\.lease\.owner/);
+  assert.match(fencedScript, new RegExp(`!= '${LEASE_TOKEN}'`));
+
+  await assert.rejects(
+    () => appendEvent({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_LEASE_MISMATCH\n" }).run }, OPERATION_ID, event, LEASE_TOKEN),
+    /execution lease no longer matches this write's own token/,
+  );
+});
+
 test("readEvents: absent (never appended to yet) returns an empty array, not an error", async () => {
   const events = await readEvents({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run }, OPERATION_ID);
   assert.deepEqual(events, []);
@@ -407,6 +463,32 @@ test("acquireMutex: HOF_LEASE_HELD resolves, and the acquire script's own shape 
   assert.match(script, /systemd-run --unit='hof-exec-lease-[0-9a-f-]+' --quiet/);
   assert.match(script, /flock -n -x 9/);
   assert.match(script, new RegExp(EXECUTION_LEASE_PATH_ESCAPED));
+  assert.equal(lease.token, script.match(/--unit='hof-exec-lease-([0-9a-f-]+)'/)[1], "the returned lease's own token must be exactly the one embedded in the real acquire script, not a second, independently-generated value");
+});
+
+// PR 2 (item 10) review, critical finding 1: `systemctl is-active`
+// reporting a unit active does NOT by itself prove its own `flock -n -x`
+// actually won - Type=simple/exec both report ActiveState=active the
+// instant the process starts, well before the script inside it ever
+// reaches its own flock line. Two genuinely concurrent acquisitions
+// could both observe "active" during that window and both conclude
+// HOF_LEASE_HELD. The fix reads the owner record's own token back
+// before ever trusting "active" as proof - this test confirms the
+// script the module actually sends does that (real, end-to-end
+// contention against a genuine target is test/apply-acceptance.impl.mjs's
+// own job, not reproducible against a mocked `run`).
+test("acquireMutex: 'active' alone is never trusted as proof of ownership - the acquire script also confirms the owner record holds exactly this acquisition's own token before ever concluding HOF_LEASE_HELD", async () => {
+  const { run, calls } = mockSequencedRun(["HOF_LEASE_HELD\n"]);
+  await acquireMutex({ ...SSH_TARGET, run });
+  const script = calls.find((c) => c.command === "ssh").input;
+  // The poll loop's own "active" branch must read the owner record back
+  // and compare it against this exact acquisition's own token before
+  // ever printing HOF_LEASE_HELD - not merely check systemctl state.
+  const activeBranch = script.slice(script.indexOf('"$state" = active'), script.indexOf("HOF_LEASE_HELD"));
+  assert.match(activeBranch, /exec\.lease\.owner/, "the active branch must read the owner record, not just trust systemctl's own state");
+  assert.match(activeBranch, /owner=\$\(cat/, "must capture the owner record's own current content");
+  const token = script.match(/--unit='hof-exec-lease-([0-9a-f-]+)'/)[1];
+  assert.match(activeBranch, new RegExp(`"\\$owner" = '${token}'`), "must compare the owner record against exactly this acquisition's own token before concluding HELD");
 });
 
 test("acquireMutex: two separate acquisitions embed two genuinely different, unique tokens - never a reused unit name", async () => {

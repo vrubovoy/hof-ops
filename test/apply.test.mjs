@@ -824,6 +824,79 @@ test("an operation failure marks the journal failed, releases the lock, and stop
   assert.ok(!failedEvent.error.includes("undefined"));
 });
 
+// PR 2 (item 10) review, critical finding 2: this catch block used to
+// write the failed event/journal status completely unconditionally,
+// with no lease check of its own at all - dispatchOperation() itself is
+// a real, often long-running await, a genuine window for the lease to
+// be lost while it ran. The lease here starts healthy and only reports
+// lost the FIRST time assertOwnership() is actually called - which, for
+// this fixture (a fresh bootstrap failing on its second dispatched
+// operation, no resume/recovery paths ever reached), is exactly the
+// fresh check apply.mjs's own catch block now makes immediately before
+// its own terminal writes. Proves the check is real (a fresh round trip
+// the catch block itself triggers), not merely a coincidence of some
+// earlier cached state.
+test("an operation failure discovered as a lost lease (via a fresh assertOwnership() call, not a stale cached isLost()) never writes the failed event/journal - refused as reason 'lease', not 'operation' (item 10 PR2 review, critical finding 2)", async () => {
+  const mutate = makeFakeMutate();
+  let calls = 0;
+  const options = baseApplyOptions({
+    mutate, inspect: async () => cleanSnapshot(),
+    dockerRun: async () => { calls += 1; if (calls === 2) throw Object.assign(new Error("ansible-playbook exited 2"), { stdout: "TASK [assert]\nfatal: [target]: FAILED!" }); return { stdout: "", stderr: "" }; },
+  });
+  let lost = false;
+  let assertOwnershipCalls = 0;
+  mutate.acquireExecutionLease = async () => ({
+    release: async () => {},
+    isLost: () => lost,
+    lostReason: () => "simulated: discovered lost via a fresh assertOwnership() call, right before the failed-path terminal writes",
+    onLost: () => {},
+    assertOwnership: async () => { assertOwnershipCalls += 1; lost = true; },
+  });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  const events = [];
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath, emit: (event) => events.push(event) }));
+
+  assert.equal(assertOwnershipCalls, 1, "fixture assumption: assertOwnership() is called exactly once, by the failed-path check itself");
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lease", "refused because the lease was found lost, not because the operation itself failed");
+  assert.ok(!events.some((event) => event.phase === "failed"), "the failed event must never be written once the lease is known lost");
+  const journal = [...mutate.state.journals.values()][0];
+  assert.equal(journal.status, "in-progress", "the journal must never be rewritten to failed once the lease is known lost - it stays exactly as the fresh-path creation left it");
+});
+
+// PR 2 (item 10) review, critical finding 2: the truest "terminal
+// write" of a whole run - committedJournal, written after every
+// operation has already genuinely succeeded. The lease here stays
+// healthy through every per-step succeeded-event check (each one also
+// now calls assertOwnership(), per this same review) and only reports
+// lost on the VERY LAST such call - the dedicated check apply.mjs now
+// makes immediately before this final write, proving it is a real,
+// distinct gate of its own, not merely inherited from an earlier
+// per-step check.
+test("a lease lost strictly before the final committedJournal write (discovered only on that write's own fresh assertOwnership() call) refuses the write - the run never reports a false success (item 10 PR2 review, critical finding 2)", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  assert.ok(plan.operations.length > 1, "fixture assumption: a real bootstrap has more than one operation");
+
+  let assertOwnershipCalls = 0;
+  mutate.acquireExecutionLease = async () => ({
+    release: async () => {},
+    isLost: () => assertOwnershipCalls > plan.operations.length,
+    lostReason: () => "simulated: discovered lost only on the final committedJournal write's own fresh assertOwnership() call",
+    onLost: () => {},
+    assertOwnership: async () => { assertOwnershipCalls += 1; },
+  });
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+
+  assert.equal(assertOwnershipCalls, plan.operations.length + 1, "one call per operation's own succeeded-event check, plus exactly one more for the final committedJournal write");
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lease");
+  const journal = [...mutate.state.journals.values()][0];
+  assert.equal(journal.status, "in-progress", "committedJournal must never be written once the lease is found lost immediately before it - the journal stays exactly as its fresh-path creation left it");
+});
+
 test("resume: an already-succeeded step is skipped, never re-dispatched, and the run still commits", async () => {
   const mutate = makeFakeMutate();
   const dockerCalls = [];

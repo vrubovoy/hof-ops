@@ -1267,6 +1267,64 @@ test("a concurrent --resume is refused by the real execution lease while the ope
   await assert.rejects(() => exec("docker", ["exec", containerName, "test", "-e", "/var/lib/hof/state/lock.json"]), "the lock is released once the commit genuinely finishes");
 });
 
+// PR 2 (item 10) review, Critical finding 1: `systemctl is-active`
+// reporting a unit active does NOT by itself prove its own `flock -n -x`
+// actually won - a unit's ActiveState turns "active" the instant its
+// process starts, well before the script inside it ever reaches its own
+// flock line. Two GENUINELY SIMULTANEOUS acquisitions (both fired in the
+// same tick, via Promise.allSettled, never one awaited before the other
+// starts) are the only way to actually exercise that narrow window
+// against a real target - a sequential "acquire, then acquire again"
+// (the scenario below) never reaches it at all, since by the time the
+// second call starts, the first is already long since fully resolved.
+// Run several times in a loop - a real race is not guaranteed to be hit
+// by a single attempt, even with the bug present (target-mutate.mjs's
+// own fix reads the owner record's actual token, not just ActiveState,
+// before ever concluding HOF_LEASE_HELD).
+test("acquireMutex: genuinely simultaneous acquisitions against the real target never both win - real flock arbitration, not merely simulated by a fake `run` (item 10 PR2 review, critical finding 1)", async () => {
+  const conn = mutateConn();
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const results = await Promise.allSettled([acquireMutex(conn), acquireMutex(conn)]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    assert.equal(fulfilled.length, 1, `attempt ${attempt}: exactly one of two simultaneous acquisitions must win, got ${fulfilled.length}: ${JSON.stringify(results.map((r) => r.status))}`);
+    assert.equal(rejected.length, 1, `attempt ${attempt}: the other must be refused, never silently ignored or itself also succeeding`);
+    assert.match(rejected[0].reason.message, /already holds the execution lease/);
+    await fulfilled[0].value.release();
+  }
+});
+
+// PR 2 (item 10) review, Medium finding 6: the sibling scenario below
+// proves killing the held unit directly releases its flock - true of
+// ANY dead process, self-expiry logic or not, so it does NOT actually
+// exercise the self-check loop's OWN timeout logic (heldScript's own
+// `while :; do sleep ...; [ age -gt TIMEOUT ] && exit 0; done`). This
+// scenario instead stops only the LOCAL heartbeat (never touching the
+// target directly, never killing anything) and waits out the real
+// self-expiry bound - the held unit must notice entirely on its own
+// that nothing has refreshed its owner record's mtime, and voluntarily
+// give up the real flock, before a fresh acquisition can succeed.
+test("acquireMutex: a real target-side self-expiry once heartbeats genuinely stop, never a killed unit - the held unit's own timeout logic, exercised for real (item 10 PR2 review, medium finding 6)", async () => {
+  const conn = mutateConn();
+  const stuck = await acquireMutex(conn);
+  stuck.stopHeartbeatForTesting();
+
+  // Still genuinely, actively held immediately after - nothing has
+  // expired yet.
+  await assert.rejects(() => acquireMutex(conn), /already holds the execution lease/);
+
+  // Wait out the real self-expiry bound with no external intervention
+  // at all - LEASE_HEARTBEAT_TIMEOUT_S (30s) + LEASE_SELF_CHECK_INTERVAL_S
+  // (5s, the held unit's own poll cadence) + a real margin, matching
+  // target-mutate.mjs's own current constants.
+  await new Promise((resolve) => setTimeout(resolve, 40_000));
+
+  // The unit gave up its own flock on its own - a fresh acquisition now
+  // succeeds without anything external ever having touched the target.
+  const fresh = await acquireMutex(conn);
+  await fresh.release();
+});
+
 // PR 2 (item 10): the execution lease/mutex is no longer a long-lived
 // local child holding flock over a persistent SSH heartbeat - it's a
 // real, target-side, transient systemd unit (acquireMutex(), see

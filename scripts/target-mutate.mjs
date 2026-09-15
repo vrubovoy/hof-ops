@@ -59,6 +59,12 @@ const HOSTNAME_PATTERN = /^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,6
 const USERNAME_PATTERN = /^[a-z_][a-z0-9_-]{0,31}$/;
 const OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HOST_KEY_SHA256_PATTERN = /^SHA256:[A-Za-z0-9+/]+=*$/;
+// Same shape as an operationId (randomUUID()) but a genuinely separate
+// concept - see acquireMutex()'s own comment on what a mutex token
+// identifies. Validated with its own pattern (not OPERATION_ID_PATTERN
+// reused) so a caller passing the wrong kind of id to the wrong
+// validator gets a message naming the thing it actually is.
+const MUTEX_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function validateSshDestination(host, user, port) {
   if (typeof host !== "string" || !HOSTNAME_PATTERN.test(host)) throw new Error(`refusing to connect: "${host}" is not a valid hostname`);
@@ -69,6 +75,11 @@ function validateSshDestination(host, user, port) {
 function validateOperationId(operationId) {
   if (!OPERATION_ID_PATTERN.test(operationId)) throw new Error(`"${operationId}" is not a valid operationId`);
   return operationId;
+}
+
+function validateLeaseToken(leaseToken) {
+  if (!MUTEX_TOKEN_PATTERN.test(leaseToken)) throw new Error(`"${leaseToken}" is not a valid execution-lease token`);
+  return leaseToken;
 }
 
 function defaultRun(command, args, { input, timeout } = {}) {
@@ -298,6 +309,34 @@ const LOCK_PATH = "/var/lib/hof/state/lock.json";
 const LOCK_GUARD_PATH = "/var/lib/hof/state/lock.flock";
 const CURRENT_STATE_PATH = "/var/lib/hof/state/current.json";
 const TOPOLOGY_PATH = "/var/lib/hof/state/topology.json";
+const EXECUTION_LEASE_PATH = "/var/lib/hof/state/exec.lease";
+const EXECUTION_LEASE_OWNER_PATH = "/var/lib/hof/state/exec.lease.owner";
+
+// PR 2 (item 10) review: appendEvent()/updateJournalStatus() used to
+// trust their own CALLER's cached isLost() check alone - a real
+// TOCTOU gap (a lease genuinely lost strictly between that check and
+// this write actually reaching the target, or a caller that simply
+// never checked at all) let a stale lease-holder's own write land on
+// the target with nothing there to refuse it. This is the real,
+// target-side fencing check every lease-gated write now runs INSIDE
+// its own flock guard (the same one acquireMutex()'s held script uses
+// to serialize acquisition against release - see that function's own
+// comment): the write proceeds only if the owner record still holds
+// EXACTLY this leaseToken; otherwise nothing is written at all,
+// atomically, decided under the same mutual exclusion the mutex itself
+// already provides - never merely a client-side, best-effort check.
+// leaseToken is optional (omitted entirely for a caller with no lease
+// concept at all) - when omitted, this returns an empty string and the
+// write proceeds unguarded, exactly like before this review.
+function leaseFencingScript(leaseToken) {
+  if (leaseToken === undefined) return "";
+  validateLeaseToken(leaseToken);
+  return `if [ ! -r '${EXECUTION_LEASE_OWNER_PATH}' ] || [ "$(cat '${EXECUTION_LEASE_OWNER_PATH}')" != '${leaseToken}' ]; then
+  echo HOF_MUTATE_LEASE_MISMATCH
+  exit 0
+fi
+`;
+}
 const journalPath = (operationId) => `/var/lib/hof/state/journal/${validateOperationId(operationId)}.json`;
 const eventsPath = (operationId) => `/var/lib/hof/state/journal/${validateOperationId(operationId)}.events.ndjson`;
 
@@ -478,15 +517,25 @@ export async function readGenerationSnapshotReleaseLock(conn, generation) {
 // target-mutate.mjs's own raw persistence functions carry no
 // schema-specific logic at all (see this file's own top comment), so a
 // v2 journal update needs no separate implementation.
-export async function updateJournalStatus(conn, journalDocument) {
+//
+// leaseToken (optional): when given, the write is target-side fenced
+// against the current execution-lease owner record BEFORE it happens,
+// atomically, under this same flock guard - see leaseFencingScript()'s
+// own comment on why this closes a real gap a caller-side isLost()
+// check alone cannot (a lease lost strictly between that check and this
+// write actually reaching the target). Omitted only by a caller with no
+// lease concept of its own.
+export async function updateJournalStatus(conn, journalDocument, leaseToken) {
   const targetPath = journalPath(journalDocument.operationId);
-  const script = withLockGuard(`payload='${b64(journalDocument)}'
+  const script = withLockGuard(`${leaseFencingScript(leaseToken)}payload='${b64(journalDocument)}'
 tmp=$(mktemp '${targetPath}.XXXXXX')
 printf '%s' "$payload" | base64 -d > "$tmp"
 mv -f "$tmp" '${targetPath}'
 echo HOF_MUTATE_UPDATED`);
   const stdout = await runScript(conn, script);
-  if (stdout.split("\n")[0] !== "HOF_MUTATE_UPDATED") throw new Error(`unexpected target-mutate response: ${JSON.stringify(stdout)}`);
+  const tag = stdout.split("\n")[0];
+  if (tag === "HOF_MUTATE_LEASE_MISMATCH") throw new Error(`refusing to update the journal for operation ${journalDocument.operationId}: the execution lease no longer matches this write's own token on the target - another process may now hold it, or it has already self-expired`);
+  if (tag !== "HOF_MUTATE_UPDATED") throw new Error(`unexpected target-mutate response: ${JSON.stringify(stdout)}`);
 }
 
 // Append-only NDJSON - one line per event, never rewritten or reordered.
@@ -497,14 +546,19 @@ echo HOF_MUTATE_UPDATED`);
 // serializing it too keeps every writer to one operationId's own
 // journal/events pair strictly ordered against every other one, never
 // relying on that syscall-level guarantee alone.
-export async function appendEvent(conn, operationId, event) {
+//
+// leaseToken (optional): same target-side fencing as
+// updateJournalStatus() above - see its own comment.
+export async function appendEvent(conn, operationId, event, leaseToken) {
   const targetPath = eventsPath(operationId);
-  const script = withLockGuard(`payload='${b64(event)}'
+  const script = withLockGuard(`${leaseFencingScript(leaseToken)}payload='${b64(event)}'
 mkdir -p "$(dirname '${targetPath}')"
 printf '%s\\n' "$(printf '%s' "$payload" | base64 -d)" >> '${targetPath}'
 echo HOF_MUTATE_APPENDED`);
   const stdout = await runScript(conn, script);
-  if (stdout.split("\n")[0] !== "HOF_MUTATE_APPENDED") throw new Error(`unexpected target-mutate response: ${JSON.stringify(stdout)}`);
+  const tag = stdout.split("\n")[0];
+  if (tag === "HOF_MUTATE_LEASE_MISMATCH") throw new Error(`refusing to append an event for operation ${operationId}: the execution lease no longer matches this write's own token on the target - another process may now hold it, or it has already self-expired`);
+  if (tag !== "HOF_MUTATE_APPENDED") throw new Error(`unexpected target-mutate response: ${JSON.stringify(stdout)}`);
 }
 
 // A brand new operationId's own events file simply doesn't exist yet -
@@ -530,17 +584,7 @@ fi
   return body.split("\n").filter((line) => line.length > 0).map((line) => JSON.parse(line));
 }
 
-const EXECUTION_LEASE_PATH = "/var/lib/hof/state/exec.lease";
-const EXECUTION_LEASE_OWNER_PATH = "/var/lib/hof/state/exec.lease.owner";
 const MUTEX_UNIT_PREFIX = "hof-exec-lease-";
-// A mutex token has the same shape as an operationId (randomUUID()) but
-// is a genuinely separate concept - it identifies ONE acquisition of the
-// physical mutex, not an apply/backup/restore run itself (many
-// operations across apply/backup/restore share this one flock path over
-// an installation's lifetime, each acquiring it with its own fresh
-// token). Never persisted into the durable lock/journal/event
-// documents, and never logged - see acquireMutex()'s own comment.
-const MUTEX_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 // How often the local side re-confirms ownership (a heartbeat, not a
 // passive read - see assertMutexScript()'s own comment: each call
@@ -655,6 +699,28 @@ export async function acquireMutex(conn) {
     "fi",
   ].join("; ");
 
+  // PR 2 (item 10) review, Critical finding 1: systemctl reporting a
+  // unit "active" does NOT by itself prove ITS OWN flock -n -x actually
+  // succeeded - Type=simple/exec both report ActiveState=active the
+  // instant the process starts (forks/execs), which happens well before
+  // the script inside it ever reaches its own `flock -n -x 9` line. Two
+  // genuinely concurrent acquisitions can both observe "active" during
+  // that shared window and both conclude HOF_LEASE_HELD - a real,
+  // reproducible double-acquisition, not a hypothetical one. flock -n -x
+  // itself IS atomic at the kernel level (only one process total can
+  // ever be inside the winning branch of heldScript's own `if` at a
+  // time) - the bug was purely in how this poll interpreted "active" as
+  // proof, without ever confirming THIS acquisition is the one that
+  // actually won it. Fixed: "active" alone is never enough - the owner
+  // record must ALSO already hold this exact acquisition's own token,
+  // which heldScript's own winning branch only ever writes AFTER
+  // flock -n -x 9 has genuinely succeeded. Observing "active" with a
+  // owner record that isn't (yet, or ever) this token is deliberately
+  // NOT treated as busy either - the real winner (whoever it is) may
+  // simply not have reached its own printf yet; only this specific
+  // unit's own later "failed" state (the losing branch's `exit 1`,
+  // reached once its own flock -n -x has genuinely resolved negatively)
+  // is trusted as proof of loss.
   const acquireScript = `set -eu
 mkdir -p "$(dirname '${EXECUTION_LEASE_PATH}')"
 systemd-run --unit='${unit}' --quiet -- /bin/sh -c '${heldScript}' >/dev/null 2>&1
@@ -662,8 +728,11 @@ i=0
 while [ "$i" -lt ${LEASE_ACQUIRE_POLL_ATTEMPTS} ]; do
   state=$(systemctl is-active '${unit}.service' 2>/dev/null || true)
   if [ "$state" = active ]; then
-    echo HOF_LEASE_HELD
-    exit 0
+    owner=$(cat '${EXECUTION_LEASE_OWNER_PATH}' 2>/dev/null || true)
+    if [ "$owner" = '${token}' ]; then
+      echo HOF_LEASE_HELD
+      exit 0
+    fi
   fi
   if [ "$state" = failed ]; then
     systemctl reset-failed '${unit}.service' >/dev/null 2>&1 || true
@@ -779,6 +848,30 @@ fi
     lostReason: () => lostReasonValue,
     onLost: (callback) => { lostCallbacks.push(callback); },
     assertOwnership,
+    // Testing-only seam (PR 2 review, medium finding 6) - stops just
+    // this LOCAL process's own heartbeat interval, without ever telling
+    // the target anything (unlike release(), which actively clears the
+    // owner record and stops the unit). Lets a real acceptance test
+    // prove the held unit's own self-check loop genuinely,
+    // independently notices a heartbeat has stopped and gives up its
+    // own flock on its own, within LEASE_HEARTBEAT_TIMEOUT_S - a
+    // materially different, and materially more important, guarantee
+    // than "killing the unit directly releases its flock" (which the
+    // OS would do for ANY dead process, self-expiry logic or not). The
+    // real CLI never calls this.
+    stopHeartbeatForTesting: () => clearInterval(heartbeat),
+    // PR 2 (item 10) review, Critical finding 2: exposed so a caller
+    // (apply.mjs's own dispatch loop, and operation-v2.mjs's own write
+    // wrappers) can pass it into updateJournalStatus()/appendEvent()'s
+    // own leaseToken parameter for real, target-side fencing on every
+    // write - a client-side isLost() check alone cannot close a loss
+    // that happens strictly between that check and the write actually
+    // reaching the target. Never written into a durable lock/journal/
+    // event document, and never logged by anything in this codebase -
+    // a caller threading it into a write's own fencing parameter is not
+    // "persisting" it, the target-side check reads it once per write and
+    // discards it.
+    token,
   };
 }
 

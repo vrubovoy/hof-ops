@@ -114,12 +114,12 @@
       "pattern": "^[a-z][a-z0-9-]{0,62}$"
     },
     "network": {
-      "description": "A network's own PHYSICAL name (render-topology.mjs's own physicalNetworkName() output, always \"hof-\" + the logical key - COMPOSE_PROJECT_NAME is a fixed, hardcoded constant, not configurable) plus whether it must be created internal - the same shape plan-v2's own network.ensure operation implicitly carries (name + a conditional internal flag), made explicit here since restore has no baseline to diff against. A fourth review round found the earlier draft's name pattern accepted the bare logical key (\"hof\", never a real physical name) and left internal fully independent of name (so {name: \"hof-wachter-internal\", internal: false} - contradicting the one network plan.mjs itself ever marks internal - was schema-valid); both are now real, enforced structural constraints, not merely prose.",
+      "description": "A network's own PHYSICAL name (render-topology.mjs's own physicalNetworkName() output) plus whether it must be created internal - the same shape plan-v2's own network.ensure operation implicitly carries (name + a conditional internal flag), made explicit here since restore has no baseline to diff against. render-topology.mjs calls physicalNetworkName() exactly twice, ever - HOF_NETWORK_NAME (\"hof-hof\") and WACHTER_INTERNAL_NETWORK_NAME (\"hof-wachter-internal\") are the ONLY two physical networks that exist anywhere in this platform, a closed set, not merely a naming convention. A fourth review round tightened name from an unconstrained identifier to a \"hof-\" prefix pattern, closing the specific {name: \"hof\", ...} counterexample it found - a fifth round found that pattern still accepted any other \"hof-something\", e.g. \"hof-unrelated\", never actually producible by this system. name is now the closed enum itself.",
       "type": "object",
       "additionalProperties": false,
       "required": ["name", "internal"],
       "properties": {
-        "name": { "type": "string", "pattern": "^hof-[a-z][a-z0-9.-]{0,75}$" },
+        "name": { "enum": ["hof-hof", "hof-wachter-internal"] },
         "internal": { "type": "boolean" }
       },
       "allOf": [

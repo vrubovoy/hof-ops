@@ -149,6 +149,13 @@ export function validateBackupPlanOperations(plan) {
   // that the plan's own stop/start halves agree with each other.
   const stopUnits = byAction("service.stop").map((op) => op.resource);
   const startUnits = byAction("service.start").map((op) => op.resource);
+  // A duplicate stop+matching duplicate start for the SAME unit passes
+  // the set-equality check above (both arrays hold the identical
+  // multiset) even though it's still two redundant, meaningless
+  // operation pairs - a fifth review round found this. hasDuplicates
+  // catches it independent of the set-equality check.
+  if (hasDuplicates(stopUnits, (u) => u)) violations.push("more than one service.stop operation targets the same unit");
+  if (hasDuplicates(startUnits, (u) => u)) violations.push("more than one service.start operation targets the same unit");
   if (sortedJSON(stopUnits) !== sortedJSON(startUnits)) {
     violations.push("service.stop and service.start must name the exact same set of units");
   }
@@ -223,6 +230,11 @@ export function validateRestorePlanOperations(plan) {
   }
   for (const action of ["service.start", "readiness.wait"]) {
     if (byAction(action).length === 0) violations.push(`expected at least one ${action} operation`);
+  }
+  // A fifth review round found restore also allowed a repeated
+  // service.start for the same unit, unnoticed.
+  if (hasDuplicates(byAction("service.start").map((op) => op.resource), (u) => u)) {
+    violations.push("more than one service.start operation targets the same unit");
   }
 
   const expectedNetworks = plan.networks.map((n) => n.name);
@@ -353,6 +365,20 @@ export function validateBackupBundle({ policy, plan, manifest, evidence, kit, lo
   if (plan.backupId !== expectedBackupId) {
     violations.push("plan.backupId does not match its own recomputed domain-separated id");
   }
+  // plan.target (the actual SSH connection binding - what installationId/
+  // generation the target was OBSERVED to be at, right before this plan
+  // was built) and plan's own top-level installationId/generation (what
+  // this backup is declared to be FOR) must always agree, policy or no
+  // policy - a fifth review round found nothing checked this at all, so
+  // a plan could describe backing up installation X/generation 5 while
+  // its own target binding was actually observed as installation Y/
+  // generation 3.
+  if (plan.target.installationId !== plan.installationId) {
+    violations.push("plan.target.installationId does not match plan.installationId");
+  }
+  if (plan.target.baselineGeneration !== plan.generation) {
+    violations.push("plan.target.baselineGeneration does not match plan.generation");
+  }
 
   if (policy) {
     const expectedPolicyId = canonicalContentId(policy, ["policyId", "appliedGeneration", "appliedManifestDigest"]);
@@ -453,6 +479,18 @@ export function validateBackupBundle({ policy, plan, manifest, evidence, kit, lo
         violations.push("evidence.abandoned: true must correspond to journal.status: failed - abandonment is itself a terminal failure");
       }
     }
+    // abandoned: true asserts the flow never naturally completed - a
+    // fifth review round found nothing checked this against the actual
+    // event log, so a bundle whose events show every one of the plan's
+    // own operations already succeeded (including evidence.write itself)
+    // could still honestly-looking claim abandoned: true.
+    if (events && evidence.abandoned === true) {
+      const succeededSteps = new Set(events.filter((event) => event.phase === "succeeded").map((event) => event.step));
+      const everyStepSucceeded = plan.operations.every((op) => succeededSteps.has(op.id));
+      if (everyStepSucceeded) {
+        violations.push("evidence.abandoned: true is incoherent with an event log showing every one of the plan's own operations already succeeded - abandonment means the flow never naturally completed");
+      }
+    }
   }
 
   if (lock) {
@@ -465,7 +503,16 @@ export function validateBackupBundle({ policy, plan, manifest, evidence, kit, lo
     if (journal.approvedPlanId !== plan.planId) violations.push("journal.approvedPlanId does not match plan.planId");
     if (journal.operationKind !== "backup") violations.push("journal.operationKind is not backup");
     if (!deepEqual(journal.target, plan.target)) violations.push("journal.target does not match plan.target");
-    if (journal.plan?.planId !== plan.planId) violations.push("journal.plan.planId does not match plan.planId");
+    // journal.plan.planId matching plan.planId alone doesn't prove
+    // journal.plan IS the real plan - operation-journal-v2.schema.json
+    // only ever requires {apiVersion, planId} within its own embedded
+    // plan (it never $ref's another schema file, this repo's own
+    // convention), so a schema-valid journal could carry a correct
+    // planId while its own embedded plan is otherwise truncated or
+    // altered. A fifth review round found exactly that gap; the real
+    // fix is structural equality against the actual plan passed in here,
+    // not merely comparing one declared field.
+    if (!deepEqual(journal.plan, plan)) violations.push("journal.plan does not structurally match the supplied plan - not merely a planId mismatch");
     if (journal.inputDigests?.releaseLockDigest !== plan.releaseLockDigest) {
       violations.push("journal.inputDigests.releaseLockDigest does not match plan.releaseLockDigest");
     }
@@ -572,6 +619,18 @@ export function validateRestoreBundle({ plan, manifest, evidence, kit, lock, jou
         violations.push("evidence.abandoned: true must correspond to journal.status: failed - abandonment is itself a terminal failure");
       }
     }
+    // abandoned: true asserts the flow never naturally completed - a
+    // fifth review round found nothing checked this against the actual
+    // event log, so a bundle whose events show every one of the plan's
+    // own operations already succeeded (including evidence.write itself)
+    // could still honestly-looking claim abandoned: true.
+    if (events && evidence.abandoned === true) {
+      const succeededSteps = new Set(events.filter((event) => event.phase === "succeeded").map((event) => event.step));
+      const everyStepSucceeded = plan.operations.every((op) => succeededSteps.has(op.id));
+      if (everyStepSucceeded) {
+        violations.push("evidence.abandoned: true is incoherent with an event log showing every one of the plan's own operations already succeeded - abandonment means the flow never naturally completed");
+      }
+    }
   }
 
   if (lock) {
@@ -584,7 +643,16 @@ export function validateRestoreBundle({ plan, manifest, evidence, kit, lock, jou
     if (journal.approvedPlanId !== plan.planId) violations.push("journal.approvedPlanId does not match plan.planId");
     if (journal.operationKind !== "restore") violations.push("journal.operationKind is not restore");
     if (!deepEqual(journal.target, plan.target)) violations.push("journal.target does not match plan.target");
-    if (journal.plan?.planId !== plan.planId) violations.push("journal.plan.planId does not match plan.planId");
+    // journal.plan.planId matching plan.planId alone doesn't prove
+    // journal.plan IS the real plan - operation-journal-v2.schema.json
+    // only ever requires {apiVersion, planId} within its own embedded
+    // plan (it never $ref's another schema file, this repo's own
+    // convention), so a schema-valid journal could carry a correct
+    // planId while its own embedded plan is otherwise truncated or
+    // altered. A fifth review round found exactly that gap; the real
+    // fix is structural equality against the actual plan passed in here,
+    // not merely comparing one declared field.
+    if (!deepEqual(journal.plan, plan)) violations.push("journal.plan does not structurally match the supplied plan - not merely a planId mismatch");
     if (journal.inputDigests?.releaseLockDigest !== plan.source.releaseLockDigest) {
       violations.push("journal.inputDigests.releaseLockDigest does not match plan.source.releaseLockDigest");
     }
@@ -614,7 +682,7 @@ export function validateRestoreBundle({ plan, manifest, evidence, kit, lock, jou
     // exercised directly by its own unit tests, never as part of
     // validating a real bundle.
     if (journal) {
-      violations.push(...validateRestoreCommittedGeneration(journal, events, plan.source.generation));
+      violations.push(...validateRestoreCommittedGeneration(journal, events, plan));
     }
   }
 
@@ -627,15 +695,23 @@ export function validateRestoreBundle({ plan, manifest, evidence, kit, lock, jou
 // state.restore actually succeeded, a fact only the event log carries.
 // This checks exactly that: committedGeneration must be non-null if and
 // only if a succeeded event for the state.restore step exists.
-// step ids are "NNN.action.resource" - matched anchored/in full here,
-// never via .includes(), which a fourth review round found could in
-// principle be fooled by an unrelated action+resource combination whose
-// concatenation happens to contain this same substring.
-const STATE_RESTORE_STEP = /^[0-9]{3}\.state\.restore\.[a-z][a-z0-9.-]*$/;
-
-export function validateRestoreCommittedGeneration(journal, events, expectedGeneration) {
+export function validateRestoreCommittedGeneration(journal, events, plan) {
   const violations = [];
-  const stateRestoreSucceeded = events.some((event) => event.phase === "succeeded" && STATE_RESTORE_STEP.test(event.step));
+  // A step's own id is free text an operation's author chooses - a
+  // fourth review round already replaced a loose .includes() substring
+  // match with an anchored regex over that same free text, but a fifth
+  // round found even that remained spoofable: nothing ties an
+  // operation's own id to its own action, so a schema-valid operation
+  // could carry id: "010.state.restore.decoy" while its real action is
+  // "config.restore" (or anything else) - fooling a regex keyed on id
+  // text just as easily as .includes() did. The only trustworthy source
+  // for "which step id is genuinely the state.restore operation" is the
+  // plan's own operations array, keyed by action, never by id text.
+  const stateRestoreOp = plan.operations.find((op) => op.action === "state.restore");
+  const expectedGeneration = plan.source.generation;
+  const stateRestoreSucceeded = stateRestoreOp
+    ? events.some((event) => event.phase === "succeeded" && event.step === stateRestoreOp.id)
+    : false;
   if (stateRestoreSucceeded) {
     if (journal.committedGeneration === null) {
       violations.push("committedGeneration must be set once state.restore has actually succeeded, regardless of the operation's own later outcome");

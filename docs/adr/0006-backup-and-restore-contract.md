@@ -150,7 +150,20 @@ check this too. `operation-journal-v2.schema.json`'s own embedded `plan`
 also required only `apiVersion` until this same round - a schema-valid
 journal could omit `planId` entirely, contradicting the bundle
 validators' own assumption that `journal.plan.planId` exists; `plan` now
-requires both.
+requires both. A fifth review round found `planId`-only equality was
+still not enough: a schema-valid journal could carry the CORRECT
+`planId` while `journal.plan` itself stayed the same truncated
+`{apiVersion, planId}` stub - matching the one declared field while
+still not being "the full, exact plan document" this schema's own
+description has always claimed. `validateBackupBundle()`/
+`validateRestoreBundle()` now require `journal.plan` to structurally,
+deep-equal the real `plan` object passed in, not merely share a
+`planId`. `evidence.abandoned: true` also wasn't cross-checked against
+the actual event log - a bundle whose events showed every one of the
+plan's own operations already succeeded, including `evidence.write`
+itself, could still honestly-looking claim abandonment; both bundle
+validators now reject that specific contradiction when `events` is
+supplied.
 
 **`operation-event-v2` exists alongside the unchanged
 `operation-event-v1` for a semantic reason, not because lock/journal
@@ -348,10 +361,20 @@ first; the schema's own earlier "succeeded requires it, everything else
 forbids it" rule would have forced a dishonest `null` in exactly that
 case. `operation-journal-v2.schema.json` no longer ties restore's own
 `committedGeneration` to `status` at all - its real correctness (does it
-match whether a `state.restore` succeeded event actually exists) is
+match whether a `state.restore` succeeded event actually exists, and
+does its VALUE actually equal the source generation being restored) is
 checked by `scripts/backup-flow.mjs`'s own
-`validateRestoreCommittedGeneration(journal, events)`, a check only the
-event log, not the journal alone, can answer.
+`validateRestoreCommittedGeneration(journal, events, plan)`, wired into
+`validateRestoreBundle()` itself (a fifth review round found it existed
+but was never actually called from there). It identifies the real
+`state.restore` step by looking up `plan.operations.find(op => op.action
+=== "state.restore")` - never by pattern-matching an event's own `step`
+text: a fourth round already replaced a loose `.includes()` substring
+check with an anchored regex, but a fifth round found even that stayed
+spoofable, since nothing ties an operation's own `id` to its own
+`action` - a schema-valid plan could still name an unrelated operation
+`id: "010.state.restore.decoy"`. Only the plan's own `action` field is a
+trustworthy source for which step id is genuinely `state.restore`.
 
 **`recovery-kit-v1` - the encrypted recovery envelope itself, private
 identity always external. Schema alone cannot prove `ciphertext` is real
@@ -666,6 +689,20 @@ existing `backup.destinations[].type: "local"`.
   the step immediately before `evidence.write` - nothing legitimately
   fails an already-readiness-confirmed restore. Both evidence schemas
   now require `abandoned` (see the Decision section above).
+- A fifth review round closed four more real gaps: `validateBackupBundle()`
+  now unconditionally requires `plan.target.installationId`/
+  `baselineGeneration` to match `plan.installationId`/`generation` (a
+  plan's own SSH connection binding and its own top-level declared
+  installation/generation could otherwise silently diverge, policy or no
+  policy); both flow validators now catch a SYMMETRIC duplicate
+  `service.stop`+`service.start` pair for the same unit (the set-equality
+  check alone treats two matching duplicates as perfectly coherent, since
+  both arrays hold the identical multiset), and `validateRestorePlanOperations()`
+  catches a duplicate `service.start` the same way; `restore-plan-v1`'s
+  own `network` `name` is now the literal closed `enum: ["hof-hof",
+  "hof-wachter-internal"]` - the two, and only two, physical networks
+  `render-topology.mjs` ever produces - not merely a `"hof-"` prefix
+  pattern, which still accepted any other unproducible `"hof-something"`.
 - What this item's own semantic validators deliberately still do NOT
   prove: that a plan's own `service.stop`/`service.start` unit set, or
   its own `consistencySet`, actually matches the platform's real, full

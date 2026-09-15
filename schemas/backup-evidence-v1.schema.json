@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/backup-evidence-v1.schema.json",
+  "title": "Hof backup evidence",
+  "description": "Written atomically once a backup operation reaches its own end, never touching current.json or the generation (ADR 0006's own Backup Flow step 12) - immutable once written. status distinguishes a real, useful middle case journal/operation-lock-v2 cannot: \"partial\" (at least one destination succeeded, at least one did not) is recorded honestly here even though the operation's own journal status is always \"failed\" whenever any configured destination failed - all destinations are required for the operation's own overall success (ADR 0006), but a partial result is never silently reported as a total one.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion", "operationId", "backupId", "planId", "backupPolicyId", "manifestDigest", "backupToolLockDigest",
+    "target", "startedAt", "completedAt", "status", "perDestinationResults", "readinessConfirmedAt", "abandoned"
+  ],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/backup-evidence/v1" },
+    "operationId": { "$ref": "#/$defs/operationId" },
+    "backupId": { "$ref": "#/$defs/sha256" },
+    "planId": {
+      "description": "The backup-plan-v1 planId this evidence resulted from - binds this evidence to the exact approved plan, not merely to the backupId it produced.",
+      "$ref": "#/$defs/sha256"
+    },
+    "backupPolicyId": {
+      "description": "The backup-policy-v1 policyId the bound plan itself was built against.",
+      "$ref": "#/$defs/sha256"
+    },
+    "manifestDigest": {
+      "description": "sha256 of the backup-manifest-v1 document actually written into every destination's own snapshot this run - lets a later audit confirm the evidence and the manifest agree on which run this was, without re-opening a snapshot.",
+      "$ref": "#/$defs/sha256"
+    },
+    "backupToolLockDigest": {
+      "description": "The signed backup-tool-lock this operation actually ran under.",
+      "$ref": "#/$defs/sha256"
+    },
+    "target": { "$ref": "#/$defs/targetBinding" },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "completedAt": { "type": "string", "format": "date-time" },
+    "status": {
+      "description": "succeeded: every configured destination succeeded. partial: at least one succeeded and at least one failed. failed: no destination succeeded at all (including the case where the operation crashed before any snapshot.create ever ran, leaving perDestinationResults empty).",
+      "enum": ["succeeded", "partial", "failed"]
+    },
+    "perDestinationResults": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/destinationResult" }
+    },
+    "readinessConfirmedAt": {
+      "description": "When the finally block's own readiness.wait last confirmed the fully-restarted platform ready, after every snapshot/retention attempt - null if the finally block never reached it (a crash inside the finally block itself, not merely a snapshot failure). Without this, evidence could claim status: succeeded (every destination snapshotted) while service.start/readiness.wait/maintenance.exit themselves silently failed to actually restore the platform to a healthy running state - every snapshot succeeding is not the same claim as the platform being left healthy.",
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "abandoned": {
+      "description": "true only when this terminal evidence was written because the operator explicitly gave up on a stuck, still-in-progress operationId rather than the flow's own guaranteed finally block naturally reaching evidence.write (a target that never comes back at all is still possible even though the finally block is designed to always run). false for every other outcome, succeeded or a real in-flow partial/total failure that itself reached evidence.write. Always false when status: succeeded.",
+      "type": "boolean"
+    }
+  },
+  "allOf": [
+    {
+      "description": "status: succeeded requires the finally block to have genuinely completed, not merely every snapshot to have succeeded - a broken restart/readiness/maintenance-exit must never hide behind a claimed backup success.",
+      "if": { "properties": { "status": { "const": "succeeded" } } },
+      "then": { "properties": { "readinessConfirmedAt": { "type": "string" }, "abandoned": { "const": false } } }
+    },
+    {
+      "description": "status must faithfully reflect perDestinationResults' own real content - never a silent partial-as-success or partial-as-total-failure. succeeded additionally requires at least one real result - an empty array is never a success, only ever the crashed-before-any-snapshot.create shape failed alone represents.",
+      "if": { "properties": { "status": { "const": "succeeded" } } },
+      "then": { "properties": { "perDestinationResults": { "type": "array", "minItems": 1, "not": { "contains": { "type": "object", "properties": { "status": { "const": "failed" } } } } } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "failed" } } },
+      "then": { "properties": { "perDestinationResults": { "type": "array", "not": { "contains": { "type": "object", "properties": { "status": { "const": "succeeded" } } } } } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "partial" } } },
+      "then": {
+        "properties": {
+          "perDestinationResults": {
+            "type": "array",
+            "allOf": [
+              { "contains": { "type": "object", "properties": { "status": { "const": "succeeded" } } } },
+              { "contains": { "type": "object", "properties": { "status": { "const": "failed" } } } }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z][a-z0-9.-]{0,80}$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "operationId": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "targetBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "host", "port", "user", "hostKeySha256", "installationId", "baselineGeneration"],
+      "properties": {
+        "mode": { "enum": ["ssh", "local"] },
+        "host": { "type": ["string", "null"] },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "user": { "type": ["string", "null"] },
+        "hostKeySha256": { "type": ["string", "null"], "pattern": "^SHA256:[A-Za-z0-9+/]+=*$" },
+        "installationId": { "type": ["string", "null"] },
+        "baselineGeneration": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "destinationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["destination", "status"],
+      "properties": {
+        "destination": { "$ref": "#/$defs/identifier" },
+        "status": { "enum": ["succeeded", "failed"] },
+        "snapshotId": { "type": "string", "minLength": 1 },
+        "verifiedAt": { "type": "string", "format": "date-time" },
+        "retentionApplied": {
+          "description": "Whether retention.apply actually ran to completion for THIS destination's own restic repository - retention is a per-destination operation (a local repo and an S3 repo have entirely independent retention state), never a single run-wide flag. Only ever present on a succeeded destination result; false is never recorded here - a destination that snapshotted successfully but never reached its own retention.apply is still status: succeeded (all-configured-destinations-succeeded is about the snapshot itself, per ADR 0006), simply with retentionApplied absent.",
+          "const": true
+        },
+        "error": {
+          "description": "A short, sanitized diagnostic - never a raw exception dump, a secret value, or credential content.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "succeeded" } } },
+          "then": { "required": ["snapshotId", "verifiedAt"], "properties": { "error": false } },
+          "else": { "required": ["error"], "properties": { "snapshotId": false, "verifiedAt": false, "retentionApplied": false } }
+        }
+      ]
+    }
+  }
+}

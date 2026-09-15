@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/operation-journal-v2.schema.json",
+  "title": "Hof operation journal (v2, backup/restore only)",
+  "description": "/var/lib/hof/state/journal/<operationId>.json for a backup or restore operation - the durable, per-operation-run header record on the target. Scoped strictly to operationKind backup/restore, never apply: the existing apply executor (scripts/operation-journal.mjs, unchanged by this item) reads and writes operation-journal-v1 exclusively and always will, for every apply run, old or new - there is no migration of apply onto v2 in this item. Written once at operation start (immutable except `status`/`committedGeneration`, updated only by the same operationId that created it); individual attempts are recorded separately as an append-only operation-event-v2 log this journal's own operationId ties them to (a genuinely different resumability contract from apply's own operation-event-v1 - see operation-event-v2.schema.json's own description for why). A pre-existing journal written before this ADR has no operationKind field and does not validate against this schema - an executor must still read and safely resume it as operation-journal-v1 (implicit \"apply\"), never refuse it outright just because the field is absent; that case is unaffected by this schema being backup/restore-only, since a pre-ADR journal was always an apply journal anyway. Never holds a secret value, decrypted content, an environment dump, or an SSH private-key path - safe to read, copy, or attach to a bug report without a second sanitization pass.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "operationKind", "operationId", "approvedPlanId", "target", "plan", "inputDigests", "startedAt", "status", "committedGeneration"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/operation-journal/v2" },
+    "operationKind": {
+      "description": "Which of the two new operation state machines produced this journal - never apply (see this schema's own top-level description). Decides which plan schema `plan` below was validated against before being embedded (backup-plan-v1 for backup, restore-plan-v1 for restore - enforced below, not merely documented) and this journal's own committedGeneration semantics (see below).",
+      "enum": ["backup", "restore"]
+    },
+    "operationId": { "$ref": "#/$defs/operationId" },
+    "approvedPlanId": {
+      "description": "The exact plan this run was approved against (--approve-plan-id) - equal to plan.planId below by construction, regardless of operationKind. Schema cannot compare the two fields directly (no $data references are used in this repo); scripts/backup-ids.mjs's own bundle validators and this item's contract tests enforce the equality that would otherwise only ever be prose.",
+      "$ref": "#/$defs/planId"
+    },
+    "target": { "$ref": "#/$defs/targetBinding" },
+    "plan": {
+      "description": "The full, exact plan document this operation was approved against. Loosely typed here on purpose (no schema in this repo cross-references another by $id) - already validated against the schema matching operationKind before ever being embedded, so this schema only ever re-checks the two fields it can meaningfully constrain without a full cross-schema $ref: apiVersion (below) and planId. A fourth review round found the previous draft required only apiVersion, so a schema-valid journal could embed {apiVersion: \"...\"} alone with no planId at all - directly contradicting scripts/backup-flow.mjs's own bundle validators, which already assumed journal.plan.planId exists. The REST of the embedded document's own integrity (every other field genuinely matching what planId claims) is never re-validated by this schema either - it is the caller's own responsibility, verified independently by recomputing planId from the full document (scripts/backup-ids.mjs's canonicalContentId) when a caller supplies both the journal and the real plan to a bundle validator.",
+      "type": "object",
+      "required": ["apiVersion", "planId"],
+      "properties": {
+        "apiVersion": { "type": "string" },
+        "planId": { "$ref": "#/$defs/planId" }
+      }
+    },
+    "inputDigests": {
+      "description": "Every input this specific run is bound to, fixed at journal creation and never recomputed from a live file again mid-run - independent of, and a defense-in-depth check against, the same values plan above already embeds. Shape depends on operationKind (enforced below): backup binds the signed release, the signed backup-tool-lock, and the exact applied backup-policy-v1 this plan was built against; restore binds the HISTORICAL signed release the backup was originally taken under, the signed backup-tool-lock, the backup-manifest-v1 embedded in the pinned snapshot, and the recovery kit.",
+      "type": "object"
+    },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "status": {
+      "description": "in-progress: the operation is running, or was interrupted before its own evidence.write step ever ran - the only state in which --resume of this SAME operationId is valid, since evidence is not yet durably recorded. succeeded: the finally block and evidence.write both completed, and for backup every configured destination's own snapshot succeeded (a partial result is a failure here, recorded separately, honestly, in backup-evidence-v1's own status field). failed: evidence.write already ran (so evidence for whatever this operationId actually achieved - including a real partial backup result - is already durably, immutably recorded), and this specific journal is terminal: a retried attempt is always a genuinely NEW operationId (and so a fresh backupSequence/backupId for backup), never a --resume of this one. \"failed\" is therefore never a mid-operation, still-resumable state - that state is always in-progress.",
+      "enum": ["in-progress", "succeeded", "failed"]
+    },
+    "committedGeneration": {
+      "description": "backup: always null, regardless of status - a backup never mutates current.json or the generation at all. restore: the restored SOURCE generation once state.restore succeeds, carried forward verbatim, never incremented - this is the same installation's history continuing on new hardware, not a new applied change. For restore this is deliberately NOT tied to overall status by this schema (see the allOf below's own description) - state.restore runs well before the operation's own overall conclusion, so a later step (service.start, readiness.wait) can still fail AFTER the generation was genuinely committed, and status: failed with a real committedGeneration already set is the honest result, not a contradiction. scripts/backup-flow.mjs's own validateRestoreCommittedGeneration() checks this field's actual correctness against the real event log - a check this schema alone cannot make.",
+      "type": ["integer", "null"],
+      "minimum": 1
+    }
+  },
+  "allOf": [
+    {
+      "description": "A backup journal's committedGeneration is always null, in every status - a backup never mutates current.json or the generation, regardless of outcome. A restore journal's committedGeneration is intentionally UNCONSTRAINED by status here: a review round found the earlier succeeded-only conditional was actually wrong for restore - state.restore (which actually commits the generation) runs well before the operation's own overall conclusion, so a journal can legitimately reach status: failed (a later step - service.start, readiness.wait - failed) while still correctly carrying a non-null committedGeneration, because the generation really was committed first. The reverse (failed with committedGeneration still null, because state.restore itself never ran) is equally legitimate. Real correctness - does this field's value actually match whether a state.restore succeeded event exists - is checked by scripts/backup-flow.mjs's own validateRestoreCommittedGeneration(), never by this schema alone.",
+      "if": { "properties": { "operationKind": { "const": "backup" } } },
+      "then": { "properties": { "committedGeneration": { "type": "null" } } }
+    },
+    {
+      "description": "plan.apiVersion must actually match operationKind - a backup journal can never embed a restore-plan-v1 document or vice versa.",
+      "if": { "properties": { "operationKind": { "const": "backup" } } },
+      "then": { "properties": { "plan": { "type": "object", "properties": { "apiVersion": { "const": "hof.dev/backup-plan/v1" } } } } },
+      "else": { "properties": { "plan": { "type": "object", "properties": { "apiVersion": { "const": "hof.dev/restore-plan/v1" } } } } }
+    },
+    {
+      "description": "inputDigests is a closed, kind-specific shape - never the other kind's fields, never both at once.",
+      "if": { "properties": { "operationKind": { "const": "backup" } } },
+      "then": {
+        "properties": {
+          "inputDigests": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["releaseLockDigest", "backupToolLockDigest", "backupPolicyId"],
+            "properties": {
+              "releaseLockDigest": { "$ref": "#/$defs/sha256" },
+              "backupToolLockDigest": { "$ref": "#/$defs/sha256" },
+              "backupPolicyId": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "inputDigests": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["releaseLockDigest", "backupToolLockDigest", "manifestDigest", "recoveryKitDigest"],
+            "properties": {
+              "releaseLockDigest": { "$ref": "#/$defs/sha256" },
+              "backupToolLockDigest": { "$ref": "#/$defs/sha256" },
+              "manifestDigest": { "$ref": "#/$defs/sha256" },
+              "recoveryKitDigest": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "operationId": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "planId": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "targetBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "host", "port", "user", "hostKeySha256", "installationId", "baselineGeneration"],
+      "properties": {
+        "mode": { "enum": ["ssh", "local"] },
+        "host": { "type": ["string", "null"] },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "user": { "type": ["string", "null"] },
+        "hostKeySha256": { "type": ["string", "null"], "pattern": "^SHA256:[A-Za-z0-9+/]+=*$" },
+        "installationId": { "type": ["string", "null"] },
+        "baselineGeneration": { "type": "integer", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "description": "ADR 0006 review: operation-journal-v1's own targetBinding left this pairing unenforced by schema (prose-only) - v2 (this schema) closes it. Not backported to operation-journal-v1 itself, which stays untouched.",
+          "if": { "properties": { "mode": { "const": "ssh" } } },
+          "then": { "properties": { "hostKeySha256": { "type": "string" } } },
+          "else": { "properties": { "hostKeySha256": { "const": null } } }
+        }
+      ]
+    }
+  }
+}

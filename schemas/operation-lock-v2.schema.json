@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/operation-lock-v2.schema.json",
+  "title": "Hof operation lock (v2, backup/restore only)",
+  "description": "/var/lib/hof/state/lock.json for a backup or restore operation - exclusive ownership of an in-progress or interrupted one against this host. Scoped strictly to operationKind backup/restore, never apply: the existing apply executor (scripts/operation-journal.mjs, unchanged by this item) reads and writes operation-lock-v1 exclusively and always will, for every apply run, old or new - there is no migration of apply onto v2 in this item, and no ambiguity about which schema an apply lock validates against. The cross-kind exclusion ADR 0006 promises (a backup/restore in progress refuses a concurrent apply, and vice versa) is enforced by the separate, lower-level physical execution mutex the ADR's own Decision describes - a later PR's executor primitive, not this document shape; v1 and v2 lock.json are two independent per-kind-family documents layered on top of that one shared mutex, never merged into one schema. Otherwise identical to operation-lock-v1 except for the added operationKind field. A pre-existing lock.json written before this ADR has no operationKind field at all and does not validate against this schema - an executor reading it must treat that absence as an implicit \"apply\" (operation-lock-v1 is still valid, still readable, never deleted). Deliberately has no TTL/expiry field - the lock must survive the invoking process dying (an operator's laptop sleeping, a network drop), so it is only ever removed by a successful commit or reclaimed by --resume for the SAME operationId, never by simply waiting it out.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "operationKind", "operationId", "approvedPlanId", "target", "acquiredAt", "acquiredBy"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/operation-lock/v2" },
+    "operationKind": {
+      "description": "Which of the two new operation state machines this lock belongs to - never apply (see this schema's own top-level description for why).",
+      "enum": ["backup", "restore"]
+    },
+    "operationId": {
+      "description": "This operation's own unique identifier - ties the lock to its operation journal (same field name) and to every operation-event-v2 record it emits.",
+      "$ref": "#/$defs/operationId"
+    },
+    "approvedPlanId": {
+      "description": "The approved plan's own planId - a plan-v2, backup-plan-v1, or restore-plan-v1 planId depending on operationKind (all three use the same sha256-of-inputs shape).",
+      "$ref": "#/$defs/planId"
+    },
+    "target": { "$ref": "#/$defs/targetBinding" },
+    "acquiredAt": { "type": "string", "format": "date-time" },
+    "acquiredBy": {
+      "description": "Informational only, for a human debugging a stuck lock - never used for an actual security decision (the lock's own operationId is the only thing that authorizes a resume).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workstation", "pid", "user"],
+      "properties": {
+        "workstation": { "type": "string", "minLength": 1 },
+        "pid": { "type": "integer", "minimum": 1 },
+        "user": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "$defs": {
+    "operationId": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+    "planId": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "targetBinding": {
+      "description": "The exact target this operation was approved against - see plan-v2.schema.json's own `target` for the full description of each field. Duplicated here (not $ref'd across files - no schema in this repo cross-references another by $id) so this schema stays independently valid on its own.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "host", "port", "user", "hostKeySha256", "installationId", "baselineGeneration"],
+      "properties": {
+        "mode": { "enum": ["ssh", "local"] },
+        "host": { "type": ["string", "null"] },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "user": { "type": ["string", "null"] },
+        "hostKeySha256": {
+          "description": "The exact accepted SSH host-key fingerprint from the same connection the bound plan was computed against - null only in --target-mode local. A host-key change invalidates every plan bound to the old one.",
+          "type": ["string", "null"],
+          "pattern": "^SHA256:[A-Za-z0-9+/]+=*$"
+        },
+        "installationId": { "type": ["string", "null"] },
+        "baselineGeneration": { "type": "integer", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "description": "ADR 0006 review: operation-lock-v1's own targetBinding left this pairing unenforced by schema (prose-only) - v2 (this schema) closes it. Not backported to operation-lock-v1 itself, which stays untouched.",
+          "if": { "properties": { "mode": { "const": "ssh" } } },
+          "then": { "properties": { "hostKeySha256": { "type": "string" } } },
+          "else": { "properties": { "hostKeySha256": { "const": null } } }
+        }
+      ]
+    }
+  }
+}

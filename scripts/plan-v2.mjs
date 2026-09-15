@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 
-import { sha256 } from "./digest.mjs";
+import { canonicalize, sha256 } from "./digest.mjs";
 import { buildPlan } from "./plan.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -142,27 +142,6 @@ export function buildPlanV2(options) {
   };
 
   return { ...plan, planId: computePlanId(plan) };
-}
-
-// A genuinely canonical JSON serialization - object keys sorted
-// recursively at every depth, array element order always preserved
-// (order there is semantically meaningful; key order in an object never
-// is). A further, 2026-08-31 review found the previous formula used
-// plain `JSON.stringify()` directly - insertion-order-dependent, not
-// actually canonical despite this function's own name and every caller
-// comment claiming otherwise - so two JSON documents with identical
-// content but differently ordered keys (a real possibility: a different
-// JS engine, a formatter, a hand-edit that preserves meaning but not key
-// order) would previously have hashed to two different planIds. Null and
-// every primitive pass through unchanged.
-function canonicalize(value) {
-  if (Array.isArray(value)) return value.map(canonicalize);
-  if (value !== null && typeof value === "object") {
-    const sorted = {};
-    for (const key of Object.keys(value).sort()) sorted[key] = canonicalize(value[key]);
-    return sorted;
-  }
-  return value;
 }
 
 // The exact, canonical planId computation - a plan-v2 document (or

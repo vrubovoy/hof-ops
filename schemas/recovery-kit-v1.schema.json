@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/recovery-kit-v1.schema.json",
+  "title": "Hof encrypted recovery kit",
+  "description": "The encrypted recovery copy of application/TLS/backup-destination secrets (ADR 0006), included in every real backup's staging tree and so in every destination's own snapshot. This document IS the portable envelope - self-contained, safe to copy off-site or hand to an operator, decryptable only with the separately-held private age identity, which this document never carries and never references beyond its own public recipient. contentInventory names only fixed, closed categories, never a secret's own name or value. restore-plan-v1's own recoveryKitDigest is the sha256 of this whole document's own canonical bytes; ciphertextDigest below is a narrower, independent check of the ciphertext property alone. This schema alone can only check ciphertext's own base64 alphabet, which any short plaintext string (a leaked password, say) trivially satisfies too - scripts/backup-flow.mjs's own verifyRecoveryKit() is the actual, pure verifier: it decodes ciphertext, confirms it begins with the real age-encryption.org/v1 binary-format magic header, recomputes ciphertextDigest, and recomputes ageRecipientFingerprint from ageRecipient. A document that is schema-valid here but fails verifyRecoveryKit() is never a real recovery kit, only a decoy shaped like one.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "apiVersion", "installationId", "createdAt", "createdForGeneration",
+    "ageRecipient", "ageRecipientFingerprint", "contentInventory", "ciphertextDigest", "ciphertext"
+  ],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/recovery-kit/v1" },
+    "installationId": { "type": "string", "minLength": 1 },
+    "createdAt": {
+      "description": "When this kit was produced - unlike a plan or policy id, a recovery kit is not content-addressed and legitimately carries a real timestamp (an operator rotating recovery kits needs to tell them apart).",
+      "type": "string",
+      "format": "date-time"
+    },
+    "createdForGeneration": {
+      "description": "The generation whose application/TLS/backup-destination secrets this kit actually encrypts - a kit is never silently reused across a generation boundary; a new one is produced whenever the secret set it covers changes.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "ageRecipient": {
+      "description": "The public age recipient this kit was encrypted to - a public key, safe to record here. The matching private age identity is never generated, stored, or transmitted by Hof; it stays entirely with the operator, external to every backup artifact.",
+      "type": "string",
+      "pattern": "^age1[a-z0-9]{58}$"
+    },
+    "ageRecipientFingerprint": {
+      "description": "sha256 of the raw ageRecipient string above, for an operator to cross-check a recipient at a glance without transcribing the full value.",
+      "$ref": "#/$defs/sha256"
+    },
+    "contentInventory": {
+      "description": "Which fixed categories of secret this kit's ciphertext actually contains - closed labels only, never a specific secretRef name, environment variable, or file path. At least one category; no duplicates.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["application-secrets", "tls-private-keys", "backup-destination-credentials"] }
+    },
+    "ciphertextDigest": {
+      "description": "sha256 of the ciphertext property's own decoded bytes - an independent integrity check of the ciphertext alone, distinct from restore-plan-v1's own recoveryKitDigest (which covers this entire document).",
+      "$ref": "#/$defs/sha256"
+    },
+    "ciphertext": {
+      "description": "The age-encrypted bytes themselves, base64-encoded - opaque without the external private age identity. Never plaintext, never a partial or diagnostic view of the plaintext. minLength is set well above any short plaintext string's own base64 length (a real age payload's own magic header, recipient stanza, MAC line, and actual ciphertext together are never this short) - not a substitute for scripts/backup-flow.mjs's own verifyRecoveryKit(), only a cheap first filter.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]+=*$",
+      "minLength": 200
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

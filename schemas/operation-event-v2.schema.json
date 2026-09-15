@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hof.dev/schemas/operation-event-v2.schema.json",
+  "title": "Hof operation event (v2, backup/restore only)",
+  "description": "One record of the append-only log a running backup or restore operation both streams to stdout (bounded NDJSON) and durably appends to its own operation-journal-v2 (ADR 0006). Scoped strictly to operationKind backup/restore, never apply (see operation-journal-v2.schema.json's own top-level description for why the whole v2 family is scoped this way) - exists only because backup and restore need a genuinely different resumability contract from apply's, not merely because operation-lock-v2/operation-journal-v2 happened to gain an operationKind field: operation-event-v1 (unchanged, still the only event schema apply ever produces) hard-codes apply's own all-or-nothing rule directly into its prose contract - an unresolved `started` blocks resume entirely, and `failed` is always fatal. ADR 0006 promises the opposite for the two new kinds: a backup may crash after `snapshot.create` succeeded for some destinations and not others, and must resume recognizing exactly which; a restore has exactly one privileged checkpoint (`checkpoint.data-restored`) and is otherwise safely restartable from nothing. This schema drops v1's own universal resumability verdict from its prose - which step+attempt is terminal versus resumable is instead decided by the journal's own operationKind-specific reconciliation (a later PR's executor), using this log purely as its evidence. `operationKind` also makes each stdout line self-describing on its own, without a reader cross-referencing the journal first, and lets a consumer confirm an event's own kind actually matches the journal/lock it claims to belong to.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "operationKind", "operationId", "step", "attempt", "phase", "at"],
+  "properties": {
+    "apiVersion": { "const": "hof.dev/operation-event/v2" },
+    "operationKind": {
+      "description": "Which of the two new state machines this event belongs to - never apply. Decides which plan schema `step` below is an id from (backup-plan-v1 for backup, restore-plan-v1 for restore) and which kind-specific reconciliation rules the journal applies to this event.",
+      "enum": ["backup", "restore"]
+    },
+    "operationId": {
+      "description": "The whole run this event belongs to - matches the run's own operation-journal-v2 and operation-lock-v2 operationId.",
+      "$ref": "#/$defs/operationId"
+    },
+    "step": {
+      "description": "The bound plan's own operation id this event is about (backup-plan-v1 or restore-plan-v1, per operationKind) - never a free-form message.",
+      "type": "string",
+      "pattern": "^[0-9]{3}\\.[a-z][a-z0-9.-]{0,80}$"
+    },
+    "attempt": {
+      "description": "1 for a step's first try; a resumed step that previously failed and is being retried increments this, never reuses attempt 1's own record.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "phase": {
+      "description": "started: about to run this step, before any target-side effect. succeeded: the step's own target-side effect completed and was confirmed. failed: the step did not complete - `error` is always present and sanitized. Unlike operation-event-v1, phase alone never determines resumability here - the journal's own operationKind-specific rules do (ADR 0006's own Failure semantics: a backup's `snapshot.create` failing for one destination never blocks retrying the others; a restore's failure before checkpoint.data-restored is safely restartable from nothing, after it never is).",
+      "enum": ["started", "succeeded", "failed"]
+    },
+    "destination": {
+      "description": "Only ever present for a backup-kind event about a per-destination step (snapshot.create, retention.apply) - which configured destination this attempt concerns, so a partial, per-destination failure is identifiable from the event stream alone, without cross-referencing the plan. Absent for every restore event, and absent for a backup event about a step that isn't destination-scoped. Same pattern as backup-plan-v1.schema.json's own $defs/destinationName (services-v1alpha1-compatible), since this always names a real, applied destination.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}$"
+    },
+    "at": { "type": "string", "format": "date-time" },
+    "error": {
+      "description": "Only for phase: failed - a short, sanitized diagnostic. Never a raw exception dump, a secret value, decrypted content, an environment variable's value, or an SSH private-key path.",
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "phase": { "const": "failed" } } },
+      "then": { "required": ["error"] },
+      "else": { "not": { "required": ["error"] } }
+    },
+    {
+      "description": "destination is required for a backup-kind event about a per-destination step (snapshot.create, retention.apply - the step id's own middle segment), and forbidden for every other event - restore, or a backup event about a non-destination-scoped step (maintenance.enter, staging.build, ...). The earlier draft only forbade it outside operationKind: backup, leaving it optional (and so silently droppable) on the very steps it exists for, and unconstrained (so smuggleable) on a backup event about an unrelated step - both real gaps a review round found.",
+      "if": {
+        "properties": {
+          "operationKind": { "const": "backup" },
+          "step": { "type": "string", "pattern": "\\.(snapshot\\.create|retention\\.apply)\\." }
+        }
+      },
+      "then": { "required": ["destination"] },
+      "else": { "not": { "required": ["destination"] } }
+    }
+  ],
+  "$defs": {
+    "operationId": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" }
+  }
+}

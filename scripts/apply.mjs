@@ -1356,7 +1356,14 @@ export async function runApply(options) {
     // them left a lock durably created with no journal at all, which
     // resume then had nothing to do but refuse forever, since it
     // requires an existing journal before it will trust anything.
-    const { acquired, lock: held } = await m.acquireLockAndJournal(mutateConn, lockDoc, journal);
+    //
+    // PR 2 (item 10) second review, high finding 2: executionLease?.token
+    // threaded through here too - without it, a holder that had already
+    // lost the physical mutex (self-expired, or explicitly released)
+    // could still create a brand new lock+journal pair on the target
+    // afterward, the same class of gap already closed for every other
+    // lease-gated write in this function.
+    const { acquired, lock: held } = await m.acquireLockAndJournal(mutateConn, lockDoc, journal, executionLease?.token);
     if (!acquired) {
       try {
         await assertLockValid(held);

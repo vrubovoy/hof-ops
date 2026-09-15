@@ -264,20 +264,20 @@ test("assertBundleBinding: a coherent restore bundle (plan alone) passes; routes
 const LEASE_TOKEN = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 
 // journals: a Map<operationId, journal> standing in for the real,
-// persisted target state writeJournalStatus() now reads fresh before
-// ever trusting a candidate - a test populates it to control what
-// "already on the target" looks like, independent of whatever candidate
-// object it happens to pass to writeJournalStatus() itself.
+// persisted target state writeJournalStatus()/writeEvent() now both
+// read fresh before ever trusting a candidate - a test populates it to
+// control what "already on the target" looks like, independent of
+// whatever the caller happens to pass to those functions itself.
 function fakeMutate({ journals = new Map() } = {}) {
   const calls = [];
   return {
     calls, journals,
-    async acquireLockAndJournal(conn, lockDoc, journalDoc) { calls.push(["acquireLockAndJournal", lockDoc, journalDoc]); return { acquired: true }; },
+    async acquireLockAndJournal(conn, lockDoc, journalDoc, leaseToken) { calls.push(["acquireLockAndJournal", lockDoc, journalDoc, leaseToken]); return { acquired: true }; },
     async readJournal(conn, operationId) {
       const journal = journals.get(operationId);
       return journal ? { status: "present", journal } : { status: "absent", journal: null };
     },
-    async updateJournalStatus(conn, journal, leaseToken) { calls.push(["updateJournalStatus", journal, leaseToken]); journals.set(journal.operationId, journal); },
+    async updateJournalStatus(conn, journal, leaseToken, expectedPreviousDocument) { calls.push(["updateJournalStatus", journal, leaseToken, expectedPreviousDocument]); journals.set(journal.operationId, journal); },
     async appendEvent(conn, operationId, event, leaseToken) { calls.push(["appendEvent", operationId, event, leaseToken]); },
   };
 }
@@ -316,6 +316,21 @@ test("writeLockAndJournal: refuses when no lease is given at all, or one missing
   const mutate = fakeMutate();
   await assert.rejects(() => writeLockAndJournal(mutate, {}, undefined, { operationKind: "backup", lockDoc: {}, journalDoc: {} }), /a real, active execution lease .* is required/);
   await assert.rejects(() => writeLockAndJournal(mutate, {}, { isLost: () => false }, { operationKind: "backup", lockDoc: {}, journalDoc: {} }), /a real, active execution lease .* is required/);
+  assert.equal(mutate.calls.length, 0);
+});
+
+// PR 2 review, High finding 3 (second round): a lease-SHAPED object with
+// no token at all used to pass assertLeaseHealthy() and quietly hand
+// `undefined` to the raw write, which target-mutate.mjs's own
+// leaseFencingScript() treats as "no lease concept, write unguarded" -
+// silently disabling every other fencing fix in this same review.
+test("writeLockAndJournal: refuses a lease exposing isLost/assertOwnership but no genuine token - never silently disables fencing by passing undefined through", async () => {
+  const mutate = fakeMutate();
+  const tokenlessLease = { isLost: () => false, lostReason: () => null, assertOwnership: async () => {} };
+  await assert.rejects(
+    () => writeLockAndJournal(mutate, {}, tokenlessLease, { operationKind: "backup", lockDoc: {}, journalDoc: {} }),
+    /exposes no token of its own/,
+  );
   assert.equal(mutate.calls.length, 0);
 });
 
@@ -380,11 +395,16 @@ test("writeLockAndJournal: a healthy lease and a coherent bundle reach the raw t
   assert.deepEqual(result, { acquired: true });
   assert.equal(assertOwnershipCalls.length, 1, "assertOwnership() must be awaited exactly once before the write");
   assert.equal(mutate.calls.length, 1);
-  assert.deepEqual(mutate.calls[0], ["acquireLockAndJournal", lockDoc, journalDoc]);
+  assert.deepEqual(mutate.calls[0], ["acquireLockAndJournal", lockDoc, journalDoc, LEASE_TOKEN]);
 });
 
-function realBackupJournal(overrides = {}) {
-  const plan = buildBackupPlan();
+// plan is its own, separate parameter (not folded into `overrides`) -
+// approvedPlanId/target/inputDigests must all be derived from whichever
+// plan is actually used, so a caller overriding `plan` (to build a
+// journal bound to a plan with different operations, say) can never
+// accidentally end up with a self-inconsistent journal (approvedPlanId
+// pointing at the DEFAULT plan while `plan` itself is the override).
+function realBackupJournal({ plan = buildBackupPlan(), ...overrides } = {}) {
   return buildJournalDocument({
     operationKind: "backup", operationId: OPERATION_ID, approvedPlanId: plan.planId, target: plan.target, plan,
     inputDigests: { releaseLockDigest: plan.releaseLockDigest, backupToolLockDigest: plan.backupToolLockDigest, backupPolicyId: plan.backupPolicyId },
@@ -451,97 +471,154 @@ test("writeJournalStatus: refuses a candidate whose own immutable field doesn't 
   assert.equal(mutate.calls.length, 0);
 });
 
-test("writeJournalStatus: a healthy lease and a genuinely valid continuation of the persisted journal reach the raw transport, carrying the lease's own token", async () => {
+test("writeJournalStatus: a healthy lease and a genuinely valid continuation of the persisted journal reach the raw transport, carrying the lease's own token AND the persisted document itself as the target-side CAS precondition", async () => {
   const journalDoc = await realBackupJournal();
   const plan = journalDoc.plan;
   const mutate = fakeMutate({ journals: new Map([[OPERATION_ID, journalDoc]]) });
   const succeeded = await withJournalStatus(journalDoc, { status: "succeeded" });
   await writeJournalStatus(mutate, {}, healthyLease(), { operationKind: "backup", journal: succeeded, bundle: { plan } });
   const writeCall = mutate.calls.find((c) => c[0] === "updateJournalStatus");
-  assert.deepEqual(writeCall, ["updateJournalStatus", succeeded, LEASE_TOKEN]);
+  // PR 2 review, High finding 4 (second round): the persisted document
+  // exactly as read - not the candidate, not something re-derived -
+  // must be passed through as target-mutate.mjs's own
+  // expectedPreviousDocument, so the actual read-compare-write happens
+  // atomically on the target, not as two independently racing JS round
+  // trips.
+  assert.deepEqual(writeCall, ["updateJournalStatus", succeeded, LEASE_TOKEN, journalDoc]);
+});
+
+// PR 2 review, High finding 4 (second round) - the real vulnerability:
+// a SECOND writer reading the same in-progress journal after the FIRST
+// one has already, genuinely landed its own transition. The first fix
+// (reading `persisted` once, comparing in JS) could not catch this by
+// itself, since the second call's own JS-side read/compare would run
+// against the FIRST caller's in-memory state, not what the target
+// itself already, actually holds a moment later - only passing the
+// exact `persisted` snapshot through as a target-side CAS precondition
+// (proven by the assertion above) closes it; this test just confirms
+// the wrapper's own contract - the SAME persisted object it just read
+// is what gets threaded through, not a re-fetched or reconstructed one.
+test("writeJournalStatus: threads the exact persisted snapshot it read through as the CAS precondition - not a re-derived or default one", async () => {
+  const journalDoc = await realBackupJournal();
+  const mutate = fakeMutate({ journals: new Map([[OPERATION_ID, journalDoc]]) });
+  let readCallCount = 0;
+  const realReadJournal = mutate.readJournal.bind(mutate);
+  mutate.readJournal = async (...args) => { readCallCount += 1; return realReadJournal(...args); };
+  const succeeded = await withJournalStatus(journalDoc, { status: "succeeded" });
+  await writeJournalStatus(mutate, {}, healthyLease(), { operationKind: "backup", journal: succeeded });
+  assert.equal(readCallCount, 1, "reads the persisted journal exactly once");
+  const writeCall = mutate.calls.find((c) => c[0] === "updateJournalStatus");
+  assert.deepEqual(writeCall[3], journalDoc, "the CAS precondition is exactly the document that was read, unmodified");
 });
 
 function realBackupEvent(overrides = {}) {
   return buildEvent({ operationKind: "backup", operationId: OPERATION_ID, step: "001.maintenance.enter.platform", attempt: 1, phase: "started", ...overrides });
 }
 
-test("writeEvent: refuses when the lease is lost, and refuses a schema-invalid event, before ever reaching the raw transport", async () => {
-  const plan = buildBackupPlan();
+test("writeEvent: refuses when the lease is lost, and refuses a schema-invalid event, before ever reading the persisted journal", async () => {
+  const journalDoc = await realBackupJournal();
   const event = await realBackupEvent();
-  const mutate = fakeMutate();
-  await assert.rejects(() => writeEvent(mutate, {}, lostLease(), { operationKind: "backup", operationId: OPERATION_ID, event, plan }), /execution lease for this target is no longer held/);
-  await assert.rejects(() => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event: { ...event, phase: "not-a-real-phase" }, plan }), /does not satisfy schemas\/operation-event-v2/);
+  const mutate = fakeMutate({ journals: new Map([[OPERATION_ID, journalDoc]]) });
+  await assert.rejects(() => writeEvent(mutate, {}, lostLease(), { operationKind: "backup", operationId: OPERATION_ID, event }), /execution lease for this target is no longer held/);
+  await assert.rejects(() => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event: { ...event, phase: "not-a-real-phase" } }), /does not satisfy schemas\/operation-event-v2/);
   assert.equal(mutate.calls.length, 0);
 });
 
-test("writeEvent: requires the plan, to bind the event's step/destination against it", async () => {
+// PR 2 review, High finding 5 (second round): writeEvent() no longer
+// accepts a `plan` parameter at all - the first fix's own `plan` was
+// still whatever the CALLER happened to pass, so a caller (or a bug)
+// could hand it a fabricated plan document containing exactly the
+// step/destination a fabricated event needed, and it would validate. It
+// now reads the persisted journal (the one this operationId's real
+// events file is actually for) and uses ITS OWN embedded plan instead -
+// this test confirms the "no persisted journal" case is refused, unlike
+// the old version's "no plan given" case.
+test("writeEvent: refuses when no persisted journal exists on the target to bind the event against", async () => {
   const event = await realBackupEvent();
-  const mutate = fakeMutate();
-  await assert.rejects(() => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event }), /requires the operation's own plan/);
+  const mutate = fakeMutate(); // empty - nothing persisted
+  await assert.rejects(() => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event }), /no persisted journal for operation .* was found on the target/);
   assert.equal(mutate.calls.length, 0);
 });
 
-// PR 2 review, High finding 4: the real vulnerability - an event whose
-// own operationId names a DIFFERENT operation than the one this write
-// is actually for. target-mutate.mjs's own appendEvent() targets the
-// events FILE purely from the `operationId` parameter, never from the
-// event body, so without this check an event claiming to belong to
-// operation A could be appended to operation B's own events file.
-test("writeEvent: refuses an event whose own operationId doesn't match the operationId this write is for - refuses operation-id substitution", async () => {
-  const plan = buildBackupPlan();
-  const event = await realBackupEvent({ operationId: "99999999-9999-9999-9999-999999999999" });
-  const mutate = fakeMutate();
+test("writeEvent: refuses when the persisted journal's own operationKind doesn't match this write's own operationKind", async () => {
+  const journalDoc = await realBackupJournal(); // operationKind: backup
+  const event = await realBackupEvent();
+  const mutate = fakeMutate({ journals: new Map([[OPERATION_ID, journalDoc]]) });
   await assert.rejects(
-    () => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event, plan }),
+    () => writeEvent(mutate, {}, healthyLease(), { operationKind: "restore", operationId: OPERATION_ID, event }),
+    /persisted journal's own operationKind .* does not match/,
+  );
+  assert.equal(mutate.calls.length, 0);
+});
+
+// PR 2 review, High finding 4 (first round) / High finding 5 (second
+// round): the real vulnerability - an event whose own operationId names
+// a DIFFERENT operation than the one this write is actually for.
+// target-mutate.mjs's own appendEvent() targets the events FILE purely
+// from the `operationId` parameter, never from the event body, so
+// without this check an event claiming to belong to operation A could
+// be appended to operation B's own events file.
+test("writeEvent: refuses an event whose own operationId doesn't match the operationId this write is for - refuses operation-id substitution", async () => {
+  const journalDoc = await realBackupJournal();
+  const event = await realBackupEvent({ operationId: "99999999-9999-9999-9999-999999999999" });
+  const mutate = fakeMutate({ journals: new Map([[OPERATION_ID, journalDoc]]) });
+  await assert.rejects(
+    () => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event }),
     /does not match the operationId this write is for/,
   );
   assert.equal(mutate.calls.length, 0);
 });
 
-test("writeEvent: refuses an event whose own operationKind doesn't match this write's own operationKind", async () => {
-  const restorePlan = buildRestorePlan();
-  const event = await buildEvent({ operationKind: "restore", operationId: OPERATION_ID, step: "001.runner.install.runner", attempt: 1, phase: "started" });
-  const mutate = fakeMutate();
+test("writeEvent: refuses an event whose own operationKind doesn't match this write's own operationKind, even when the persisted journal's own operationKind does match", async () => {
+  const journalDoc = await realBackupJournal(); // operationKind: backup
+  const event = await buildEvent({ operationKind: "restore", operationId: OPERATION_ID, step: "001.maintenance.enter.platform", attempt: 1, phase: "started" });
+  const mutate = fakeMutate({ journals: new Map([[OPERATION_ID, journalDoc]]) });
   await assert.rejects(
-    () => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event, plan: restorePlan }),
+    () => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event }),
     /event\.operationKind .* does not match/,
   );
   assert.equal(mutate.calls.length, 0);
 });
 
-test("writeEvent: refuses an event naming a step that isn't part of the plan's own operations", async () => {
-  const plan = buildBackupPlan();
-  // Schema-valid step id shape, but not one of this plan's own operations.
+// PR 2 review, High finding 5 (second round)'s own core scenario: even
+// with a genuine, persisted journal on the target, an event naming a
+// step that isn't part of THAT journal's own real, approved plan is
+// refused - never validated against a plan the caller merely asserts.
+test("writeEvent: refuses an event naming a step that isn't part of the persisted journal's own plan operations", async () => {
+  const journalDoc = await realBackupJournal();
+  // Schema-valid step id shape, but not one of this journal's own plan's operations.
   const event = await realBackupEvent({ step: "099.evidence.write.nowhere" });
-  const mutate = fakeMutate();
+  const mutate = fakeMutate({ journals: new Map([[OPERATION_ID, journalDoc]]) });
   await assert.rejects(
-    () => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event, plan }),
-    /is not part of the plan's own operations/,
+    () => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event }),
+    /is not part of the persisted journal's own plan operations/,
   );
   assert.equal(mutate.calls.length, 0);
 });
 
-test("writeEvent: refuses an event whose own destination doesn't match the plan's step for a per-destination action", async () => {
-  const plan = buildBackupPlan({
-    operations: [
-      ...fullBackupOperations().slice(0, 3),
-      { id: "004.snapshot.create.onsite", phase: "snapshot", action: "snapshot.create", resource: "onsite", destination: "onsite", reason: "snapshot to onsite" },
-    ],
+test("writeEvent: refuses an event whose own destination doesn't match the persisted journal's own plan step for a per-destination action", async () => {
+  const journalDoc = await realBackupJournal({
+    plan: buildBackupPlan({
+      operations: [
+        ...fullBackupOperations().slice(0, 3),
+        { id: "004.snapshot.create.onsite", phase: "snapshot", action: "snapshot.create", resource: "onsite", destination: "onsite", reason: "snapshot to onsite" },
+      ],
+    }),
   });
   const event = await realBackupEvent({ step: "004.snapshot.create.onsite", destination: "offsite" });
-  const mutate = fakeMutate();
+  const mutate = fakeMutate({ journals: new Map([[OPERATION_ID, journalDoc]]) });
   await assert.rejects(
-    () => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event, plan }),
-    /event\.destination .* does not match the plan's own step/,
+    () => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event }),
+    /event\.destination .* does not match the persisted journal's own plan step/,
   );
   assert.equal(mutate.calls.length, 0);
 });
 
-test("writeEvent: a healthy lease and a genuinely plan-bound event reach the raw transport, carrying the lease's own token", async () => {
-  const plan = buildRestorePlan();
-  const event = await buildEvent({ operationKind: "restore", operationId: OPERATION_ID, step: "001.runner.install.runner", attempt: 1, phase: "started" });
-  const mutate = fakeMutate();
-  await writeEvent(mutate, {}, healthyLease(), { operationKind: "restore", operationId: OPERATION_ID, event, plan });
+test("writeEvent: a healthy lease and a genuinely plan-bound event (bound against the PERSISTED journal's own plan) reach the raw transport, carrying the lease's own token", async () => {
+  const journalDoc = await realBackupJournal();
+  const event = await realBackupEvent();
+  const mutate = fakeMutate({ journals: new Map([[OPERATION_ID, journalDoc]]) });
+  await writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event });
   assert.equal(mutate.calls.length, 1);
   assert.deepEqual(mutate.calls[0], ["appendEvent", OPERATION_ID, event, LEASE_TOKEN]);
 });

@@ -1322,7 +1322,29 @@ test("acquireMutex: a real target-side self-expiry once heartbeats genuinely sto
   // The unit gave up its own flock on its own - a fresh acquisition now
   // succeeds without anything external ever having touched the target.
   const fresh = await acquireMutex(conn);
-  await fresh.release();
+  try {
+    // PR 2 (item 10) second review, Medium finding 6: real fenced
+    // append/status from the OLD (now-expired, now-superseded) token,
+    // after a genuine handoff to a new holder - not merely a mocked
+    // response. `stuck`'s own token is stale twice over now (its own
+    // unit self-expired, AND a completely different acquisition already
+    // holds the real mutex) - a real appendEvent() carrying it must be
+    // refused by the target itself, never silently accepted.
+    const eventOperationId = randomUUID();
+    const staleEvent = { apiVersion: "hof.dev/operation-event/v1", operationId: eventOperationId, step: "001.host.prepare", attempt: 1, phase: "started", at: new Date().toISOString() };
+    await assert.rejects(
+      () => appendEvent(conn, eventOperationId, staleEvent, stuck.token),
+      /execution lease no longer matches this write's own token/,
+      "a write carrying the old, expired-and-superseded token must be refused by the real target, not silently accepted",
+    );
+    // The CURRENT holder's own token, by contrast, is genuinely accepted -
+    // confirming the refusal above is real fencing, not a broken write path.
+    await appendEvent(conn, eventOperationId, staleEvent, fresh.token);
+    const written = await onTarget("cat", `/var/lib/hof/state/journal/${eventOperationId}.events.ndjson`);
+    assert.deepEqual(JSON.parse(written.trim()), staleEvent, "the current holder's own token must genuinely succeed in writing to the real target");
+  } finally {
+    await fresh.release();
+  }
 });
 
 // PR 2 (item 10): the execution lease/mutex is no longer a long-lived

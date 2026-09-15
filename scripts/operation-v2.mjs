@@ -244,23 +244,40 @@ export function assertBundleBinding(operationKind, bundle) {
 // apply.mjs's own dispatch loop already does for v1 (fail-closed, see
 // target-mutate.mjs's own acquireMutex() comment).
 
-// PR 2 review, High finding 5: this used to accept `lease?.isLost?.()`
-// - if `lease` were undefined, or any object lacking an isLost method,
-// optional chaining silently evaluated to undefined (falsy), and this
-// function returned normally as if the lease were healthy. A caller
-// that forgot to pass a lease at all - or passed something that merely
-// LOOKED like one - sailed straight through with no lease check
-// whatsoever. Now requires a real lease object exposing both isLost AND
-// assertOwnership, and always calls assertOwnership() FIRST - a fresh,
-// real round trip immediately before this write, not the possibly-
-// stale cached flag isLost() alone reflects (isLost() only updates when
-// something - the background heartbeat interval, or an explicit
-// assertOwnership() call - last happened to check; a lease genuinely
-// lost in between is invisible to a bare isLost() read until something
-// checks again).
+// PR 2 review, High finding 5 (first round): this used to accept
+// `lease?.isLost?.()` - if `lease` were undefined, or any object lacking
+// an isLost method, optional chaining silently evaluated to undefined
+// (falsy), and this function returned normally as if the lease were
+// healthy. A caller that forgot to pass a lease at all - or passed
+// something that merely LOOKED like one - sailed straight through with
+// no lease check whatsoever. Now requires a real lease object exposing
+// isLost, assertOwnership, AND a genuine token, and always calls
+// assertOwnership() FIRST - a fresh, real round trip immediately before
+// this write, not the possibly-stale cached flag isLost() alone
+// reflects (isLost() only updates when something - the background
+// heartbeat interval, or an explicit assertOwnership() call - last
+// happened to check; a lease genuinely lost in between is invisible to
+// a bare isLost() read until something checks again).
+//
+// PR 2 review, High finding 3 (second round): the token requirement was
+// missing entirely from this first fix - a tokenless, lease-SHAPED
+// object (isLost/assertOwnership present, but no token at all) still
+// passed this check, and the raw target-mutate.mjs write then received
+// `undefined` as its own leaseToken parameter - which that module's own
+// leaseFencingScript() deliberately treats as "no lease concept at all,
+// proceed unguarded" (see its own comment: this is intentional for
+// callers with genuinely no lease concept). A caller here DOES have a
+// lease concept - it just forgot the token - so silently falling
+// through to "unguarded" defeats every other fencing fix in this same
+// review. Checked explicitly now, distinctly from the isLost/
+// assertOwnership shape check, so the error names exactly what's
+// missing.
 async function assertLeaseHealthy(lease) {
   if (!lease || typeof lease.isLost !== "function" || typeof lease.assertOwnership !== "function") {
     throw new Error("refusing to write: a real, active execution lease (exposing isLost/assertOwnership) is required - none was given");
+  }
+  if (typeof lease.token !== "string" || lease.token.length === 0) {
+    throw new Error("refusing to write: the given lease exposes no token of its own - target-side fencing would silently be disabled for this write, refusing rather than writing unguarded");
   }
   await lease.assertOwnership();
   if (lease.isLost()) {
@@ -273,13 +290,19 @@ async function assertLeaseHealthy(lease) {
 // buildJournalDocument above) and their own bundle binding against
 // `bundle` (the rest of the operation's own known documents - typically
 // at minimum { policy?, plan } for a fresh backup, or { plan, manifest }
-// for a fresh restore) before ever reaching the raw transport.
+// for a fresh restore) before ever reaching the raw transport. The
+// create itself is target-side fenced by lease.token too (PR 2 review,
+// high finding 2, second round) - target-mutate.mjs's own
+// acquireLockAndJournalScript() now takes the same leaseFencingScript()
+// gate every other lease-gated write already had, closing the gap where
+// a holder that had already lost the physical mutex could still create
+// a brand new lock+journal pair.
 export async function writeLockAndJournal(mutate, conn, lease, { operationKind, lockDoc, journalDoc, bundle = {} }) {
   await assertLeaseHealthy(lease);
   await assertLockValid(lockDoc);
   await assertJournalValid(journalDoc);
   assertBundleBinding(operationKind, { ...bundle, plan: journalDoc.plan, lock: lockDoc, journal: journalDoc });
-  return mutate.acquireLockAndJournal(conn, lockDoc, journalDoc);
+  return mutate.acquireLockAndJournal(conn, lockDoc, journalDoc, lease.token);
 }
 
 // Every field a v2 journal carries except status/committedGeneration -
@@ -287,19 +310,26 @@ export async function writeLockAndJournal(mutate, conn, lease, { operationKind, 
 // committedGeneration" description.
 const IMMUTABLE_JOURNAL_FIELDS = ["apiVersion", "operationKind", "operationId", "approvedPlanId", "target", "plan", "inputDigests", "startedAt"];
 
-// PR 2 review, High finding 3: this used to validate only the
-// CANDIDATE document's own schema/bundle-binding and write it straight
-// through - nothing here ever compared it against what is ACTUALLY,
-// currently persisted on the target, so a caller passing a stale or
-// tampered candidate (an already-terminal journal rewritten again, or
-// one field's own value quietly drifted from the real record) would
-// simply overwrite it. Now reads the real, persisted journal fresh
-// (under the same lease this write is about to use), confirms it is
-// not already terminal, and confirms the candidate is byte-for-byte
-// identical to it on every field except status/committedGeneration -
-// only THEN does the write reach the raw transport. `journal` is the
-// FULL candidate document (already produced by withJournalStatus()
-// above, or equivalent).
+// PR 2 review, High finding 3 (first round) / High finding 4 (second
+// round): the first fix read the persisted journal and validated a
+// candidate transition against it in JS, then wrote separately - two
+// round trips with a real, independently reachable gap between them: a
+// second, concurrent writeJournalStatus() call could read the SAME
+// persisted (in-progress) journal, also pass this exact validation, and
+// then whichever of the two writes reaches the target SECOND would
+// silently overwrite the first's own genuinely-landed transition
+// (including a terminal one) - the lease.token fencing alone doesn't
+// close this, since both callers could legitimately be holding the
+// SAME lease sequentially, or this could simply be a caller bug, not an
+// adversarial one. Closed for real now: `persisted` (read fresh here)
+// is passed straight through to target-mutate.mjs's own
+// updateJournalStatus() as its own expectedPreviousDocument - the
+// actual read-compare-write for "is the target still exactly what I
+// last saw" now happens atomically, on the target, immediately before
+// the write, under the same flock guard - not as two independently
+// racing JS-orchestrated round trips. A second writer's own attempt
+// after the first already landed gets a clean HOF_MUTATE_CAS_CONFLICT
+// refusal instead of silently clobbering it.
 export async function writeJournalStatus(mutate, conn, lease, { operationKind, journal, bundle = {} }) {
   await assertLeaseHealthy(lease);
   await assertJournalValid(journal);
@@ -319,26 +349,36 @@ export async function writeJournalStatus(mutate, conn, lease, { operationKind, j
   }
 
   assertBundleBinding(operationKind, { ...bundle, plan: journal.plan, journal });
-  return mutate.updateJournalStatus(conn, journal, lease.token);
+  return mutate.updateJournalStatus(conn, journal, lease.token, persisted);
 }
 
-// PR 2 review, High finding 4: this used to append whatever `event` it
-// was given under the caller-supplied `operationId`, with no check that
-// the two actually agreed - a caller (or a bug) could hand this an
-// event whose own operationId field names a DIFFERENT operation than
-// the one whose events file it is about to be appended to (target-
-// mutate.mjs's own appendEvent() targets the path purely from the
-// `operationId` parameter, never from the event body). Also never
-// checked the event's own step (and, for a per-destination step, its
-// destination) against the plan it actually belongs to, so a fabricated
-// event for a step that isn't even part of the plan could be appended
-// without complaint. `plan` is now required - the same full plan
-// document this operation's own journal already embeds.
-export async function writeEvent(mutate, conn, lease, { operationKind, operationId, event, plan }) {
+// PR 2 review, High finding 4 (first round) / High finding 5 (second
+// round): the first fix required a `plan` parameter and bound the
+// event's step/destination against it - but still trusted whatever
+// plan object the CALLER happened to pass, with nothing tying it to the
+// real, approved plan this operation is actually bound to. A caller (or
+// a bug) could pass a fabricated plan document containing exactly the
+// step/destination the fabricated event needed, and this would happily
+// validate a schema-valid event for a step that was never really part
+// of the real, approved operation. Closed for real now: `plan` is no
+// longer accepted as a parameter at all - this reads the persisted
+// journal (the same one appendEvent()'s own operationId targets) and
+// uses ITS OWN embedded plan, the one actually bound to this operation
+// by writeLockAndJournal() at creation time and never rewritable since
+// (operation-journal-v2.schema.json's own immutability, enforced by
+// withJournalStatus()/writeJournalStatus() above) - not anything a
+// caller can substitute.
+export async function writeEvent(mutate, conn, lease, { operationKind, operationId, event }) {
   await assertLeaseHealthy(lease);
   await assertEventValid(event);
-  if (!plan) {
-    throw new Error("refusing to write: writeEvent requires the operation's own plan, to bind the event's step (and destination, if any) against it");
+
+  const { status: readStatus, journal: persisted } = await mutate.readJournal(conn, operationId);
+  if (readStatus !== "present") {
+    throw new Error(`refusing to write: no persisted journal for operation ${operationId} was found on the target to bind this event against`);
+  }
+  await assertJournalValid(persisted);
+  if (persisted.operationKind !== operationKind) {
+    throw new Error(`refusing to write: the persisted journal's own operationKind (${persisted.operationKind}) does not match this write's own operationKind (${operationKind})`);
   }
   if (event.operationId !== operationId) {
     throw new Error(`refusing to write: event.operationId (${event.operationId}) does not match the operationId this write is for (${operationId}) - refusing a possible operation-id substitution`);
@@ -346,12 +386,12 @@ export async function writeEvent(mutate, conn, lease, { operationKind, operation
   if (event.operationKind !== operationKind) {
     throw new Error(`refusing to write: event.operationKind (${event.operationKind}) does not match this write's own operationKind (${operationKind})`);
   }
-  const step = plan.operations.find((operation) => operation.id === event.step);
+  const step = persisted.plan.operations.find((operation) => operation.id === event.step);
   if (!step) {
-    throw new Error(`refusing to write: event names step "${event.step}", which is not part of the plan's own operations`);
+    throw new Error(`refusing to write: event names step "${event.step}", which is not part of the persisted journal's own plan operations`);
   }
   if (event.destination !== undefined && event.destination !== step.destination) {
-    throw new Error(`refusing to write: event.destination (${event.destination}) does not match the plan's own step ${event.step}'s destination (${step.destination ?? "none"})`);
+    throw new Error(`refusing to write: event.destination (${event.destination}) does not match the persisted journal's own plan step ${event.step}'s destination (${step.destination ?? "none"})`);
   }
   return mutate.appendEvent(conn, operationId, event, lease.token);
 }

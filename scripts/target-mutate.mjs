@@ -257,8 +257,18 @@ fi`;
 // script, moments earlier. If the lock step still somehow fails (target
 // already locked by another operation), the just-created journal is
 // rolled back - it was never actually claimed by anything.
-function acquireLockAndJournalScript(lockPayload, journalTargetPath, journalPayload) {
-  return withLockGuard(`lock_payload='${lockPayload}'
+// leaseToken (optional): PR 2 (item 10) second review, high finding 2 -
+// without this, a holder that already lost the physical mutex (self-
+// expired, or explicitly released) could still create a brand new
+// lock+journal pair afterward, since nothing here ever checked whether
+// the caller was still the genuine mutex owner. Fenced the same way
+// every other lease-gated write already is - see leaseFencingScript()'s
+// own comment - and, since this already runs inside withLockGuard(),
+// costs nothing extra to add: the SAME critical section that now also
+// serializes every owner-record read/write (acquireMutex()'s own held
+// script, heartbeat, and release all take this identical guard).
+function acquireLockAndJournalScript(leaseToken, lockPayload, journalTargetPath, journalPayload) {
+  return withLockGuard(`${leaseFencingScript(leaseToken)}lock_payload='${lockPayload}'
 journal_payload='${journalPayload}'
 ${atomicExclusiveCreateStep(journalTargetPath, "journal_payload", "journal_created")}
 if [ "$journal_created" != 1 ]; then
@@ -380,9 +390,10 @@ export async function acquireLock(conn, lockDocument) {
 // with no journal. Journal-first removes that specific window
 // structurally, not just probabilistically - see the script's own
 // comment for why.
-export async function acquireLockAndJournal(conn, lockDocument, journalDocument) {
-  const stdout = await runScript(conn, acquireLockAndJournalScript(b64(lockDocument), journalPath(journalDocument.operationId), b64(journalDocument)));
+export async function acquireLockAndJournal(conn, lockDocument, journalDocument, leaseToken) {
+  const stdout = await runScript(conn, acquireLockAndJournalScript(leaseToken, b64(lockDocument), journalPath(journalDocument.operationId), b64(journalDocument)));
   const [tag, ...rest] = stdout.split("\n");
+  if (tag === "HOF_MUTATE_LEASE_MISMATCH") throw new Error(`refusing to create lock/journal for operation ${journalDocument.operationId}: the execution lease no longer matches this write's own token on the target - another process may now hold it, or it has already self-expired`);
   if (tag === "HOF_MUTATE_CREATED") return { acquired: true };
   if (tag === "HOF_MUTATE_EXISTS") return { acquired: false, lock: rest.join("\n").trim() ? JSON.parse(rest.join("\n")) : null };
   if (tag === "HOF_MUTATE_JOURNAL_CONFLICT") throw new Error(`a journal for operation ${journalDocument.operationId} already existed on the target even though its lock did not - structurally impossible for a freshly generated operationId, points at real target-side corruption; the lock write was rolled back`);
@@ -525,9 +536,34 @@ export async function readGenerationSnapshotReleaseLock(conn, generation) {
 // check alone cannot (a lease lost strictly between that check and this
 // write actually reaching the target). Omitted only by a caller with no
 // lease concept of its own.
-export async function updateJournalStatus(conn, journalDocument, leaseToken) {
+//
+// expectedPreviousDocument (optional): PR 2 (item 10) second review,
+// high finding 4 - a caller (operation-v2.mjs's own writeJournalStatus())
+// typically reads the persisted journal, validates a candidate
+// transition against it in JS, and only THEN calls this - two separate
+// round trips, with a real gap between them where a DIFFERENT writer
+// could land its own transition first. leaseToken alone does not close
+// this (both writers could legitimately hold the SAME lease sequentially,
+// or this could simply be a caller bug) - a real compare-and-swap does:
+// when given, the write proceeds only if the target's CURRENT content at
+// this exact targetPath is still byte-for-byte identical to
+// expectedPreviousDocument, checked atomically, under this same flock
+// guard, immediately before the write - if anything already changed it,
+// this refuses with HOF_MUTATE_CAS_CONFLICT rather than blindly
+// overwriting whatever is actually there now.
+function journalCasCheckScript(targetPath, expectedPreviousDocument) {
+  if (expectedPreviousDocument === undefined) return "";
+  return `expected_payload='${b64(expectedPreviousDocument)}'
+if [ ! -r '${targetPath}' ] || [ "$(cat '${targetPath}')" != "$(printf '%s' "$expected_payload" | base64 -d)" ]; then
+  echo HOF_MUTATE_CAS_CONFLICT
+  exit 0
+fi
+`;
+}
+
+export async function updateJournalStatus(conn, journalDocument, leaseToken, expectedPreviousDocument) {
   const targetPath = journalPath(journalDocument.operationId);
-  const script = withLockGuard(`${leaseFencingScript(leaseToken)}payload='${b64(journalDocument)}'
+  const script = withLockGuard(`${leaseFencingScript(leaseToken)}${journalCasCheckScript(targetPath, expectedPreviousDocument)}payload='${b64(journalDocument)}'
 tmp=$(mktemp '${targetPath}.XXXXXX')
 printf '%s' "$payload" | base64 -d > "$tmp"
 mv -f "$tmp" '${targetPath}'
@@ -535,6 +571,7 @@ echo HOF_MUTATE_UPDATED`);
   const stdout = await runScript(conn, script);
   const tag = stdout.split("\n")[0];
   if (tag === "HOF_MUTATE_LEASE_MISMATCH") throw new Error(`refusing to update the journal for operation ${journalDocument.operationId}: the execution lease no longer matches this write's own token on the target - another process may now hold it, or it has already self-expired`);
+  if (tag === "HOF_MUTATE_CAS_CONFLICT") throw new Error(`refusing to update the journal for operation ${journalDocument.operationId}: the persisted document on the target no longer matches what was last read - another writer already landed a different transition first`);
   if (tag !== "HOF_MUTATE_UPDATED") throw new Error(`unexpected target-mutate response: ${JSON.stringify(stdout)}`);
 }
 
@@ -679,20 +716,45 @@ export async function acquireMutex(conn) {
   // The held unit's own script - never wrapped in an outer single-quoted
   // /bin/sh -c argument that also contains single quotes of its own (a
   // real quoting hazard): every literal this embeds (the fixed lease/
-  // owner paths, the token, the two bounds) is quote-free by
+  // owner/guard paths, the token, the two bounds) is quote-free by
   // construction (no spaces, no shell metacharacters), so the whole
   // thing can be safely wrapped in a single pair of outer single quotes
   // by acquireMutexScript() below without any nested-quote escaping.
+  //
+  // PR 2 (item 10) second review, critical finding 1: the ORIGINAL
+  // version of this script wrote the owner record (`printf ... >
+  // OWNER_PATH`) with no guard at all, and - the real, always-
+  // reproducible bug, not a narrow timing race - its self-expiry branch
+  // was a bare `exit 0`: it never cleared the owner record at all. A
+  // stale token therefore stayed "fencing-valid" on the target FOREVER
+  // after the unit that wrote it had already self-expired and exited
+  // (releasing the real flock) - any delayed write still carrying that
+  // token would pass the fencing check in leaseFencingScript() even
+  // though nothing was actually holding the mutex any more. Fixed: fd 8
+  // (LOCK_GUARD_PATH, the SAME guard every fenced write already takes -
+  // see leaseFencingScript()'s own comment) now serializes every single
+  // read-or-write of the owner record this unit ever performs - the
+  // initial write (only after flock -n -x 9 on fd 9 has genuinely
+  // succeeded) and, critically, the self-expiry branch now actually
+  // REMOVES the owner record before exiting, under that same guard, so
+  // a fencing check run after self-expiry sees an absent owner record
+  // (leaseFencingScript()'s own `[ ! -r OWNER_PATH ]` branch) rather
+  // than a stale, still-matching token.
   const heldScript = [
     `exec 9>${EXECUTION_LEASE_PATH}`,
     "if flock -n -x 9; then",
+    `exec 8>${LOCK_GUARD_PATH}`,
+    "flock -x 8",
     "umask 077",
     `printf %s ${token} > ${EXECUTION_LEASE_OWNER_PATH}`,
+    "flock -u 8",
     "while :; do",
     `sleep ${LEASE_SELF_CHECK_INTERVAL_S}`,
-    `mtime=$(stat -c %Y ${EXECUTION_LEASE_OWNER_PATH} 2>/dev/null) || exit 0`,
+    "flock -x 8",
+    `mtime=$(stat -c %Y ${EXECUTION_LEASE_OWNER_PATH} 2>/dev/null) || { flock -u 8; exit 0; }`,
     "now=$(date +%s)",
-    `[ $((now - mtime)) -gt ${LEASE_HEARTBEAT_TIMEOUT_S} ] && exit 0`,
+    `if [ $((now - mtime)) -gt ${LEASE_HEARTBEAT_TIMEOUT_S} ]; then rm -f ${EXECUTION_LEASE_OWNER_PATH}; flock -u 8; exit 0; fi`,
+    "flock -u 8",
     "done",
     "else",
     "exit 1",
@@ -721,6 +783,23 @@ export async function acquireMutex(conn) {
   // unit's own later "failed" state (the losing branch's `exit 1`,
   // reached once its own flock -n -x has genuinely resolved negatively)
   // is trusted as proof of loss.
+  //
+  // This poll's own `cat` of the owner record deliberately does NOT take
+  // the LOCK_GUARD_PATH guard heldScript's own write (and every fenced
+  // write/expiry/release) now does - not an oversight, a real, checked
+  // property: the write is a single `printf '%s' TOKEN > FILE`, one
+  // write() syscall for a fixed ~36-byte token, which is atomic at the
+  // filesystem level for a regular file this small - a concurrent,
+  // unguarded reader can only ever observe either the FULL old content,
+  // the FULL new content, or (during the `>` redirection's own initial
+  // truncate) an EMPTY file; it can never observe a torn, partial token
+  // that happens to coincidentally equal this acquisition's own real
+  // token. The comparison below is therefore never a false POSITIVE
+  // (only ever a false negative - "not yet visible, keep polling" -
+  // which the loop already handles correctly), so guarding this
+  // particular read buys no additional correctness, only extra round
+  // trips on every one of up to LEASE_ACQUIRE_POLL_ATTEMPTS poll
+  // iterations.
   const acquireScript = `set -eu
 mkdir -p "$(dirname '${EXECUTION_LEASE_PATH}')"
 systemd-run --unit='${unit}' --quiet -- /bin/sh -c '${heldScript}' >/dev/null 2>&1
@@ -782,6 +861,18 @@ echo HOF_LEASE_TIMEOUT
   // (see heldScript above) - a passive read-only check here would let
   // the unit expire out from under a caller that dutifully polled
   // isLost() but never actually refreshed liveness on the target.
+  //
+  // PR 2 (item 10) second review, critical finding 1: the check-and-
+  // touch here now also runs under the SAME LOCK_GUARD_PATH guard
+  // heldScript's own self-check loop takes - without it, a heartbeat
+  // landing at EXACTLY the wrong instant (heldScript has already read a
+  // stale mtime and decided to expire, but hasn't yet removed the owner
+  // record) could touch the file a moment before heldScript's own `rm`
+  // still ran anyway - a legitimate, just-arrived heartbeat silently
+  // lost to a self-expiry decision already made. Serializing both
+  // through fd 8 makes "read mtime, decide, clear" (heldScript) and
+  // "verify token, touch" (here) strictly ordered relative to each
+  // other, never interleaved.
   async function assertOwnership() {
     // Once a loss is already known (voluntary release, or a prior
     // assertOwnership()/background-interval tick already found it gone),
@@ -797,10 +888,14 @@ if [ "$state" != active ]; then
   echo HOF_LEASE_LOST
   exit 0
 fi
+exec 8>'${LOCK_GUARD_PATH}'
+flock -x 8
 if [ -r '${EXECUTION_LEASE_OWNER_PATH}' ] && [ "$(cat '${EXECUTION_LEASE_OWNER_PATH}')" = '${token}' ]; then
   touch '${EXECUTION_LEASE_OWNER_PATH}'
+  flock -u 8
   echo HOF_LEASE_OK
 else
+  flock -u 8
   echo HOF_LEASE_LOST
 fi
 `);
@@ -828,14 +923,26 @@ fi
     // nothing heartbeats it again, so a failed release here degrades to
     // "a later --resume waits out the same bound a genuine crash
     // would", never to a permanently stuck mutex.
+    //
+    // PR 2 (item 10) second review, critical finding 1: this check-
+    // then-clear now also runs under the same LOCK_GUARD_PATH guard as
+    // every other owner-record operation - see this function's own
+    // sibling comments (heldScript above, assertOwnership() above) for
+    // why a shared guard is what actually makes the whole owner-record
+    // lifecycle (write, heartbeat-touch, self-expiry-clear, release-
+    // clear) mutually exclusive, not merely "usually fast enough".
     try {
       await runScript(scriptConn, `set -eu
+exec 8>'${LOCK_GUARD_PATH}'
+flock -x 8
 if [ -r '${EXECUTION_LEASE_OWNER_PATH}' ] && [ "$(cat '${EXECUTION_LEASE_OWNER_PATH}')" = '${token}' ]; then
   rm -f '${EXECUTION_LEASE_OWNER_PATH}'
+  flock -u 8
   systemctl stop '${unit}.service' >/dev/null 2>&1 || true
   systemctl reset-failed '${unit}.service' >/dev/null 2>&1 || true
   echo HOF_LEASE_RELEASED
 else
+  flock -u 8
   echo HOF_LEASE_MISMATCH
 fi
 `);

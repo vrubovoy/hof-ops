@@ -160,6 +160,36 @@ test("acquireLockAndJournal: a structurally-impossible journal conflict (lock ab
   );
 });
 
+// PR 2 (item 10) second review, high finding 2: a holder that already
+// lost the physical mutex (self-expired, or explicitly released) could
+// still create a brand new lock+journal pair afterward - nothing here
+// ever checked whether the caller was still the genuine mutex owner.
+const LEASE_TOKEN = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
+test("acquireLockAndJournal: with a leaseToken, embeds the same real target-side fencing check as updateJournalStatus/appendEvent, inside the same flock guard", async () => {
+  const { run, calls } = mockRun({ sshStdout: "HOF_MUTATE_CREATED\n" });
+  await acquireLockAndJournal({ ...SSH_TARGET, run }, { operationId: OPERATION_ID }, { operationId: OPERATION_ID, status: "in-progress" }, LEASE_TOKEN);
+  const script = calls.find((c) => c.command === "ssh").input;
+  assert.match(script, /flock -x 9/);
+  assert.match(script, /exec\.lease\.owner/);
+  assert.match(script, new RegExp(`!= '${LEASE_TOKEN}'`));
+});
+
+test("acquireLockAndJournal: a real HOF_MUTATE_LEASE_MISMATCH response is refused with a clear, distinct error - never silently creates a lock/journal for a lease that's already gone", async () => {
+  const { run } = mockRun({ sshStdout: "HOF_MUTATE_LEASE_MISMATCH\n" });
+  await assert.rejects(
+    () => acquireLockAndJournal({ ...SSH_TARGET, run }, { operationId: OPERATION_ID }, { operationId: OPERATION_ID, status: "in-progress" }, LEASE_TOKEN),
+    /execution lease no longer matches this write's own token/,
+  );
+});
+
+test("acquireLockAndJournal: without a leaseToken, the script carries no fencing check at all - unchanged from before this review", async () => {
+  const { run, calls } = mockRun({ sshStdout: "HOF_MUTATE_CREATED\n" });
+  await acquireLockAndJournal({ ...SSH_TARGET, run }, { operationId: OPERATION_ID }, { operationId: OPERATION_ID, status: "in-progress" });
+  const script = calls.find((c) => c.command === "ssh").input;
+  assert.doesNotMatch(script, /exec\.lease\.owner/);
+});
+
 test("acquireLockAndJournal: an orphaned hard-linked temp file left by a crashed prior attempt never corrupts an already-live lock", async () => {
   // A further, 2026-08-31 review found the fixed `targetPath.tmp` name
   // this used to reuse was itself a real corruption path: if a PRIOR,
@@ -318,8 +348,8 @@ test("appendEvent: serializes through the same target-side flock guard as update
 // leaseToken and, when given, embed a real, target-side, atomic check
 // (under the same flock guard) that the owner record still holds
 // exactly that token before ever writing - see leaseFencingScript()'s
-// own comment.
-const LEASE_TOKEN = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+// own comment. (LEASE_TOKEN itself is declared once, above, alongside
+// acquireLockAndJournal's own equivalent fencing tests.)
 
 test("updateJournalStatus: with a leaseToken, embeds a real target-side fencing check against the owner record before ever writing; without one, the script is unchanged", async () => {
   const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "succeeded", committedGeneration: 1 };
@@ -351,6 +381,53 @@ test("updateJournalStatus: rejects a malformed leaseToken before ever building a
     () => updateJournalStatus({ ...SSH_TARGET, run: async () => { throw new Error("must not be called"); } }, journalDoc, "not-a-token; rm -rf /"),
     /is not a valid execution-lease token/,
   );
+});
+
+// PR 2 (item 10) second review, high finding 4: a JS-orchestrated
+// "read, validate, then write" (two separate round trips) leaves a real
+// gap - another writer's own transition could land in between. A real
+// compare-and-swap, done on the target itself, closes it: the write
+// proceeds only if the persisted document is STILL byte-for-byte
+// identical to expectedPreviousDocument, checked atomically under the
+// same flock guard immediately before the write.
+test("updateJournalStatus: with expectedPreviousDocument, embeds a real target-side compare-and-swap check before ever writing; without one, the script carries no such check", async () => {
+  const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "succeeded", committedGeneration: 1 };
+  const previous = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "in-progress", committedGeneration: null };
+  const cased = mockRun({ sshStdout: "HOF_MUTATE_UPDATED\n" });
+  await updateJournalStatus({ ...SSH_TARGET, run: cased.run }, journalDoc, undefined, previous);
+  const casedScript = cased.calls.find((c) => c.command === "ssh").input;
+  assert.match(casedScript, /HOF_MUTATE_CAS_CONFLICT/);
+  const embeddedPrevious = [...casedScript.matchAll(/expected_payload='([A-Za-z0-9+/=]+)'/g)].map((m) => JSON.parse(Buffer.from(m[1], "base64").toString("utf8")));
+  assert.ok(embeddedPrevious.some((p) => JSON.stringify(p) === JSON.stringify(previous)), "the exact expectedPreviousDocument must be embedded for the target-side comparison");
+
+  const uncased = mockRun({ sshStdout: "HOF_MUTATE_UPDATED\n" });
+  await updateJournalStatus({ ...SSH_TARGET, run: uncased.run }, journalDoc);
+  const uncasedScript = uncased.calls.find((c) => c.command === "ssh").input;
+  assert.doesNotMatch(uncasedScript, /HOF_MUTATE_CAS_CONFLICT/, "omitting expectedPreviousDocument must leave the write with no CAS check at all, exactly like before this review");
+});
+
+test("updateJournalStatus: a real HOF_MUTATE_CAS_CONFLICT response is refused with a clear, distinct error - never silently treated as success", async () => {
+  const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "succeeded", committedGeneration: 1 };
+  const previous = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "in-progress", committedGeneration: null };
+  const { run } = mockRun({ sshStdout: "HOF_MUTATE_CAS_CONFLICT\n" });
+  await assert.rejects(
+    () => updateJournalStatus({ ...SSH_TARGET, run }, journalDoc, undefined, previous),
+    /persisted document on the target no longer matches what was last read/,
+  );
+});
+
+// Both gates can be active at once - the fencing check (leaseToken) and
+// the CAS check (expectedPreviousDocument) are genuinely independent,
+// and target-mutate.mjs's own script must run the fencing gate FIRST
+// (never write, however the CAS would resolve, once the lease itself no
+// longer matches).
+test("updateJournalStatus: with both a leaseToken and expectedPreviousDocument, the lease fencing check runs before the CAS check", async () => {
+  const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "succeeded", committedGeneration: 1 };
+  const previous = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "in-progress", committedGeneration: null };
+  const { run, calls } = mockRun({ sshStdout: "HOF_MUTATE_UPDATED\n" });
+  await updateJournalStatus({ ...SSH_TARGET, run }, journalDoc, LEASE_TOKEN, previous);
+  const script = calls.find((c) => c.command === "ssh").input;
+  assert.ok(script.indexOf("HOF_MUTATE_LEASE_MISMATCH") < script.indexOf("HOF_MUTATE_CAS_CONFLICT"), "the lease fencing check must be written (and so checked) before the CAS check");
 });
 
 test("appendEvent: with a leaseToken, embeds the same real target-side fencing check; a HOF_MUTATE_LEASE_MISMATCH response is refused with a clear, distinct error", async () => {
@@ -466,6 +543,38 @@ test("acquireMutex: HOF_LEASE_HELD resolves, and the acquire script's own shape 
   assert.equal(lease.token, script.match(/--unit='hof-exec-lease-([0-9a-f-]+)'/)[1], "the returned lease's own token must be exactly the one embedded in the real acquire script, not a second, independently-generated value");
 });
 
+// PR 2 (item 10) second review, critical finding 1: the ORIGINAL fix for
+// "active alone isn't proof" still left a real, always-reproducible bug
+// - the held unit's OWN owner-record write, and its self-expiry clear,
+// ran completely unguarded (no flock at all), and self-expiry never
+// actually REMOVED the owner record - it just `exit 0`'d, leaving a
+// stale-but-still-matching token "fencing-valid" on the target forever.
+// Every operation that touches the owner record (the initial write, the
+// self-expiry clear, the heartbeat's own touch, and release()'s own
+// clear) must now share ONE guard (LOCK_GUARD_PATH, fd 8 - the exact
+// same guard every fenced write already takes) for any of this to be
+// genuinely atomic, not merely "usually fast enough in practice".
+test("acquireMutex: the held unit's own script writes the owner record AND clears it on self-expiry, both under the same LOCK_GUARD_PATH guard every fenced write uses (item 10 PR2 second review, critical finding 1)", async () => {
+  const { run, calls } = mockSequencedRun(["HOF_LEASE_HELD\n"]);
+  await acquireMutex({ ...SSH_TARGET, run });
+  const script = calls.find((c) => c.command === "ssh").input;
+  // The held unit's own inner script is embedded as a single-quoted
+  // /bin/sh -c argument inside the outer acquire script - extract it.
+  const heldScript = script.match(/\/bin\/sh -c '([^']*(?:'\\''[^']*)*)'/)[1];
+  assert.match(heldScript, /exec 8>.*lock\.flock/, "must open the same LOCK_GUARD_PATH fd the rest of this module uses");
+  assert.match(heldScript, /printf %s [0-9a-f-]+ > .*exec\.lease\.owner/, "the owner record write must still be present");
+  // The write and the self-expiry clear must both be guarded - "flock -x
+  // 8" must appear before EACH of them, and "flock -u 8" (or the fd
+  // simply closing) after.
+  const printfIndex = heldScript.indexOf("printf %s");
+  const lockBeforePrintf = heldScript.lastIndexOf("flock -x 8", printfIndex);
+  assert.ok(lockBeforePrintf !== -1 && lockBeforePrintf < printfIndex, "the owner-record write must be preceded by taking the guard");
+  assert.match(heldScript, /rm -f .*exec\.lease\.owner/, "self-expiry must actually REMOVE the owner record, not merely exit - a stale, uncleared token must never remain fencing-valid forever");
+  const rmIndex = heldScript.indexOf("rm -f");
+  const lockBeforeRm = heldScript.lastIndexOf("flock -x 8", rmIndex);
+  assert.ok(lockBeforeRm !== -1 && lockBeforeRm < rmIndex, "the self-expiry clear must also be preceded by taking the guard");
+});
+
 // PR 2 (item 10) review, critical finding 1: `systemctl is-active`
 // reporting a unit active does NOT by itself prove its own `flock -n -x`
 // actually won - Type=simple/exec both report ActiveState=active the
@@ -524,7 +633,7 @@ test("acquireMutex: local mode runs the acquire script via `sudo -n sh -s` direc
   assert.deepEqual(calls[0].args, ["-n", "sh", "-s"]);
 });
 
-test("acquireMutex: release() reports the raw HOF_LEASE_RELEASED round trip - stops the unit and clears the owner record, only ever by exact token match (the script itself, never trusted blindly - see its own guard)", async () => {
+test("acquireMutex: release() reports the raw HOF_LEASE_RELEASED round trip - stops the unit and clears the owner record, only ever by exact token match, under the SAME LOCK_GUARD_PATH guard every other owner-record operation now shares (item 10 PR2 second review, critical finding 1)", async () => {
   const { run, calls } = mockSequencedRun(["HOF_LEASE_HELD\n", "HOF_LEASE_RELEASED\n"]);
   const lease = await acquireMutex({ ...SSH_TARGET, run });
   await lease.release();
@@ -532,6 +641,8 @@ test("acquireMutex: release() reports the raw HOF_LEASE_RELEASED round trip - st
   assert.match(releaseScript, /rm -f/);
   assert.match(releaseScript, /systemctl stop/);
   assert.match(releaseScript, /\[ "\$\(cat '.*exec\.lease\.owner'\)" = '.*' \]/);
+  assert.match(releaseScript, /exec 8>.*lock\.flock/);
+  assert.match(releaseScript, /flock -x 8/);
 });
 
 test("acquireMutex: HOF_LEASE_MISMATCH on release (the owner record no longer matches this acquisition's own token) never throws - degrades to best-effort, matching the target-side unit's own eventual self-expiry", async () => {
@@ -552,13 +663,15 @@ test("acquireMutex: a transport failure while releasing is swallowed, never thro
 // out from under a caller that dutifully polled isLost() but never
 // refreshed liveness on the target). assertOwnership() is called
 // directly here rather than waiting out the real background interval.
-test("acquireMutex: assertOwnership() touches the owner record and reports HOF_LEASE_OK without marking the lease lost", async () => {
+test("acquireMutex: assertOwnership() touches the owner record and reports HOF_LEASE_OK without marking the lease lost, under the same LOCK_GUARD_PATH guard (item 10 PR2 second review, critical finding 1)", async () => {
   const { run, calls } = mockSequencedRun(["HOF_LEASE_HELD\n", "HOF_LEASE_OK\n"]);
   const lease = await acquireMutex({ ...SSH_TARGET, run });
   await lease.assertOwnership();
   assert.equal(lease.isLost(), false);
   const assertScript = calls.filter((c) => c.command === "ssh")[1].input;
   assert.match(assertScript, /touch '.*exec\.lease\.owner'/);
+  assert.match(assertScript, /exec 8>.*lock\.flock/);
+  assert.match(assertScript, /flock -x 8/);
 });
 
 test("acquireMutex: assertOwnership() reporting HOF_LEASE_LOST (the unit is gone, or the owner record no longer matches) is recorded and broadcast, fail-closed", async () => {

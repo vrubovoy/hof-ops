@@ -8,7 +8,7 @@
   "required": [
     "apiVersion", "operationId", "planId", "backupId", "snapshotId", "manifestDigest", "recoveryKitDigest",
     "backupToolLockDigest", "source", "target", "startedAt", "completedAt", "status",
-    "dataRestoredCheckpointAt", "readinessConfirmedAt"
+    "dataRestoredCheckpointAt", "readinessConfirmedAt", "abandoned"
   ],
   "properties": {
     "apiVersion": { "const": "hof.dev/restore-evidence/v1" },
@@ -60,9 +60,13 @@
       "format": "date-time"
     },
     "readinessConfirmedAt": {
-      "description": "When readiness.wait last confirmed the fully-restored platform ready - null unless status is succeeded.",
+      "description": "When readiness.wait last confirmed the fully-restored platform ready - null unless status is succeeded. Never non-null on a failed restore: readiness.wait is the step immediately before evidence.write, so a restore that reached and confirmed readiness has nothing left that could still fail the overall operation.",
       "type": ["string", "null"],
       "format": "date-time"
+    },
+    "abandoned": {
+      "description": "true only when this terminal failed evidence was written because the operator explicitly gave up on a stuck, still-in-progress operationId (restore has no guaranteed finally block the way backup does - a restore that gets stuck before reaching its own natural evidence.write has no other path to a terminal state). false for every other outcome, succeeded or a real in-flow failure that itself reached evidence.write. Always false when status: succeeded.",
+      "type": "boolean"
     },
     "error": {
       "description": "Only for status: failed - a short, sanitized diagnostic. Never a raw exception dump, a secret value, decrypted content, or an SSH private-key path.",
@@ -78,7 +82,8 @@
     },
     {
       "if": { "properties": { "status": { "const": "succeeded" } } },
-      "then": { "properties": { "readinessConfirmedAt": { "type": "string" }, "dataRestoredCheckpointAt": { "type": "string" } } }
+      "then": { "properties": { "readinessConfirmedAt": { "type": "string" }, "dataRestoredCheckpointAt": { "type": "string" }, "abandoned": { "const": false } } },
+      "else": { "properties": { "readinessConfirmedAt": { "type": "null" } } }
     }
   ],
   "$defs": {

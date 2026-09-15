@@ -49,9 +49,15 @@
       "else": { "not": { "required": ["error"] } }
     },
     {
-      "description": "destination only ever appears on a backup-kind event - apply and restore never have a per-destination step.",
-      "if": { "not": { "properties": { "operationKind": { "const": "backup" } } } },
-      "then": { "not": { "required": ["destination"] } }
+      "description": "destination is required for a backup-kind event about a per-destination step (snapshot.create, retention.apply - the step id's own middle segment), and forbidden for every other event - restore, or a backup event about a non-destination-scoped step (maintenance.enter, staging.build, ...). The earlier draft only forbade it outside operationKind: backup, leaving it optional (and so silently droppable) on the very steps it exists for, and unconstrained (so smuggleable) on a backup event about an unrelated step - both real gaps a review round found.",
+      "if": {
+        "properties": {
+          "operationKind": { "const": "backup" },
+          "step": { "type": "string", "pattern": "\\.(snapshot\\.create|retention\\.apply)\\." }
+        }
+      },
+      "then": { "required": ["destination"] },
+      "else": { "not": { "required": ["destination"] } }
     }
   ],
   "$defs": {

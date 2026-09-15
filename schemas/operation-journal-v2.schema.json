@@ -36,21 +36,16 @@
       "enum": ["in-progress", "succeeded", "failed"]
     },
     "committedGeneration": {
-      "description": "backup: always null, even on success - a backup never mutates current.json or the generation at all. restore: the restored SOURCE generation once state.restore succeeds, carried forward verbatim, never incremented - this is the same installation's history continuing on new hardware, not a new applied change. Null for the entire lifetime of a run that never reaches its own commit point, including every failed one, regardless of kind.",
+      "description": "backup: always null, regardless of status - a backup never mutates current.json or the generation at all. restore: the restored SOURCE generation once state.restore succeeds, carried forward verbatim, never incremented - this is the same installation's history continuing on new hardware, not a new applied change. For restore this is deliberately NOT tied to overall status by this schema (see the allOf below's own description) - state.restore runs well before the operation's own overall conclusion, so a later step (service.start, readiness.wait) can still fail AFTER the generation was genuinely committed, and status: failed with a real committedGeneration already set is the honest result, not a contradiction. scripts/backup-flow.mjs's own validateRestoreCommittedGeneration() checks this field's actual correctness against the real event log - a check this schema alone cannot make.",
       "type": ["integer", "null"],
       "minimum": 1
     }
   },
   "allOf": [
     {
-      "description": "The status/committedGeneration/operationKind pairing this schema's own field descriptions above already document, actually enforced - reusing operation-journal-v1's own already-reviewed if/then/else mechanism (2026-08-31).",
-      "if": { "properties": { "status": { "const": "succeeded" } } },
-      "then": {
-        "if": { "properties": { "operationKind": { "const": "backup" } } },
-        "then": { "properties": { "committedGeneration": { "type": "null" } } },
-        "else": { "properties": { "committedGeneration": { "type": "integer", "minimum": 1 } } }
-      },
-      "else": { "properties": { "committedGeneration": { "type": "null" } } }
+      "description": "A backup journal's committedGeneration is always null, in every status - a backup never mutates current.json or the generation, regardless of outcome. A restore journal's committedGeneration is intentionally UNCONSTRAINED by status here: a review round found the earlier succeeded-only conditional was actually wrong for restore - state.restore (which actually commits the generation) runs well before the operation's own overall conclusion, so a journal can legitimately reach status: failed (a later step - service.start, readiness.wait - failed) while still correctly carrying a non-null committedGeneration, because the generation really was committed first. The reverse (failed with committedGeneration still null, because state.restore itself never ran) is equally legitimate. Real correctness - does this field's value actually match whether a state.restore succeeded event exists - is checked by scripts/backup-flow.mjs's own validateRestoreCommittedGeneration(), never by this schema alone.",
+      "if": { "properties": { "operationKind": { "const": "backup" } } },
+      "then": { "properties": { "committedGeneration": { "type": "null" } } }
     },
     {
       "description": "plan.apiVersion must actually match operationKind - a backup journal can never embed a restore-plan-v1 document or vice versa.",

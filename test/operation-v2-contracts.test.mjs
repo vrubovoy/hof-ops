@@ -191,10 +191,15 @@ test("operation-journal-v2: rejects backup inputDigests on a restore journal, an
 
 // The centerpiece: operationKind x status x committedGeneration.
 
-test("operation-journal-v2: a succeeded RESTORE journal requires a real committed generation - the restored source generation, carried forward", async () => {
+test("operation-journal-v2: a succeeded RESTORE journal MAY carry a real committed generation - the restored source generation, carried forward", async () => {
   const validate = await validatorFor("operation-journal-v2.schema.json");
   assert.ok(validate(journalFixture({ operationKind: "restore", status: "succeeded", committedGeneration: 7 })), JSON.stringify(validate.errors));
-  assert.equal(validate(journalFixture({ operationKind: "restore", status: "succeeded", committedGeneration: null })), false, "restore succeeded with no committed generation must be rejected");
+});
+
+test("operation-journal-v2: restore's own committedGeneration is intentionally NOT tied to status by this schema - state.restore commits well before the operation's own overall conclusion, so a failed journal may still legitimately carry a real committedGeneration (a later step failed after the generation was already committed), and a succeeded one may still legitimately be null only if state.restore itself was somehow skipped. Real correctness is scripts/backup-flow.mjs's own validateRestoreCommittedGeneration(), not this schema.", async () => {
+  const validate = await validatorFor("operation-journal-v2.schema.json");
+  assert.ok(validate(journalFixture({ operationKind: "restore", status: "failed", committedGeneration: 7 })), JSON.stringify(validate.errors));
+  assert.ok(validate(journalFixture({ operationKind: "restore", status: "in-progress", committedGeneration: null })), JSON.stringify(validate.errors));
 });
 
 test("operation-journal-v2: a succeeded BACKUP journal REQUIRES committedGeneration to stay null - a backup never mutates the generation", async () => {
@@ -203,13 +208,19 @@ test("operation-journal-v2: a succeeded BACKUP journal REQUIRES committedGenerat
   assert.equal(validate(journalFixture({ operationKind: "backup", status: "succeeded", committedGeneration: 1 })), false, "a succeeded backup claiming a committed generation must be rejected, regardless of value");
 });
 
-test("operation-journal-v2: an in-progress or failed journal never carries a committed generation, regardless of kind", async () => {
+test("operation-journal-v2: a backup journal never carries a committed generation, in any status", async () => {
   const validate = await validatorFor("operation-journal-v2.schema.json");
-  for (const operationKind of ["backup", "restore"]) {
-    for (const status of ["in-progress", "failed"]) {
-      assert.equal(validate(journalFixture({ operationKind, status, committedGeneration: 1 })), false, `${operationKind}/${status} with a committed generation must be rejected`);
-      assert.ok(validate(journalFixture({ operationKind, status, committedGeneration: null })), `${operationKind}/${status} with null: ${JSON.stringify(validate.errors)}`);
-    }
+  for (const status of ["in-progress", "succeeded", "failed"]) {
+    assert.equal(validate(journalFixture({ operationKind: "backup", status, committedGeneration: 1 })), false, `backup/${status} with a committed generation must be rejected`);
+    assert.ok(validate(journalFixture({ operationKind: "backup", status, committedGeneration: null })), `backup/${status} with null: ${JSON.stringify(validate.errors)}`);
+  }
+});
+
+test("operation-journal-v2: a restore journal may carry a committed generation in any status, or none - this schema alone never decides which is correct", async () => {
+  const validate = await validatorFor("operation-journal-v2.schema.json");
+  for (const status of ["in-progress", "succeeded", "failed"]) {
+    assert.ok(validate(journalFixture({ operationKind: "restore", status, committedGeneration: 1 })), `restore/${status} with committedGeneration: ${JSON.stringify(validate.errors)}`);
+    assert.ok(validate(journalFixture({ operationKind: "restore", status, committedGeneration: null })), `restore/${status} with null: ${JSON.stringify(validate.errors)}`);
   }
 });
 
@@ -253,6 +264,7 @@ function eventFixture(overrides = {}) {
     attempt: 1,
     phase: "started",
     at: "2026-09-04T10:00:00Z",
+    destination: "onsite",
     ...overrides,
   };
 }
@@ -264,12 +276,16 @@ test("operation-event-v2: a backup event validates", async () => {
 
 test("operation-event-v2: a restore event validates", async () => {
   const validate = await validatorFor("operation-event-v2.schema.json");
-  assert.ok(validate(eventFixture({ operationKind: "restore", step: "003.data.restore.schlussel" })), JSON.stringify(validate.errors));
+  const event = eventFixture({ operationKind: "restore", step: "003.data.restore.schlussel" });
+  delete event.destination;
+  assert.ok(validate(event), JSON.stringify(validate.errors));
 });
 
 test("operation-event-v2: rejects operationKind apply - the existing apply executor only ever emits operation-event-v1, never this schema", async () => {
   const validate = await validatorFor("operation-event-v2.schema.json");
-  assert.equal(validate(eventFixture({ operationKind: "apply", step: "003.service.start.gateway" })), false);
+  const event = eventFixture({ operationKind: "apply", step: "003.service.start.gateway" });
+  delete event.destination;
+  assert.equal(validate(event), false);
 });
 
 test("operation-event-v2: rejects an unrecognized operationKind", async () => {
@@ -291,9 +307,18 @@ test("operation-event-v2: a failed phase requires a sanitized error; succeeded/s
   assert.equal(validate(eventFixture({ phase: "succeeded", error: "should not be here" })), false);
 });
 
-test("operation-event-v2: destination is only ever valid on a backup-kind event", async () => {
+test("operation-event-v2: destination is required for a backup event about snapshot.create/retention.apply, and forbidden everywhere else", async () => {
   const validate = await validatorFor("operation-event-v2.schema.json");
-  assert.ok(validate(eventFixture({ operationKind: "backup", destination: "onsite" })), JSON.stringify(validate.errors));
+  assert.ok(validate(eventFixture({ operationKind: "backup", step: "005.snapshot.create.onsite", destination: "onsite" })), JSON.stringify(validate.errors));
+  assert.ok(validate(eventFixture({ operationKind: "backup", step: "006.retention.apply.onsite", destination: "onsite" })), JSON.stringify(validate.errors));
+
+  const missingOnSnapshot = eventFixture({ operationKind: "backup", step: "005.snapshot.create.onsite" });
+  delete missingOnSnapshot.destination;
+  assert.equal(validate(missingOnSnapshot), false, "destination is required, not merely optional, on a snapshot.create event");
+
+  const smuggledOnMaintenance = eventFixture({ operationKind: "backup", step: "001.maintenance.enter.platform" });
+  assert.equal(validate(smuggledOnMaintenance), false, "a non-destination-scoped backup step must not carry a destination either");
+
   assert.equal(validate(eventFixture({ operationKind: "restore", step: "003.data.restore.schlussel", destination: "onsite" })), false, "restore never has a per-destination step");
 });
 

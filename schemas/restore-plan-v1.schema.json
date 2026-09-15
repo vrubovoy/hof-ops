@@ -81,10 +81,10 @@
       "items": { "$ref": "#/$defs/consistencySetEntry" }
     },
     "networks": {
-      "description": "Every network this restore's own network.create operations must create before any volume.create or data.restore runs - a clean target has none of Hof's usual infrastructure yet, unlike a plain apply, where the shared network is long-lived, externally-provisioned infrastructure the Ansible network role owns and Compose/plan-v2 never creates (render-topology.mjs's own physicalNetworkName()). Restore is the one flow that must actually create it, matching ADR 0006's own \"operation-owned volumes and networks only\" - it never adopts a pre-existing network either, exactly like it never adopts a pre-existing volume.",
+      "description": "Every network this restore's own network.create operations must create before any volume.create or data.restore runs - a clean target has none of Hof's usual infrastructure yet, unlike a plain apply, where the shared network is long-lived, externally-provisioned infrastructure the Ansible network role owns and Compose/plan-v2 never creates. Restore is the one flow that must actually create it, matching ADR 0006's own \"operation-owned volumes and networks only\" - it never adopts a pre-existing network either, exactly like it never adopts a pre-existing volume. Each entry names the network's own PHYSICAL name (render-topology.mjs's own physicalNetworkName() output, e.g. \"hof-hof\" - state-v1.schema.json's own committed networks and plan-v2's own desired.networks/network.ensure already use this same physical name, never the bare logical Compose key; recording the logical key here would make this document inconsistent with every other network-naming contract in this repo) and whether it must be created with no default route to the outside world (plan.mjs's own network.ensure carries the identical internal flag for exactly one network, WACHTER_INTERNAL_NETWORK_NAME - \"hof-wachter-internal\" - restore must recreate that exact property, not merely the network's existence).",
       "type": "array",
       "minItems": 1,
-      "items": { "$ref": "#/$defs/identifier" }
+      "items": { "$ref": "#/$defs/network" }
     },
     "operations": {
       "type": "array",
@@ -112,6 +112,16 @@
       "description": "Exactly services-v1alpha1.schema.json's own $defs/name pattern (hyphens only, max 63 chars, no dots) - see backup-plan-v1.schema.json's own identical $def for why.",
       "type": "string",
       "pattern": "^[a-z][a-z0-9-]{0,62}$"
+    },
+    "network": {
+      "description": "A network's own PHYSICAL name (render-topology.mjs's own physicalNetworkName() output) plus whether it must be created internal - the same shape plan-v2's own network.ensure operation implicitly carries (name + a conditional internal flag), made explicit here since restore has no baseline to diff against.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "internal"],
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "internal": { "type": "boolean" }
+      }
     },
     "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
     "operationId": {

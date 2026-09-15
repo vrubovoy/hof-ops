@@ -7,7 +7,7 @@
   "additionalProperties": false,
   "required": [
     "apiVersion", "operationId", "backupId", "planId", "backupPolicyId", "manifestDigest", "backupToolLockDigest",
-    "target", "startedAt", "completedAt", "status", "perDestinationResults", "readinessConfirmedAt"
+    "target", "startedAt", "completedAt", "status", "perDestinationResults", "readinessConfirmedAt", "abandoned"
   ],
   "properties": {
     "apiVersion": { "const": "hof.dev/backup-evidence/v1" },
@@ -44,13 +44,17 @@
       "description": "When the finally block's own readiness.wait last confirmed the fully-restarted platform ready, after every snapshot/retention attempt - null if the finally block never reached it (a crash inside the finally block itself, not merely a snapshot failure). Without this, evidence could claim status: succeeded (every destination snapshotted) while service.start/readiness.wait/maintenance.exit themselves silently failed to actually restore the platform to a healthy running state - every snapshot succeeding is not the same claim as the platform being left healthy.",
       "type": ["string", "null"],
       "format": "date-time"
+    },
+    "abandoned": {
+      "description": "true only when this terminal evidence was written because the operator explicitly gave up on a stuck, still-in-progress operationId rather than the flow's own guaranteed finally block naturally reaching evidence.write (a target that never comes back at all is still possible even though the finally block is designed to always run). false for every other outcome, succeeded or a real in-flow partial/total failure that itself reached evidence.write. Always false when status: succeeded.",
+      "type": "boolean"
     }
   },
   "allOf": [
     {
       "description": "status: succeeded requires the finally block to have genuinely completed, not merely every snapshot to have succeeded - a broken restart/readiness/maintenance-exit must never hide behind a claimed backup success.",
       "if": { "properties": { "status": { "const": "succeeded" } } },
-      "then": { "properties": { "readinessConfirmedAt": { "type": "string" } } }
+      "then": { "properties": { "readinessConfirmedAt": { "type": "string" }, "abandoned": { "const": false } } }
     },
     {
       "description": "status must faithfully reflect perDestinationResults' own real content - never a silent partial-as-success or partial-as-total-failure. succeeded additionally requires at least one real result - an empty array is never a success, only ever the crashed-before-any-snapshot.create shape failed alone represents.",

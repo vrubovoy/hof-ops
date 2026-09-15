@@ -125,10 +125,18 @@ embed a restore plan, or vice versa, and inputDigests can no longer
 silently mix the two kinds' own fixed input sets (this item's earlier
 draft required all five of apply's own digest names unconditionally,
 regardless of `operationKind` - a real gap this closes). `approvedPlanId
-== plan.planId` is the one binding schema genuinely cannot check without
-a `$data` reference (none are used anywhere in this repo) -
-`scripts/backup-flow.mjs`'s own bundle validators and this item's
-contract tests enforce it instead.
+== plan.planId` (and `lock`/`journal`/`event` all actually agreeing with
+the plan they claim to belong to, and with each other) is a class of
+binding schema genuinely cannot check without a `$data` reference (none
+are used anywhere in this repo). A second review round's own draft of
+this ADR already claimed `scripts/backup-flow.mjs`'s bundle validators
+enforced this; a third review round found that claim was false -
+neither `validateBackupBundle()` nor `validateRestoreBundle()` accepted
+a `lock`, `journal`, or `event` argument at all, so `operationId`,
+`operationKind`, `target`, `approvedPlanId`, `inputDigests`, and every
+event's own `step`/`operationId`/`operationKind` went entirely
+unchecked. Both functions now take optional `lock`/`journal`/`events`
+parameters and check all of the above when supplied.
 
 **`operation-event-v2` exists alongside the unchanged
 `operation-event-v1` for a semantic reason, not because lock/journal
@@ -231,7 +239,14 @@ changed that time, without ever perturbing `policyId`. Both a manual
 whichever policy is currently applied via `backup-plan-v1`'s own
 `backupPolicyId` - never a plan-local synthetic one - which is what lets
 a scheduled run skip fresh interactive approval: the policy itself was
-already approved when it was applied.
+already approved when it was applied. That id binding alone is not
+enough to stop the policy from being bypassed, though: a third review
+round found a plan could reference the correct, real `backupPolicyId`
+while quietly carrying its OWN, different `destinations` or `retention`
+- the approved policy's own content was never actually compared against
+what the plan does. `scripts/backup-flow.mjs`'s own `validateBackupBundle()`
+now also requires `plan.destinations`/`plan.retention` to exactly,
+structurally match the supplied policy's own - not merely share an id.
 
 **`backupId` is a domain-separated digest, never a content-id of the
 plan - and a new, monotonic `backupSequence` is why. `backupSequence`
@@ -286,6 +301,37 @@ own `finally` block, already concluded (however that conclusion reads in
 `backup-evidence-v1`'s own honest `succeeded`/`partial`/`failed`
 status).
 
+**Restore has no guaranteed `finally` block the way backup does - an
+explicit operator `abandoned` marker is its only path to a terminal
+state when stuck. `committedGeneration` is NOT tied to overall status
+for restore.** A third review round found two further, real gaps in the
+above: first, backup's own `finally` block is a decision THIS ADR makes
+(every backup dispatch always reaches `service.start`/`readiness.wait`/
+`maintenance.exit`/`evidence.write` regardless of outcome so far) -
+restore's own operation whitelist has no equivalent guarantee, so a
+restore that gets genuinely stuck before its own natural `evidence.write`
+(the target never comes back, say) has no other path to a terminal
+state at all. Both `backup-evidence-v1` and `restore-evidence-v1` now
+carry a required `abandoned` boolean - `true` only when this terminal
+evidence exists because the operator explicitly gave up on a stuck,
+still-`in-progress` operationId, `false` for every outcome (success, or
+a real in-flow failure) that itself reached `evidence.write` naturally;
+always `false` when `status: succeeded`. Second, `committedGeneration`'s
+own succeeded-only conditional was actually WRONG for restore:
+`state.restore` (which genuinely commits the generation) runs several
+steps before the operation's own overall conclusion, so a restore can
+legitimately reach `status: failed` (a later step - `service.start`,
+`readiness.wait` - failed) while still correctly carrying a non-null
+`committedGeneration`, because the generation really was committed
+first; the schema's own earlier "succeeded requires it, everything else
+forbids it" rule would have forced a dishonest `null` in exactly that
+case. `operation-journal-v2.schema.json` no longer ties restore's own
+`committedGeneration` to `status` at all - its real correctness (does it
+match whether a `state.restore` succeeded event actually exists) is
+checked by `scripts/backup-flow.mjs`'s own
+`validateRestoreCommittedGeneration(journal, events)`, a check only the
+event log, not the journal alone, can answer.
+
 **`recovery-kit-v1` - the encrypted recovery envelope itself, private
 identity always external. Schema alone cannot prove `ciphertext` is real
 - `scripts/backup-flow.mjs`'s `verifyRecoveryKit()` does.** A
@@ -306,7 +352,13 @@ actually begin with age's own real binary-format magic header
 same decoded bytes, and recomputes `ageRecipientFingerprint` from
 `ageRecipient`. A document that is schema-valid but fails
 `verifyRecoveryKit()` is never a real recovery kit, only a decoy shaped
-like one.
+like one. `verifyRecoveryKit()` only ever checks a kit's own INTERNAL
+consistency, never whether it actually belongs to the plan using it - a
+third review round found nothing bound a kit's own `installationId`/
+`createdForGeneration` to the plan/manifest referencing it, nor its own
+digest to the `recoveryKitDigest` a plan/manifest declares.
+`validateBackupBundle()`/`validateRestoreBundle()` now accept an
+optional `kit` and check exactly that.
 
 **Backup Flow - the fixed, typed operation whitelist
 `backup-plan-v1.schema.json` encodes.** Planning-time (never dispatched
@@ -354,10 +406,21 @@ contains the complete, correctly-ordered, correctly-counted flow above
 (the required count of `snapshot.create`/`retention.apply` legs depends
 on `destinations`' own length, which no schema in this repo can
 reference from a sibling array without a `$data` extension - none are
-used anywhere in this repo), completeness and ordering are checked
-separately by `scripts/backup-flow.mjs`'s own pure
-`validateBackupPlanOperations()`, exercised by this item's own contract
-tests.
+used anywhere in this repo), completeness and the FULL ordering chain
+(every destination's own `retention.apply` strictly after that SAME
+destination's own `snapshot.create` - not merely after snapshots/
+retentions in aggregate; `service.start` before `readiness.wait` before
+`maintenance.exit`; `service.stop` and `service.start` naming the exact
+same set of units) are checked separately by `scripts/backup-flow.mjs`'s
+own pure `validateBackupPlanOperations()`, exercised by this item's own
+contract tests - a blocked plan (`executable: false`) is never analyzed
+this way, since it never claims to have a real flow at all. This
+function, and its schema-level duplicate check on `plan.destinations`/
+`plan.consistencySet`, do NOT prove the plan's own stop/start unit set
+or consistency set matches the platform's real, full topology - this
+document carries no independent source-topology projection to check
+that against, and adding one is out of this PR's own scope (see
+Consequences).
 
 **Restore Flow - the fixed, typed operation whitelist
 `restore-plan-v1.schema.json` encodes, against a *second*, clean
@@ -395,7 +458,17 @@ alone); `snapshot.verify`; `network.create` and `volume.create`
 overwrites a resource it didn't itself just create; a clean target has
 none of Hof's usual long-lived, externally-provisioned network
 infrastructure yet, unlike a plain apply, so restore is the one flow
-that must actually create it) and `data.restore` for the full
+that must actually create it - each network named by its own PHYSICAL
+name, `render-topology.mjs`'s own `physicalNetworkName()` output, e.g.
+`"hof-hof"`, matching `state-v1.schema.json`'s own committed `networks`
+and `plan-v2`'s own `desired.networks`/`network.ensure` exactly, never
+the bare logical Compose key; a third review round found the first two
+drafts of this document used the logical key instead, which would have
+made `restore-plan-v1` the one inconsistent network-naming contract in
+the whole repo. Each network entry also carries its own `internal` flag
+- `plan.mjs`'s own `network.ensure` sets it for exactly one network,
+`hof-wachter-internal`, and restore must recreate that same property,
+not merely the network's bare existence) and `data.restore` for the full
 consistency set; `manifest.verify` and `database.integrity-check`
 against the actually-restored files, before any container using them
 ever starts; `checkpoint.data-restored` (a durable, resumable marker -
@@ -410,13 +483,18 @@ that this generation's data arrived via a restore, from which backup,
 onto which new host - is recorded separately from `current.json`, never
 folded into the generation history itself); `service.start`
 (dependencies-first, gateway last), `readiness.wait`; finally
-`evidence.write`. Completeness and ordering (every `network.create` per
-configured network, every `volume.create`/`data.restore` per
-consistency-set volume, and above all that `checkpoint.data-restored`
-is the sole privileged boundary - every `data.restore` before it, every
-`config.restore`/`secret.materialize`/`state.restore` after) are checked
-by `scripts/backup-flow.mjs`'s own pure `validateRestorePlanOperations()`,
-the restore-side sibling of the backup one above.
+`evidence.write`. Completeness and the FULL ordering chain (network
+before volume, volume before its own data.restore, every data.restore
+before verification, verification before the sole privileged checkpoint,
+config/secret/state restoration before service.start, service.start
+before readiness.wait) are checked by `scripts/backup-flow.mjs`'s own
+pure `validateRestorePlanOperations()`, the restore-side sibling of the
+backup one above - a third review round found the first two drafts of
+this same function checked only a handful of these relationships (data.
+restore-before-checkpoint, config/secret/state-after-checkpoint),
+silently accepting volume.create after its own data.restore, network.
+create after volume.create, or verification after the checkpoint it is
+supposed to gate.
 
 **Failure semantics and resumability.** All configured destinations are
 required for a backup's own overall success, exactly as stated above.
@@ -509,17 +587,29 @@ existing `backup.destinations[].type: "local"`.
     `exactSetEquals`, `consistencySetEntryKey`, `hasDuplicates`.
   - `scripts/backup-flow.mjs`: `validateBackupPlanOperations`/
     `validateRestorePlanOperations` (flow completeness, per-destination/
-    per-network/per-volume cardinality, and ordering - what schemas
-    cannot check without `$data`), `validateBackupBundle`/
-    `validateRestoreBundle` (cross-document id/digest bindings across
-    policy/plan/manifest/evidence - including that a `succeeded`
-    backup's evidence names every configured destination, exactly, not
-    a subset), and `verifyRecoveryKit` (ciphertext round-trip, age magic
-    header, digest/fingerprint recomputation). This item's own contract
-    tests build every "happy path" fixture through these same functions
-    rather than an arbitrary placeholder value, so a passing positive
-    test is real evidence the fixture is internally coherent, not merely
-    that each field's own shape is individually valid.
+    per-network/per-volume cardinality, the FULL predecessor-ordering
+    chain each flow's own Decision text above now spells out, and a
+    blocked-plan (`executable: false`) short-circuit - none of this is
+    checkable by schema alone without a `$data` extension),
+    `validateBackupBundle`/`validateRestoreBundle` (cross-document id/
+    digest/content bindings across policy/plan/manifest/evidence/kit,
+    and now optionally lock/journal/events too - including that a
+    `succeeded` backup's evidence names every configured destination
+    exactly, that a plan bound to an approved policy actually uses that
+    policy's own destinations/retention verbatim, that a restore plan's
+    own `source` claim actually matches the manifest that is the real
+    proof of what is being restored, and that a recovery kit is bound to
+    the installation/generation actually using it), `verifyRecoveryKit`
+    (ciphertext round-trip, age magic header, digest/fingerprint
+    recomputation), and `validateRestoreCommittedGeneration` (checks
+    `operation-journal-v2`'s own now-status-independent `committedGeneration`
+    for restore against whether a real `state.restore` succeeded event
+    exists - the one thing that formula's own correctness actually
+    depends on). This item's own contract tests build every "happy path"
+    fixture through these same functions rather than an arbitrary
+    placeholder value, so a passing positive test is real evidence the
+    fixture is internally coherent, not merely that each field's own
+    shape is individually valid.
 - `restore-plan-v1` now pins `snapshotId` and `manifestDigest` at
   approval time (not merely `backupId`+`destinationName`, which a
   repository's own contents are not otherwise bound to), and records a
@@ -530,7 +620,23 @@ existing `backup.destinations[].type: "local"`.
   only when `status: succeeded` - a snapshot succeeding at every
   destination is not the same claim as the platform's own `finally`
   block (`service.start`/`readiness.wait`/`maintenance.exit`) actually
-  completing.
+  completing; `restore-evidence-v1` now forbids a non-null
+  `readinessConfirmedAt` on a `failed` restore, since `readiness.wait` is
+  the step immediately before `evidence.write` - nothing legitimately
+  fails an already-readiness-confirmed restore. Both evidence schemas
+  now require `abandoned` (see the Decision section above).
+- What this item's own semantic validators deliberately still do NOT
+  prove: that a plan's own `service.stop`/`service.start` unit set, or
+  its own `consistencySet`, actually matches the platform's real, full
+  topology (every enabled-plus-retained volume, the exact
+  dependency-ordered service set) - only that a plan's OWN internal
+  halves agree with each other (stop/start naming the same units; no
+  duplicate destination/volume/network within one document). Proving
+  real completeness would need a source-topology/inventory projection
+  this item's own contracts do not currently carry, and building one is
+  out of scope for a schema-only PR - a later PR, when a real executor
+  exists to compare against, is the natural place to close this
+  specific gap, not this one.
 - No executor, target-side runner, Ansible role, systemd unit, CLI
   surface (`hofctl backup`/`hofctl restore`), or CI workflow exists yet.
   The `backupSequence` allocation-and-recheck-under-mutex logic

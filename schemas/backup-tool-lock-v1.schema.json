@@ -53,6 +53,7 @@
       "additionalProperties": false,
       "required": [
         "backupPlanApiVersion", "restorePlanApiVersion", "backupPolicyApiVersion", "recoveryKitApiVersion",
+        "backupManifestApiVersion", "backupEvidenceApiVersion", "restoreEvidenceApiVersion",
         "operationLockApiVersion", "operationJournalApiVersion", "operationEventApiVersion"
       ],
       "properties": {
@@ -60,6 +61,9 @@
         "restorePlanApiVersion": { "const": "hof.dev/restore-plan/v1" },
         "backupPolicyApiVersion": { "const": "hof.dev/backup-policy/v1" },
         "recoveryKitApiVersion": { "const": "hof.dev/recovery-kit/v1" },
+        "backupManifestApiVersion": { "const": "hof.dev/backup-manifest/v1" },
+        "backupEvidenceApiVersion": { "const": "hof.dev/backup-evidence/v1" },
+        "restoreEvidenceApiVersion": { "const": "hof.dev/restore-evidence/v1" },
         "operationLockApiVersion": { "const": "hof.dev/operation-lock/v2" },
         "operationJournalApiVersion": { "const": "hof.dev/operation-journal/v2" },
         "operationEventApiVersion": { "const": "hof.dev/operation-event/v2" }

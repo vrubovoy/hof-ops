@@ -268,7 +268,7 @@ fi`;
 // serializes every owner-record read/write (acquireMutex()'s own held
 // script, heartbeat, and release all take this identical guard).
 function acquireLockAndJournalScript(leaseToken, lockPayload, journalTargetPath, journalPayload) {
-  return withLockGuard(`${leaseFencingScript(leaseToken)}lock_payload='${lockPayload}'
+  return fencedWriteScript(leaseToken, `lock_payload='${lockPayload}'
 journal_payload='${journalPayload}'
 ${atomicExclusiveCreateStep(journalTargetPath, "journal_payload", "journal_created")}
 if [ "$journal_created" != 1 ]; then
@@ -332,7 +332,12 @@ const EXECUTION_LEASE_OWNER_PATH = "/var/lib/hof/state/exec.lease.owner";
 // its own flock guard (the same one acquireMutex()'s held script uses
 // to serialize acquisition against release - see that function's own
 // comment): the write proceeds only if the owner record still holds
-// EXACTLY this leaseToken; otherwise nothing is written at all,
+// EXACTLY this leaseToken AND systemctl genuinely confirms THAT
+// TOKEN'S OWN unit is still active - not merely the file's content
+// (PR 2 third review, critical finding 1: a belt-and-suspenders check
+// independent of whatever cleared or didn't clear the owner record -
+// catches a partially-failed cleanup or a future bug in that logic,
+// not just a token mismatch) - otherwise nothing is written at all,
 // atomically, decided under the same mutual exclusion the mutex itself
 // already provides - never merely a client-side, best-effort check.
 // leaseToken is optional (omitted entirely for a caller with no lease
@@ -341,12 +346,60 @@ const EXECUTION_LEASE_OWNER_PATH = "/var/lib/hof/state/exec.lease.owner";
 function leaseFencingScript(leaseToken) {
   if (leaseToken === undefined) return "";
   validateLeaseToken(leaseToken);
-  return `if [ ! -r '${EXECUTION_LEASE_OWNER_PATH}' ] || [ "$(cat '${EXECUTION_LEASE_OWNER_PATH}')" != '${leaseToken}' ]; then
+  const unit = mutexUnitName(leaseToken);
+  return `owner_unit_state=$(systemctl is-active '${unit}.service' 2>/dev/null || true)
+if [ "$owner_unit_state" != active ] || [ ! -r '${EXECUTION_LEASE_OWNER_PATH}' ] || [ "$(cat '${EXECUTION_LEASE_OWNER_PATH}')" != '${leaseToken}' ]; then
   echo HOF_MUTATE_LEASE_MISMATCH
   exit 0
 fi
 `;
 }
+
+// How long a fenced write's own shared flock on EXECUTION_LEASE_PATH
+// (see fencedWriteScript() below) waits to be granted before giving up -
+// bounded rather than an unbounded blocking wait, matching this whole
+// module's own "never wait indefinitely" discipline. Generous relative
+// to how long the brief exclusive-then-downgrade window a genuine
+// acquisition/self-expiry ever needs actually takes (fractions of a
+// second) - a wait anywhere near this bound already means something is
+// genuinely wrong, not merely contended.
+const LEASE_SHARED_FLOCK_WAIT_S = 10;
+
+// PR 2 (item 10) third review, critical finding 1: leaseFencingScript()
+// alone still made the WHOLE correctness guarantee rest on every single
+// owner-record-touching code path remembering to take LOCK_GUARD_PATH's
+// guard, forever, with no independent backstop - a real gap if a future
+// write path (or a bug in an existing one) ever forgot. This adds a
+// second, kernel-enforced barrier that doesn't depend on that discipline
+// alone: a fenced write now ALSO takes a SHARED flock on
+// EXECUTION_LEASE_PATH itself (a separate fd from LOCK_GUARD_PATH's own),
+// held for the write's ENTIRE remaining script (the fencing check AND
+// the actual mutation) - and acquireMutex()'s own held script (see its
+// own comment) now holds that SAME file with a SHARED flock too
+// (downgraded from an initial EXCLUSIVE check, atomically, on the same
+// fd - see flock(2): "subsequent flock() calls on an already locked
+// file will convert an existing lock to the new lock mode"), instead of
+// holding it exclusively for its whole lifetime. Multiple SHARED
+// holders (the current holder, plus any number of in-flight fenced
+// writes) coexist freely - flock's own kernel semantics guarantee a NEW
+// acquisition's own EXCLUSIVE attempt on this same file cannot succeed
+// while ANY of them - the current holder OR any write still in flight,
+// regardless of which token it carries - still holds it. This closes
+// the residual window a lock.flock-only design left structurally open:
+// a write that has already, genuinely confirmed a still-active unit and
+// a matching owner token is now GUARANTEED to finish (or fail on its
+// own terms) before any new acquisition can even begin to take over -
+// never interleaved with one, regardless of whether every future write
+// path remembers LOCK_GUARD_PATH correctly on its own.
+function fencedWriteScript(leaseToken, criticalSection) {
+  if (leaseToken === undefined) return withLockGuard(criticalSection);
+  return `set -eu
+mkdir -p "$(dirname '${EXECUTION_LEASE_PATH}')"
+exec 7>'${EXECUTION_LEASE_PATH}'
+flock -w ${LEASE_SHARED_FLOCK_WAIT_S} -s 7
+${withLockGuard(`${leaseFencingScript(leaseToken)}${criticalSection}`)}`;
+}
+
 const journalPath = (operationId) => `/var/lib/hof/state/journal/${validateOperationId(operationId)}.json`;
 const eventsPath = (operationId) => `/var/lib/hof/state/journal/${validateOperationId(operationId)}.events.ndjson`;
 
@@ -563,7 +616,7 @@ fi
 
 export async function updateJournalStatus(conn, journalDocument, leaseToken, expectedPreviousDocument) {
   const targetPath = journalPath(journalDocument.operationId);
-  const script = withLockGuard(`${leaseFencingScript(leaseToken)}${journalCasCheckScript(targetPath, expectedPreviousDocument)}payload='${b64(journalDocument)}'
+  const script = fencedWriteScript(leaseToken, `${journalCasCheckScript(targetPath, expectedPreviousDocument)}payload='${b64(journalDocument)}'
 tmp=$(mktemp '${targetPath}.XXXXXX')
 printf '%s' "$payload" | base64 -d > "$tmp"
 mv -f "$tmp" '${targetPath}'
@@ -573,6 +626,43 @@ echo HOF_MUTATE_UPDATED`);
   if (tag === "HOF_MUTATE_LEASE_MISMATCH") throw new Error(`refusing to update the journal for operation ${journalDocument.operationId}: the execution lease no longer matches this write's own token on the target - another process may now hold it, or it has already self-expired`);
   if (tag === "HOF_MUTATE_CAS_CONFLICT") throw new Error(`refusing to update the journal for operation ${journalDocument.operationId}: the persisted document on the target no longer matches what was last read - another writer already landed a different transition first`);
   if (tag !== "HOF_MUTATE_UPDATED") throw new Error(`unexpected target-mutate response: ${JSON.stringify(stdout)}`);
+}
+
+// PR 2 (item 10) third review, high finding 4: appendEvent()'s own
+// caller (operation-v2.mjs's own writeEvent()) reads the persisted
+// journal, validates the event's own step/destination against it, and
+// only THEN calls this - the exact same two-round-trip gap
+// updateJournalStatus()'s own journalCasCheckScript() above already
+// closes for journal WRITES, now closed for EVENT writes too: the
+// append proceeds only if the journal is (a) still exactly
+// expectedJournalSnapshot, byte-for-byte (a real compare-and-swap,
+// catching ANY change, benign or not, since the read) and (b), checked
+// independently and reported distinctly for a clearer diagnosis, not
+// already terminal (a case CAS alone would also catch, but reported as
+// a generic conflict rather than the more specific, more actionable
+// "this operation already finished" it actually is). `"status":"..."`
+// is a fixed, compact substring JSON.stringify always produces
+// verbatim, regardless of surrounding key order - safe to match with a
+// plain case pattern, no JSON parser needed in shell.
+function journalGuardForEventScript(journalTargetPath, expectedJournalSnapshot) {
+  if (expectedJournalSnapshot === undefined) return "";
+  return `expected_journal_payload='${b64(expectedJournalSnapshot)}'
+if [ ! -r '${journalTargetPath}' ]; then
+  echo HOF_MUTATE_CAS_CONFLICT
+  exit 0
+fi
+current_journal=$(cat '${journalTargetPath}')
+case "$current_journal" in
+  *'"status":"succeeded"'*|*'"status":"failed"'*)
+    echo HOF_MUTATE_JOURNAL_TERMINAL
+    exit 0
+    ;;
+esac
+if [ "$current_journal" != "$(printf '%s' "$expected_journal_payload" | base64 -d)" ]; then
+  echo HOF_MUTATE_CAS_CONFLICT
+  exit 0
+fi
+`;
 }
 
 // Append-only NDJSON - one line per event, never rewritten or reordered.
@@ -586,15 +676,23 @@ echo HOF_MUTATE_UPDATED`);
 //
 // leaseToken (optional): same target-side fencing as
 // updateJournalStatus() above - see its own comment.
-export async function appendEvent(conn, operationId, event, leaseToken) {
+//
+// expectedJournalSnapshot (optional): PR 2 third review, high finding 4
+// - see journalGuardForEventScript()'s own comment. Required by
+// operation-v2.mjs's own writeEvent() (the v2-wrapped path); omitted by
+// v1/apply.mjs, which has no such journal-CAS concept of its own.
+export async function appendEvent(conn, operationId, event, leaseToken, expectedJournalSnapshot) {
   const targetPath = eventsPath(operationId);
-  const script = withLockGuard(`${leaseFencingScript(leaseToken)}payload='${b64(event)}'
+  const journalTargetPath = journalPath(operationId);
+  const script = fencedWriteScript(leaseToken, `${journalGuardForEventScript(journalTargetPath, expectedJournalSnapshot)}payload='${b64(event)}'
 mkdir -p "$(dirname '${targetPath}')"
 printf '%s\\n' "$(printf '%s' "$payload" | base64 -d)" >> '${targetPath}'
 echo HOF_MUTATE_APPENDED`);
   const stdout = await runScript(conn, script);
   const tag = stdout.split("\n")[0];
   if (tag === "HOF_MUTATE_LEASE_MISMATCH") throw new Error(`refusing to append an event for operation ${operationId}: the execution lease no longer matches this write's own token on the target - another process may now hold it, or it has already self-expired`);
+  if (tag === "HOF_MUTATE_JOURNAL_TERMINAL") throw new Error(`refusing to append an event for operation ${operationId}: the persisted journal is already terminal - no further events are ever appended once an operation has genuinely finished`);
+  if (tag === "HOF_MUTATE_CAS_CONFLICT") throw new Error(`refusing to append an event for operation ${operationId}: the persisted journal on the target no longer matches what was last read - another writer already changed it`);
   if (tag !== "HOF_MUTATE_APPENDED") throw new Error(`unexpected target-mutate response: ${JSON.stringify(stdout)}`);
 }
 
@@ -740,9 +838,22 @@ export async function acquireMutex(conn) {
   // a fencing check run after self-expiry sees an absent owner record
   // (leaseFencingScript()'s own `[ ! -r OWNER_PATH ]` branch) rather
   // than a stale, still-matching token.
+  // PR 2 (item 10) third review, critical finding 1: still holds
+  // EXECUTION_LEASE_PATH's own fd 9 EXCLUSIVELY only for the brief
+  // instant needed to prove no one else currently holds ANY lock on it
+  // (neither another holder nor an in-flight fenced write, which now
+  // also takes a lock on this same file - see fencedWriteScript()'s own
+  // comment) - then immediately, atomically downgrades the SAME fd to
+  // SHARED (`flock -s 9`, converting in place per flock(2), never
+  // releasing it even momentarily) for the rest of its own lifetime.
+  // Shared coexists with every fenced write's own shared hold; it does
+  // NOT coexist with a FUTURE acquisition's own exclusive check, which
+  // is exactly the point - see fencedWriteScript()'s own comment for
+  // the full reasoning.
   const heldScript = [
     `exec 9>${EXECUTION_LEASE_PATH}`,
     "if flock -n -x 9; then",
+    "flock -s 9",
     `exec 8>${LOCK_GUARD_PATH}`,
     "flock -x 8",
     "umask 077",

@@ -1385,6 +1385,24 @@ test("acquireMutex: real target-side flock contention across two concurrent acqu
     // its exact column format.
     await onTarget("sh", "-c", "systemctl kill -s SIGKILL 'hof-exec-lease-*.service'");
 
+    // PR 2 (item 10) third review, item 2: a stale write carrying the
+    // now-dead holder's own token must be refused EVEN BEFORE any new
+    // acquisition ever takes over - leaseFencingScript()'s own
+    // `systemctl is-active` check (for THIS token's own unit,
+    // independent of whatever the owner record file still says) is what
+    // catches this, not merely a new acquisition having since
+    // overwritten the owner record. The owner record itself still holds
+    // `first`'s own token at this exact point (SIGKILL never cleans it
+    // up) - if this refusal only worked AFTER a handoff, it would prove
+    // the wrong mechanism.
+    const staleOperationId = randomUUID();
+    const staleEvent = { apiVersion: "hof.dev/operation-event/v1", operationId: staleOperationId, step: "001.host.prepare", attempt: 1, phase: "started", at: new Date().toISOString() };
+    await assert.rejects(
+      () => appendEvent(conn, staleOperationId, staleEvent, first.token),
+      /execution lease no longer matches this write's own token/,
+      "a write carrying the just-killed holder's own token must be refused immediately, before any new acquisition ever takes over",
+    );
+
     // The kernel releases the real flock the instant the holding
     // process is gone - no need to wait out the self-expiry bound at
     // all - so a fresh acquisition succeeds immediately, proving real
@@ -1393,6 +1411,19 @@ test("acquireMutex: real target-side flock contention across two concurrent acqu
     try {
       await first.assertOwnership();
       assert.equal(first.isLost(), true, "the original acquisition must notice its own unit is really gone once it's actually killed");
+
+      // After the real handoff: the stale (dead) token is still refused
+      // (now doubly so - its unit is gone AND the owner record has been
+      // overwritten), and the CURRENT holder's own token genuinely
+      // succeeds - confirming the refusal above isn't merely a broken
+      // write path.
+      await assert.rejects(
+        () => appendEvent(conn, staleOperationId, staleEvent, first.token),
+        /execution lease no longer matches this write's own token/,
+      );
+      await appendEvent(conn, staleOperationId, staleEvent, second.token);
+      const written = await onTarget("cat", `/var/lib/hof/state/journal/${staleOperationId}.events.ndjson`);
+      assert.deepEqual(JSON.parse(written.trim()), staleEvent, "the current holder's own token must genuinely succeed in writing to the real target after a genuine handoff");
     } finally {
       await second.release();
     }

@@ -368,6 +368,27 @@ export async function writeJournalStatus(mutate, conn, lease, { operationKind, j
 // (operation-journal-v2.schema.json's own immutability, enforced by
 // withJournalStatus()/writeJournalStatus() above) - not anything a
 // caller can substitute.
+// PR 2 review, High finding 3 (third round): two further gaps in the
+// same journal-bound design. First, nothing ever refused an event
+// against a journal that was already terminal (succeeded/failed) - an
+// event genuinely has no business being appended once an operation has
+// already, honestly finished (ADR 0006's own terminal-journal
+// semantics); checked explicitly here, before ever reaching the raw
+// transport (target-mutate.mjs's own appendEvent() independently
+// re-checks this too, atomically, against whatever is ACTUALLY
+// persisted at write time - see its own journalGuardForEventScript()
+// comment; this JS-side check is the fast, early rejection for the
+// common case). Second, `persisted.plan` was trusted directly, with
+// only assertJournalValid()'s own schema check behind it -
+// operation-journal-v2.schema.json's own `plan` field is deliberately
+// loosely typed (no schema in this repo cross-references another by
+// $id), so a hand-tampered-but-still-schema-valid persisted journal
+// could carry a plan whose own `operations` array doesn't actually
+// match what its own `planId` claims. assertBundleBinding() runs the
+// real cross-document/content checks (backup-flow.mjs's own
+// validateBackupBundle()/validateRestoreBundle()) - including
+// recomputing plan.planId from its own content - before that plan is
+// ever trusted for the step/destination binding below.
 export async function writeEvent(mutate, conn, lease, { operationKind, operationId, event }) {
   await assertLeaseHealthy(lease);
   await assertEventValid(event);
@@ -380,6 +401,10 @@ export async function writeEvent(mutate, conn, lease, { operationKind, operation
   if (persisted.operationKind !== operationKind) {
     throw new Error(`refusing to write: the persisted journal's own operationKind (${persisted.operationKind}) does not match this write's own operationKind (${operationKind})`);
   }
+  if (persisted.status !== "in-progress") {
+    throw new Error(`refusing to write: the persisted journal for operation ${operationId} is already terminal (status: ${persisted.status}) - no further events are ever appended once an operation has genuinely finished`);
+  }
+  assertBundleBinding(operationKind, { plan: persisted.plan, journal: persisted });
   if (event.operationId !== operationId) {
     throw new Error(`refusing to write: event.operationId (${event.operationId}) does not match the operationId this write is for (${operationId}) - refusing a possible operation-id substitution`);
   }
@@ -393,5 +418,11 @@ export async function writeEvent(mutate, conn, lease, { operationKind, operation
   if (event.destination !== undefined && event.destination !== step.destination) {
     throw new Error(`refusing to write: event.destination (${event.destination}) does not match the persisted journal's own plan step ${event.step}'s destination (${step.destination ?? "none"})`);
   }
-  return mutate.appendEvent(conn, operationId, event, lease.token);
+  // PR 2 review, High finding 4 (third round): `persisted` - the EXACT
+  // snapshot just read and validated above - is passed straight through
+  // as target-mutate.mjs's own expectedJournalSnapshot, so the real
+  // compare-and-swap (and the independent terminal-status re-check) runs
+  // atomically, on the target, immediately before the append - not as
+  // two independently racing JS-orchestrated round trips.
+  return mutate.appendEvent(conn, operationId, event, lease.token, persisted);
 }

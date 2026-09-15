@@ -278,7 +278,7 @@ function fakeMutate({ journals = new Map() } = {}) {
       return journal ? { status: "present", journal } : { status: "absent", journal: null };
     },
     async updateJournalStatus(conn, journal, leaseToken, expectedPreviousDocument) { calls.push(["updateJournalStatus", journal, leaseToken, expectedPreviousDocument]); journals.set(journal.operationId, journal); },
-    async appendEvent(conn, operationId, event, leaseToken) { calls.push(["appendEvent", operationId, event, leaseToken]); },
+    async appendEvent(conn, operationId, event, leaseToken, expectedJournalSnapshot) { calls.push(["appendEvent", operationId, event, leaseToken, expectedJournalSnapshot]); },
   };
 }
 
@@ -614,11 +614,54 @@ test("writeEvent: refuses an event whose own destination doesn't match the persi
   assert.equal(mutate.calls.length, 0);
 });
 
-test("writeEvent: a healthy lease and a genuinely plan-bound event (bound against the PERSISTED journal's own plan) reach the raw transport, carrying the lease's own token", async () => {
+test("writeEvent: a healthy lease and a genuinely plan-bound event (bound against the PERSISTED journal's own plan) reach the raw transport, carrying the lease's own token AND the exact persisted journal snapshot", async () => {
   const journalDoc = await realBackupJournal();
   const event = await realBackupEvent();
   const mutate = fakeMutate({ journals: new Map([[OPERATION_ID, journalDoc]]) });
   await writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event });
   assert.equal(mutate.calls.length, 1);
-  assert.deepEqual(mutate.calls[0], ["appendEvent", OPERATION_ID, event, LEASE_TOKEN]);
+  // PR 2 review, High finding 4 (third round): the exact persisted
+  // snapshot - not a re-derived or default one - must be threaded
+  // through as target-mutate.mjs's own expectedJournalSnapshot, so the
+  // real compare-and-swap (and the independent terminal-status re-
+  // check) runs atomically on the target, not as two independently
+  // racing JS round trips.
+  assert.deepEqual(mutate.calls[0], ["appendEvent", OPERATION_ID, event, LEASE_TOKEN, journalDoc]);
+});
+
+// PR 2 review, High finding 3 (third round): an event has no business
+// being appended once the persisted journal has already, genuinely
+// finished - checked here, distinctly from the raw transport's own
+// independent re-check (test/target-mutate.test.mjs's own equivalent
+// test covers that layer).
+test("writeEvent: refuses when the persisted journal is already terminal, before ever reaching the raw transport", async () => {
+  const journalDoc = await realBackupJournal();
+  const succeeded = await withJournalStatus(journalDoc, { status: "succeeded" });
+  const event = await realBackupEvent();
+  const mutate = fakeMutate({ journals: new Map([[OPERATION_ID, succeeded]]) });
+  await assert.rejects(
+    () => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event }),
+    /already terminal \(status: succeeded\)/,
+  );
+  assert.equal(mutate.calls.length, 0);
+});
+
+// PR 2 review, High finding 3 (third round): a persisted journal whose
+// own embedded plan is schema-valid but internally inconsistent (its
+// own planId doesn't actually match its own content) must never be
+// trusted for step/destination binding - assertJournalValid() alone
+// (a schema check only, since operation-journal-v2.schema.json's own
+// `plan` field is deliberately loosely typed) would not have caught
+// this; assertBundleBinding() does, by recomputing planId from content.
+test("writeEvent: refuses when the persisted journal's own embedded plan fails bundle binding (a tampered-but-schema-valid planId), before ever reaching the raw transport", async () => {
+  const plan = buildBackupPlan();
+  const tamperedPlan = { ...plan, planId: sha("0") }; // schema-valid shape, but no longer matches its own content
+  const journalDoc = await realBackupJournal({ plan: tamperedPlan, approvedPlanId: tamperedPlan.planId });
+  const event = await realBackupEvent();
+  const mutate = fakeMutate({ journals: new Map([[OPERATION_ID, journalDoc]]) });
+  await assert.rejects(
+    () => writeEvent(mutate, {}, healthyLease(), { operationKind: "backup", operationId: OPERATION_ID, event }),
+    /does not match its own recomputed content-id|planId/,
+  );
+  assert.equal(mutate.calls.length, 0);
 });

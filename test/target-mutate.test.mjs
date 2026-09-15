@@ -444,6 +444,108 @@ test("appendEvent: with a leaseToken, embeds the same real target-side fencing c
   );
 });
 
+// PR 2 (item 10) third review, critical finding 1: leaseFencingScript()
+// now also checks `systemctl is-active` for the SPECIFIC unit this
+// token's own acquisition would have created - not merely the owner
+// record's own file content - a belt-and-suspenders check independent
+// of whatever cleared (or didn't) the owner record.
+test("leaseFencingScript (via updateJournalStatus): checks systemctl is-active for the token-derived unit name, not just the owner record's file content", async () => {
+  const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "succeeded", committedGeneration: 1 };
+  const { run, calls } = mockRun({ sshStdout: "HOF_MUTATE_UPDATED\n" });
+  await updateJournalStatus({ ...SSH_TARGET, run }, journalDoc, LEASE_TOKEN);
+  const script = calls.find((c) => c.command === "ssh").input;
+  assert.match(script, new RegExp(`systemctl is-active 'hof-exec-lease-${LEASE_TOKEN}\\.service'`));
+});
+
+// PR 2 (item 10) third review, critical finding 1: every fenced write
+// (acquireLockAndJournal/updateJournalStatus/appendEvent) now ALSO
+// takes a SHARED flock on EXECUTION_LEASE_PATH itself, held for its
+// entire remaining script - a second, kernel-enforced barrier
+// independent of LOCK_GUARD_PATH alone (see fencedWriteScript()'s own
+// comment for the full reasoning). Without a leaseToken, none of this
+// applies at all - unchanged from before this review.
+test("fencedWriteScript: every fenced write (with a leaseToken) takes a shared flock on exec.lease itself, held for the whole script; without a leaseToken, no such lock is taken at all", async () => {
+  const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "succeeded", committedGeneration: 1 };
+  const event = { apiVersion: "hof.dev/operation-event/v1", operationId: OPERATION_ID, step: "001.host.prepare", attempt: 1, phase: "started", at: "2026-08-27T10:00:00Z" };
+  const lockDoc = { apiVersion: "hof.dev/operation-lock/v1", operationId: OPERATION_ID };
+
+  async function scriptFor(name) {
+    if (name === "acquireLockAndJournal") {
+      const { calls } = await (async () => { const m = mockRun({ sshStdout: "HOF_MUTATE_CREATED\n" }); await acquireLockAndJournal({ ...SSH_TARGET, run: m.run }, lockDoc, journalDoc, LEASE_TOKEN); return m; })();
+      return calls.find((c) => c.command === "ssh").input;
+    }
+    if (name === "updateJournalStatus") {
+      const m = mockRun({ sshStdout: "HOF_MUTATE_UPDATED\n" });
+      await updateJournalStatus({ ...SSH_TARGET, run: m.run }, journalDoc, LEASE_TOKEN);
+      return m.calls.find((c) => c.command === "ssh").input;
+    }
+    const m = mockRun({ sshStdout: "HOF_MUTATE_APPENDED\n" });
+    await appendEvent({ ...SSH_TARGET, run: m.run }, OPERATION_ID, event, LEASE_TOKEN);
+    return m.calls.find((c) => c.command === "ssh").input;
+  }
+
+  for (const name of ["acquireLockAndJournal", "updateJournalStatus", "appendEvent"]) {
+    const script = await scriptFor(name);
+    assert.match(script, new RegExp(EXECUTION_LEASE_PATH_ESCAPED), `${name}: must open EXECUTION_LEASE_PATH itself`);
+    assert.match(script, /flock -w \d+ -s 7/, `${name}: must take a bounded, shared flock on it`);
+    // The shared lock must be taken BEFORE the fencing check/critical
+    // section (LOCK_GUARD_PATH's own exclusive flock) - held for the
+    // whole remaining script, not released and reacquired partway
+    // through.
+    assert.ok(script.indexOf("flock -w") < script.indexOf("lock.flock"), `${name}: the shared exec.lease flock must be taken before entering the lock.flock-guarded critical section`);
+  }
+
+  // Without a leaseToken: no exec.lease involvement at all.
+  const unfenced = mockRun({ sshStdout: "HOF_MUTATE_APPENDED\n" });
+  await appendEvent({ ...SSH_TARGET, run: unfenced.run }, OPERATION_ID, event);
+  const unfencedScript = unfenced.calls.find((c) => c.command === "ssh").input;
+  assert.doesNotMatch(unfencedScript, /flock -w \d+ -s 7/);
+});
+
+// PR 2 (item 10) third review, high finding 4: appendEvent() now takes
+// an optional expectedJournalSnapshot, closing the same two-round-trip
+// TOCTOU gap updateJournalStatus()'s own CAS already closes for journal
+// writes - now for EVENT writes too, plus an independent, distinctly-
+// reported terminal-status check (see journalGuardForEventScript()'s
+// own comment for why both, not just CAS).
+test("appendEvent: with expectedJournalSnapshot, embeds both a real target-side terminal-status check and a compare-and-swap against the persisted journal, before ever appending; without one, the script carries neither", async () => {
+  const event = { apiVersion: "hof.dev/operation-event/v1", operationId: OPERATION_ID, step: "001.host.prepare", attempt: 1, phase: "started", at: "2026-08-27T10:00:00Z" };
+  const previousJournal = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "in-progress", committedGeneration: null };
+  const guarded = mockRun({ sshStdout: "HOF_MUTATE_APPENDED\n" });
+  await appendEvent({ ...SSH_TARGET, run: guarded.run }, OPERATION_ID, event, undefined, previousJournal);
+  const guardedScript = guarded.calls.find((c) => c.command === "ssh").input;
+  assert.match(guardedScript, /HOF_MUTATE_JOURNAL_TERMINAL/);
+  assert.match(guardedScript, /"status":"succeeded"/);
+  assert.match(guardedScript, /"status":"failed"/);
+  assert.match(guardedScript, /HOF_MUTATE_CAS_CONFLICT/);
+  const embeddedPrevious = [...guardedScript.matchAll(/expected_journal_payload='([A-Za-z0-9+/=]+)'/g)].map((m) => JSON.parse(Buffer.from(m[1], "base64").toString("utf8")));
+  assert.ok(embeddedPrevious.some((p) => JSON.stringify(p) === JSON.stringify(previousJournal)));
+
+  const unguarded = mockRun({ sshStdout: "HOF_MUTATE_APPENDED\n" });
+  await appendEvent({ ...SSH_TARGET, run: unguarded.run }, OPERATION_ID, event);
+  const unguardedScript = unguarded.calls.find((c) => c.command === "ssh").input;
+  assert.doesNotMatch(unguardedScript, /HOF_MUTATE_JOURNAL_TERMINAL/);
+  assert.doesNotMatch(unguardedScript, /HOF_MUTATE_CAS_CONFLICT/);
+});
+
+test("appendEvent: a real HOF_MUTATE_JOURNAL_TERMINAL response is refused with a clear, distinct error, never conflated with a CAS conflict or lease mismatch", async () => {
+  const event = { apiVersion: "hof.dev/operation-event/v1", operationId: OPERATION_ID, step: "001.host.prepare", attempt: 1, phase: "started", at: "2026-08-27T10:00:00Z" };
+  const previousJournal = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "in-progress", committedGeneration: null };
+  await assert.rejects(
+    () => appendEvent({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_JOURNAL_TERMINAL\n" }).run }, OPERATION_ID, event, undefined, previousJournal),
+    /already terminal - no further events are ever appended/,
+  );
+});
+
+test("appendEvent: a real HOF_MUTATE_CAS_CONFLICT response (on the journal, not the events file) is refused with a clear, distinct error", async () => {
+  const event = { apiVersion: "hof.dev/operation-event/v1", operationId: OPERATION_ID, step: "001.host.prepare", attempt: 1, phase: "started", at: "2026-08-27T10:00:00Z" };
+  const previousJournal = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "in-progress", committedGeneration: null };
+  await assert.rejects(
+    () => appendEvent({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_CAS_CONFLICT\n" }).run }, OPERATION_ID, event, undefined, previousJournal),
+    /persisted journal on the target no longer matches what was last read/,
+  );
+});
+
 test("readEvents: absent (never appended to yet) returns an empty array, not an error", async () => {
   const events = await readEvents({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run }, OPERATION_ID);
   assert.deepEqual(events, []);

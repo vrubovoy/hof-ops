@@ -65,6 +65,15 @@ function targetConnectionEqual(a, b) {
   return deepEqual(pick(a), pick(b));
 }
 
+// Every key for a given action, WITHOUT deduplicating - unlike
+// mapByIndex below (a Map, which silently collapses two operations that
+// happen to share a key down to one entry), this is what a caller must
+// use to actually detect "the same resource/destination targeted twice"
+// before ever building a Map from the same data.
+function keysOf(ops, action, keyFn) {
+  return ops.filter((op) => op.action === action).map(keyFn);
+}
+
 function mapByIndex(ops, action, keyFn) {
   const map = new Map();
   ops.forEach((op, i) => {
@@ -102,14 +111,24 @@ export function validateBackupPlanOperations(plan) {
     if (byAction(action).length === 0) violations.push(`expected at least one ${action} operation`);
   }
 
-  const snapshotByDestination = mapByIndex(ops, "snapshot.create", (op) => op.destination);
-  const retentionByDestination = mapByIndex(ops, "retention.apply", (op) => op.destination);
-  if (sortedJSON([...snapshotByDestination.keys()]) !== sortedJSON(destinationNames)) {
+  // A second, uniquely-IDed operation for a destination/resource already
+  // covered is invisible to a Map-based cardinality check (the second
+  // write just overwrites the first's own index) - a fourth review
+  // round found exactly that gap. keysOf below returns every key WITHOUT
+  // deduplicating, so hasDuplicates can actually see a repeat before
+  // anything downstream ever collapses it into a Map.
+  const snapshotKeys = keysOf(ops, "snapshot.create", (op) => op.destination);
+  const retentionKeys = keysOf(ops, "retention.apply", (op) => op.destination);
+  if (hasDuplicates(snapshotKeys, (k) => k)) violations.push("more than one snapshot.create operation targets the same destination");
+  if (hasDuplicates(retentionKeys, (k) => k)) violations.push("more than one retention.apply operation targets the same destination");
+  if (sortedJSON(snapshotKeys) !== sortedJSON(destinationNames)) {
     violations.push("snapshot.create operations must cover exactly the plan's own destinations, one each");
   }
-  if (sortedJSON([...retentionByDestination.keys()]) !== sortedJSON(destinationNames)) {
+  if (sortedJSON(retentionKeys) !== sortedJSON(destinationNames)) {
     violations.push("retention.apply operations must cover exactly the plan's own destinations, one each");
   }
+  const snapshotByDestination = mapByIndex(ops, "snapshot.create", (op) => op.destination);
+  const retentionByDestination = mapByIndex(ops, "retention.apply", (op) => op.destination);
   // Per-destination predecessor: THIS destination's own retention.apply
   // must come after THIS destination's own snapshot.create - checking
   // only "every retention after every snapshot in aggregate" would miss
@@ -208,19 +227,24 @@ export function validateRestorePlanOperations(plan) {
 
   const expectedNetworks = plan.networks.map((n) => n.name);
   const networkResources = byAction("network.create").map((op) => op.resource);
+  if (hasDuplicates(networkResources, (k) => k)) violations.push("more than one network.create operation targets the same network");
   if (sortedJSON(networkResources) !== sortedJSON(expectedNetworks)) {
     violations.push("network.create operations must cover exactly the plan's own networks, one each");
   }
 
   const expectedVolumes = plan.consistencySet.map((entry) => entry.volume);
-  const volumeByResource = mapByIndex(ops, "volume.create", (op) => op.resource);
-  const dataRestoreByResource = mapByIndex(ops, "data.restore", (op) => op.resource);
-  if (sortedJSON([...volumeByResource.keys()]) !== sortedJSON(expectedVolumes)) {
+  const volumeKeys = keysOf(ops, "volume.create", (op) => op.resource);
+  const dataRestoreKeys = keysOf(ops, "data.restore", (op) => op.resource);
+  if (hasDuplicates(volumeKeys, (k) => k)) violations.push("more than one volume.create operation targets the same resource");
+  if (hasDuplicates(dataRestoreKeys, (k) => k)) violations.push("more than one data.restore operation targets the same resource");
+  if (sortedJSON(volumeKeys) !== sortedJSON(expectedVolumes)) {
     violations.push("volume.create operations must cover exactly the plan's own consistencySet volumes, one each");
   }
-  if (sortedJSON([...dataRestoreByResource.keys()]) !== sortedJSON(expectedVolumes)) {
+  if (sortedJSON(dataRestoreKeys) !== sortedJSON(expectedVolumes)) {
     violations.push("data.restore operations must cover exactly the plan's own consistencySet volumes, one each");
   }
+  const volumeByResource = mapByIndex(ops, "volume.create", (op) => op.resource);
+  const dataRestoreByResource = mapByIndex(ops, "data.restore", (op) => op.resource);
   // Per-resource predecessor: THIS volume's own volume.create must
   // precede THIS volume's own data.restore.
   for (const [resource, dataRestoreIndex] of dataRestoreByResource) {
@@ -237,6 +261,8 @@ export function validateRestorePlanOperations(plan) {
     if (ops[ops.length - 1].action !== "evidence.write") violations.push("evidence.write must be the last operation");
   }
 
+  const targetVerifyIndex = indexOfAction(ops, "target.verify-clean");
+  const snapshotVerifyIndex = indexOfAction(ops, "snapshot.verify");
   const networkIndices = indicesOfAction(ops, "network.create");
   const volumeIndices = indicesOfAction(ops, "volume.create");
   const dataRestoreIndices = indicesOfAction(ops, "data.restore");
@@ -247,6 +273,20 @@ export function validateRestorePlanOperations(plan) {
   const stateIndex = indexOfAction(ops, "state.restore");
   const startIndices = indicesOfAction(ops, "service.start");
   const readinessIndices = indicesOfAction(ops, "readiness.wait");
+
+  // A fourth review round found nothing checked that a restore actually
+  // confirms the target is clean and the snapshot is genuinely the right
+  // one BEFORE creating any network/volume or touching any data -
+  // runner.install < target.verify-clean was already implied by
+  // runner.install being required first, but target.verify-clean <
+  // snapshot.verify < network.create never was.
+  const firstNetwork = networkIndices.length > 0 ? Math.min(...networkIndices) : Infinity;
+  if (targetVerifyIndex >= 0 && snapshotVerifyIndex >= 0 && targetVerifyIndex > snapshotVerifyIndex) {
+    violations.push("target.verify-clean must come before snapshot.verify");
+  }
+  if (snapshotVerifyIndex >= 0 && snapshotVerifyIndex > firstNetwork) {
+    violations.push("snapshot.verify must come before every network.create - nothing is provisioned before the snapshot is confirmed genuine");
+  }
 
   const lastNetwork = Math.max(-1, ...networkIndices);
   if (volumeIndices.some((i) => i < lastNetwork)) {
@@ -319,6 +359,15 @@ export function validateBackupBundle({ policy, plan, manifest, evidence, kit, lo
     if (policy.policyId !== expectedPolicyId) violations.push("policy.policyId does not match its own recomputed content-id");
     if (plan.backupPolicyId !== policy.policyId) violations.push("plan.backupPolicyId does not match the supplied policy's own policyId");
     if (plan.installationId !== policy.installationId) violations.push("plan.installationId does not match the supplied policy's own installationId");
+    // A stale policy (last reconfirmed at an older generation than the
+    // one this plan is actually built against) must never authorize a
+    // newer generation's backup silently - policy.appliedGeneration
+    // exists specifically so this can be checked (see backup-policy-v1
+    // schema's own field description), but a fourth review round found
+    // it never actually was.
+    if (plan.generation !== policy.appliedGeneration) {
+      violations.push("plan.generation does not match the supplied policy's own appliedGeneration - the policy is stale and must be reconfirmed via apply first");
+    }
     // A plan referencing the right policyId while quietly using
     // different destinations/retention would otherwise bypass the whole
     // point of an approved policy - the id binding alone never checked
@@ -373,6 +422,36 @@ export function validateBackupBundle({ policy, plan, manifest, evidence, kit, lo
     }
     if (evidence.status === "succeeded" && sortedJSON(resultDestinations) !== sortedJSON(expectedDestinations)) {
       violations.push("a succeeded backup's evidence must report every configured destination, exactly - not a subset");
+    }
+
+    // Evidence was never actually bound to the operation (lock/journal)
+    // that supposedly produced it - a fourth review round found this
+    // gap: two entirely unrelated operationIds could share a plan
+    // without ever being cross-checked.
+    if (lock && evidence.operationId !== lock.operationId) violations.push("evidence.operationId does not match lock.operationId");
+    if (journal) {
+      if (evidence.operationId !== journal.operationId) violations.push("evidence.operationId does not match journal.operationId");
+      // journal.status is binary (in-progress/succeeded/failed);
+      // evidence.status is a three-way honest account
+      // (succeeded/partial/failed) - see backup-evidence-v1's own
+      // description for why. The two must still reconcile: journal
+      // reaches a terminal status only once evidence.write ran, so
+      // "in-progress" can never coexist with evidence existing at all,
+      // "succeeded" must correspond to evidence.status: succeeded, and
+      // "failed" must correspond to evidence.status: partial or failed
+      // (never succeeded).
+      if (journal.status === "in-progress") {
+        violations.push("journal.status: in-progress can never coexist with evidence - evidence.write is what terminates the journal");
+      }
+      if (journal.status === "succeeded" && evidence.status !== "succeeded") {
+        violations.push("journal.status: succeeded must correspond to evidence.status: succeeded");
+      }
+      if (journal.status === "failed" && evidence.status === "succeeded") {
+        violations.push("journal.status: failed can never correspond to evidence.status: succeeded");
+      }
+      if (evidence.abandoned === true && journal.status !== "failed") {
+        violations.push("evidence.abandoned: true must correspond to journal.status: failed - abandonment is itself a terminal failure");
+      }
     }
   }
 
@@ -443,6 +522,11 @@ export function validateRestoreBundle({ plan, manifest, evidence, kit, lock, jou
     if (manifest.release !== plan.source.release) violations.push("manifest.release does not match plan.source.release");
     if (manifest.releaseLockDigest !== plan.source.releaseLockDigest) violations.push("manifest.releaseLockDigest does not match plan.source.releaseLockDigest");
     if (manifest.backupToolLockDigest !== plan.backupToolLockDigest) violations.push("manifest.backupToolLockDigest does not match plan.backupToolLockDigest");
+    // ADR 0006's own Restore Flow text: "confirming the manifest's own
+    // recoveryKitDigest matches the kit actually obtained, before
+    // trusting anything else in the snapshot" - documented, never
+    // actually implemented until a fourth review round caught it.
+    if (manifest.recoveryKitDigest !== plan.recoveryKitDigest) violations.push("manifest.recoveryKitDigest does not match plan.recoveryKitDigest");
     if (!exactSetEquals(manifest.consistencySet, plan.consistencySet, consistencySetEntryKey)) {
       violations.push("manifest.consistencySet does not exactly match plan.consistencySet");
     }
@@ -472,6 +556,22 @@ export function validateRestoreBundle({ plan, manifest, evidence, kit, lock, jou
     // genuinely clean, at planning time; evidence.target.installationId
     // is the source installationId state.restore actually assigned).
     if (!targetConnectionEqual(evidence.target, plan.target)) violations.push("evidence.target's own connection identity does not match plan.target's");
+
+    if (lock && evidence.operationId !== lock.operationId) violations.push("evidence.operationId does not match lock.operationId");
+    if (journal) {
+      if (evidence.operationId !== journal.operationId) violations.push("evidence.operationId does not match journal.operationId");
+      // restore-evidence-v1's own status is binary (succeeded/failed,
+      // no "partial") - it maps directly onto journal.status.
+      if (journal.status === "in-progress") {
+        violations.push("journal.status: in-progress can never coexist with evidence - evidence.write is what terminates the journal");
+      }
+      if (journal.status !== evidence.status && journal.status !== "in-progress") {
+        violations.push("journal.status does not match evidence.status");
+      }
+      if (evidence.abandoned === true && journal.status !== "failed") {
+        violations.push("evidence.abandoned: true must correspond to journal.status: failed - abandonment is itself a terminal failure");
+      }
+    }
   }
 
   if (lock) {
@@ -509,6 +609,13 @@ export function validateRestoreBundle({ plan, manifest, evidence, kit, lock, jou
       if (event.operationKind !== "restore") violations.push(`event for step ${event.step} has operationKind other than restore`);
       if (!planStepIds.has(event.step)) violations.push(`event names step "${event.step}", which is not in the plan's own operations`);
     }
+    // A fourth review round found validateRestoreCommittedGeneration()
+    // existed but was never actually wired into this bundle - only
+    // exercised directly by its own unit tests, never as part of
+    // validating a real bundle.
+    if (journal) {
+      violations.push(...validateRestoreCommittedGeneration(journal, events, plan.source.generation));
+    }
   }
 
   return violations;
@@ -520,13 +627,22 @@ export function validateRestoreBundle({ plan, manifest, evidence, kit, lock, jou
 // state.restore actually succeeded, a fact only the event log carries.
 // This checks exactly that: committedGeneration must be non-null if and
 // only if a succeeded event for the state.restore step exists.
-export function validateRestoreCommittedGeneration(journal, events) {
+// step ids are "NNN.action.resource" - matched anchored/in full here,
+// never via .includes(), which a fourth review round found could in
+// principle be fooled by an unrelated action+resource combination whose
+// concatenation happens to contain this same substring.
+const STATE_RESTORE_STEP = /^[0-9]{3}\.state\.restore\.[a-z][a-z0-9.-]*$/;
+
+export function validateRestoreCommittedGeneration(journal, events, expectedGeneration) {
   const violations = [];
-  const stateRestoreSucceeded = events.some((event) => event.phase === "succeeded" && event.step.includes(".state.restore."));
-  if (stateRestoreSucceeded && journal.committedGeneration === null) {
-    violations.push("committedGeneration must be set once state.restore has actually succeeded, regardless of the operation's own later outcome");
-  }
-  if (!stateRestoreSucceeded && journal.committedGeneration !== null) {
+  const stateRestoreSucceeded = events.some((event) => event.phase === "succeeded" && STATE_RESTORE_STEP.test(event.step));
+  if (stateRestoreSucceeded) {
+    if (journal.committedGeneration === null) {
+      violations.push("committedGeneration must be set once state.restore has actually succeeded, regardless of the operation's own later outcome");
+    } else if (journal.committedGeneration !== expectedGeneration) {
+      violations.push("committedGeneration does not match the source generation state.restore actually committed");
+    }
+  } else if (journal.committedGeneration !== null) {
     violations.push("committedGeneration must stay null until state.restore actually succeeds");
   }
   return violations;

@@ -537,6 +537,20 @@ test("validateBackupPlanOperations: flags a duplicate destination name or consis
   assert.ok(dupVolumes.some((v) => v.includes("plan.consistencySet has a duplicate")), JSON.stringify(dupVolumes));
 });
 
+test("validateBackupPlanOperations: flags a SECOND, uniquely-IDed snapshot.create or retention.apply for a destination already covered - a Map-based cardinality check alone would silently let the second overwrite the first", () => {
+  const opsWithDupSnapshot = fullBackupOperations();
+  const snapshotIndex = opsWithDupSnapshot.findIndex((op) => op.id === "004.snapshot.create.onsite");
+  opsWithDupSnapshot.splice(snapshotIndex + 1, 0, { id: "004b.snapshot.create.onsite.dup", phase: "snapshot", action: "snapshot.create", resource: "onsite", destination: "onsite", reason: "duplicate" });
+  const v1 = validateBackupPlanOperations(buildBackupPlan({ operations: opsWithDupSnapshot }));
+  assert.ok(v1.some((v) => v.includes("more than one snapshot.create operation targets the same destination")), JSON.stringify(v1));
+
+  const opsWithDupRetention = fullBackupOperations();
+  const retentionIndex = opsWithDupRetention.findIndex((op) => op.id === "006.retention.apply.onsite");
+  opsWithDupRetention.splice(retentionIndex + 1, 0, { id: "006b.retention.apply.onsite.dup", phase: "retention", action: "retention.apply", resource: "onsite", destination: "onsite", reason: "duplicate" });
+  const v2 = validateBackupPlanOperations(buildBackupPlan({ operations: opsWithDupRetention }));
+  assert.ok(v2.some((v) => v.includes("more than one retention.apply operation targets the same destination")), JSON.stringify(v2));
+});
+
 // =============================================================================
 // restore-plan-v1
 // =============================================================================
@@ -618,6 +632,18 @@ test("restore-plan-v1: a network.create operation under the data phase validates
 test("restore-plan-v1: rejects an empty networks array - a clean target always needs at least one created", async () => {
   const validate = await validatorFor("restore-plan-v1.schema.json");
   assert.equal(validate(buildRestorePlan({ networks: [] })), false);
+});
+
+test("restore-plan-v1: rejects a network named by its bare logical key instead of its real physical name", async () => {
+  const validate = await validatorFor("restore-plan-v1.schema.json");
+  assert.equal(validate(buildRestorePlan({ networks: [{ name: "hof", internal: false }] })), false);
+});
+
+test("restore-plan-v1: rejects internal: false for hof-wachter-internal, and internal: true for any other network - only that one network is ever internal", async () => {
+  const validate = await validatorFor("restore-plan-v1.schema.json");
+  assert.equal(validate(buildRestorePlan({ networks: [{ name: "hof-wachter-internal", internal: false }] })), false);
+  assert.equal(validate(buildRestorePlan({ networks: [{ name: "hof-hof", internal: true }] })), false);
+  assert.ok(validate(buildRestorePlan({ networks: [{ name: "hof-wachter-internal", internal: true }] })), JSON.stringify(validate.errors));
 });
 
 test("restore-plan-v1: rejects a missing source field", async () => {
@@ -736,6 +762,42 @@ test("validateRestorePlanOperations: flags a duplicate consistencySet volume or 
 
   const dupNetworks = validateRestorePlanOperations(buildRestorePlan({ networks: [{ name: "hof-hof", internal: false }, { name: "hof-hof", internal: false }] }));
   assert.ok(dupNetworks.some((v) => v.includes("plan.networks has a duplicate")), JSON.stringify(dupNetworks));
+});
+
+test("validateRestorePlanOperations: flags a SECOND, uniquely-IDed volume.create, data.restore, or network.create for a resource already covered", () => {
+  const opsWithDupVolume = fullRestoreOperations();
+  const volumeIndex = opsWithDupVolume.findIndex((op) => op.id === "005.volume.create.schlussel-data");
+  opsWithDupVolume.splice(volumeIndex + 1, 0, { id: "005b.volume.create.schlussel-data.dup", phase: "data", action: "volume.create", resource: "schlussel-data", reason: "duplicate" });
+  const v1 = validateRestorePlanOperations(buildRestorePlan({ operations: opsWithDupVolume }));
+  assert.ok(v1.some((v) => v.includes("more than one volume.create operation targets the same resource")), JSON.stringify(v1));
+
+  const opsWithDupDataRestore = fullRestoreOperations();
+  const dataRestoreIndex = opsWithDupDataRestore.findIndex((op) => op.id === "006.data.restore.schlussel-data");
+  opsWithDupDataRestore.splice(dataRestoreIndex + 1, 0, { id: "006b.data.restore.schlussel-data.dup", phase: "data", action: "data.restore", resource: "schlussel-data", reason: "duplicate" });
+  const v2 = validateRestorePlanOperations(buildRestorePlan({ operations: opsWithDupDataRestore }));
+  assert.ok(v2.some((v) => v.includes("more than one data.restore operation targets the same resource")), JSON.stringify(v2));
+
+  const opsWithDupNetwork = fullRestoreOperations();
+  const networkIndex = opsWithDupNetwork.findIndex((op) => op.id === "004.network.create.hof-hof");
+  opsWithDupNetwork.splice(networkIndex + 1, 0, { id: "004b.network.create.hof-hof.dup", phase: "data", action: "network.create", resource: "hof-hof", reason: "duplicate" });
+  const v3 = validateRestorePlanOperations(buildRestorePlan({ operations: opsWithDupNetwork }));
+  assert.ok(v3.some((v) => v.includes("more than one network.create operation targets the same network")), JSON.stringify(v3));
+});
+
+test("validateRestorePlanOperations: flags target.verify-clean after snapshot.verify, or snapshot.verify after network.create - nothing may be provisioned before the target and snapshot are both confirmed genuine", () => {
+  const opsSwapVerify = fullRestoreOperations();
+  const targetVerifyIndex = opsSwapVerify.findIndex((op) => op.action === "target.verify-clean");
+  const snapshotVerifyIndex = opsSwapVerify.findIndex((op) => op.action === "snapshot.verify");
+  [opsSwapVerify[targetVerifyIndex], opsSwapVerify[snapshotVerifyIndex]] = [opsSwapVerify[snapshotVerifyIndex], opsSwapVerify[targetVerifyIndex]];
+  const v1 = validateRestorePlanOperations(buildRestorePlan({ operations: opsSwapVerify }));
+  assert.ok(v1.some((v) => v.includes("target.verify-clean must come before snapshot.verify")), JSON.stringify(v1));
+
+  const opsSnapshotAfterNetwork = fullRestoreOperations();
+  const snapshotVerifyIndex2 = opsSnapshotAfterNetwork.findIndex((op) => op.action === "snapshot.verify");
+  const networkIndex2 = opsSnapshotAfterNetwork.findIndex((op) => op.action === "network.create");
+  [opsSnapshotAfterNetwork[snapshotVerifyIndex2], opsSnapshotAfterNetwork[networkIndex2]] = [opsSnapshotAfterNetwork[networkIndex2], opsSnapshotAfterNetwork[snapshotVerifyIndex2]];
+  const v2 = validateRestorePlanOperations(buildRestorePlan({ operations: opsSnapshotAfterNetwork }));
+  assert.ok(v2.some((v) => v.includes("snapshot.verify must come before every network.create")), JSON.stringify(v2));
 });
 
 // =============================================================================
@@ -1257,6 +1319,13 @@ test("validateBackupBundle: a plan referencing the right policyId while actually
   assert.ok(v2.some((v) => v.includes("plan.retention does not match the approved policy")), JSON.stringify(v2));
 });
 
+test("validateBackupBundle: flags a plan built against a stale policy - plan.generation must match policy.appliedGeneration", () => {
+  const policy = buildBackupPolicy({ appliedGeneration: 3 });
+  const staleGenerationPlan = buildBackupPlan({ generation: 9 }, { policy });
+  const violations = validateBackupBundle({ policy, plan: staleGenerationPlan });
+  assert.ok(violations.some((v) => v.includes("plan.generation does not match the supplied policy's own appliedGeneration")), JSON.stringify(violations));
+});
+
 test("validateBackupBundle: a kit is bound to the plan's own installation/generation and the manifest's own recoveryKitDigest", () => {
   const kit = buildRecoveryKit();
   const plan = buildBackupPlan();
@@ -1290,7 +1359,7 @@ test("validateBackupBundle: a genuinely coherent bundle including lock, journal,
     apiVersion: "hof.dev/operation-journal/v2", operationKind: "backup", operationId: OPERATION_ID,
     approvedPlanId: plan.planId, target: plan.target, plan: { apiVersion: "hof.dev/backup-plan/v1", planId: plan.planId },
     inputDigests: { releaseLockDigest: plan.releaseLockDigest, backupToolLockDigest: plan.backupToolLockDigest, backupPolicyId: plan.backupPolicyId },
-    startedAt: "2026-09-04T10:00:00Z", status: "in-progress", committedGeneration: null,
+    startedAt: "2026-09-04T10:00:00Z", status: "succeeded", committedGeneration: null,
   };
   const events = plan.operations.map((op) => ({
     apiVersion: "hof.dev/operation-event/v2", operationKind: "backup", operationId: OPERATION_ID,
@@ -1319,6 +1388,37 @@ test("validateBackupBundle: flags an event whose operationId/operationKind doesn
   const unknownStepEvent = { apiVersion: "hof.dev/operation-event/v2", operationKind: "backup", operationId: OPERATION_ID, step: "999.unknown.step.here", attempt: 1, phase: "started", at: "2026-09-04T10:01:00Z" };
   assert.ok(validateBackupBundle({ plan, journal, events: [badEvent] }).some((v) => v.includes("operationId not matching the journal")));
   assert.ok(validateBackupBundle({ plan, journal, events: [unknownStepEvent] }).some((v) => v.includes("not in the plan")));
+});
+
+test("validateBackupBundle: evidence is bound to lock/journal by operationId, and journal status must reconcile with evidence status/abandoned", () => {
+  const policy = buildBackupPolicy();
+  const plan = buildBackupPlan({}, { policy });
+  const manifest = buildBackupManifest({}, { plan });
+  const evidence = buildBackupEvidence({}, { plan, manifest });
+  const lock = { apiVersion: "hof.dev/operation-lock/v2", operationKind: "backup", operationId: OPERATION_ID, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-09-04T10:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  const succeededJournal = { apiVersion: "hof.dev/operation-journal/v2", operationKind: "backup", operationId: OPERATION_ID, approvedPlanId: plan.planId, target: plan.target, plan: { apiVersion: "hof.dev/backup-plan/v1", planId: plan.planId }, inputDigests: { releaseLockDigest: plan.releaseLockDigest, backupToolLockDigest: plan.backupToolLockDigest, backupPolicyId: plan.backupPolicyId }, startedAt: "2026-09-04T10:00:00Z", status: "succeeded", committedGeneration: null };
+
+  // evidence.operationId not matching lock/journal
+  const otherEvidence = buildBackupEvidence({ operationId: "some-other-op-id" }, { plan, manifest });
+  assert.ok(validateBackupBundle({ plan, evidence: otherEvidence, lock }).some((v) => v.includes("evidence.operationId does not match lock.operationId")));
+  assert.ok(validateBackupBundle({ plan, evidence: otherEvidence, journal: succeededJournal }).some((v) => v.includes("evidence.operationId does not match journal.operationId")));
+
+  // journal.status: in-progress can never coexist with evidence
+  const inProgressJournal = { ...succeededJournal, status: "in-progress" };
+  assert.ok(validateBackupBundle({ plan, evidence, journal: inProgressJournal }).some((v) => v.includes("in-progress can never coexist with evidence")));
+
+  // journal.status: succeeded must correspond to evidence.status: succeeded
+  const partialEvidence = buildBackupEvidence({ status: "partial", perDestinationResults: [buildDestinationResult({ destination: "onsite" }), { destination: "offsite", status: "failed", error: "timeout" }] }, { plan, manifest });
+  assert.ok(validateBackupBundle({ plan, evidence: partialEvidence, journal: succeededJournal }).some((v) => v.includes("journal.status: succeeded must correspond to evidence.status: succeeded")));
+
+  // journal.status: failed can never correspond to evidence.status: succeeded
+  const failedJournal = { ...succeededJournal, status: "failed" };
+  assert.ok(validateBackupBundle({ plan, evidence, journal: failedJournal }).some((v) => v.includes("journal.status: failed can never correspond to evidence.status: succeeded")));
+
+  // evidence.abandoned: true must correspond to journal.status: failed
+  const abandonedEvidence = buildBackupEvidence({ status: "failed", perDestinationResults: [], readinessConfirmedAt: null, abandoned: true }, { plan, manifest });
+  assert.ok(validateBackupBundle({ plan, evidence: abandonedEvidence, journal: succeededJournal }).some((v) => v.includes("evidence.abandoned: true must correspond to journal.status: failed")));
+  assert.deepEqual(validateBackupBundle({ plan, evidence: abandonedEvidence, journal: failedJournal }).filter((v) => v.includes("abandoned")), []);
 });
 
 test("validateRestoreBundle: a genuinely coherent plan/manifest/evidence bundle has zero violations", () => {
@@ -1364,6 +1464,13 @@ test("validateRestoreBundle: flags a manifest whose backupToolLockDigest doesn't
   const plan = buildRestorePlan({}, { manifest: buildRestoreManifest() });
   const violations = validateRestoreBundle({ plan, manifest });
   assert.ok(violations.some((v) => v.includes("manifest.backupToolLockDigest")), JSON.stringify(violations));
+});
+
+test("validateRestoreBundle: flags a manifest whose own recoveryKitDigest doesn't match the plan's own - ADR 0006 promises this is confirmed before trusting anything else in the snapshot", () => {
+  const manifest = buildRestoreManifest({ recoveryKitDigest: sha("0") });
+  const plan = buildRestorePlan({}, { manifest: buildRestoreManifest() });
+  const violations = validateRestoreBundle({ plan, manifest });
+  assert.ok(violations.some((v) => v.includes("manifest.recoveryKitDigest")), JSON.stringify(violations));
 });
 
 test("validateRestoreBundle: a kit is bound to the plan's own source installation/generation and the plan's own recoveryKitDigest", () => {
@@ -1412,7 +1519,7 @@ test("validateRestoreBundle: a genuinely coherent bundle including lock, journal
     apiVersion: "hof.dev/operation-journal/v2", operationKind: "restore", operationId: OPERATION_ID,
     approvedPlanId: plan.planId, target: plan.target, plan: { apiVersion: "hof.dev/restore-plan/v1", planId: plan.planId },
     inputDigests: { releaseLockDigest: plan.source.releaseLockDigest, backupToolLockDigest: plan.backupToolLockDigest, manifestDigest: plan.manifestDigest, recoveryKitDigest: plan.recoveryKitDigest },
-    startedAt: "2026-09-04T10:00:00Z", status: "in-progress", committedGeneration: null,
+    startedAt: "2026-09-04T10:00:00Z", status: "succeeded", committedGeneration: plan.source.generation,
   };
   const events = plan.operations.map((op) => ({
     apiVersion: "hof.dev/operation-event/v2", operationKind: "restore", operationId: OPERATION_ID,
@@ -1421,16 +1528,50 @@ test("validateRestoreBundle: a genuinely coherent bundle including lock, journal
   assert.deepEqual(validateRestoreBundle({ plan, manifest, evidence, lock, journal, events }), []);
 });
 
+test("validateRestoreBundle: evidence is bound to lock/journal by operationId, and journal status must reconcile with evidence status/abandoned", () => {
+  const manifest = buildRestoreManifest();
+  const plan = buildRestorePlan({}, { manifest });
+  const evidence = buildRestoreEvidence({}, { plan });
+  const lock = { apiVersion: "hof.dev/operation-lock/v2", operationKind: "restore", operationId: OPERATION_ID, approvedPlanId: plan.planId, target: plan.target, acquiredAt: "2026-09-04T10:00:00Z", acquiredBy: { workstation: "w", pid: 1, user: "u" } };
+  const succeededJournal = { apiVersion: "hof.dev/operation-journal/v2", operationKind: "restore", operationId: OPERATION_ID, approvedPlanId: plan.planId, target: plan.target, plan: { apiVersion: "hof.dev/restore-plan/v1", planId: plan.planId }, inputDigests: { releaseLockDigest: plan.source.releaseLockDigest, backupToolLockDigest: plan.backupToolLockDigest, manifestDigest: plan.manifestDigest, recoveryKitDigest: plan.recoveryKitDigest }, startedAt: "2026-09-04T10:00:00Z", status: "succeeded", committedGeneration: plan.source.generation };
+
+  const otherEvidence = buildRestoreEvidence({ operationId: "some-other-op-id" }, { plan });
+  assert.ok(validateRestoreBundle({ plan, evidence: otherEvidence, lock }).some((v) => v.includes("evidence.operationId does not match lock.operationId")));
+  assert.ok(validateRestoreBundle({ plan, evidence: otherEvidence, journal: succeededJournal }).some((v) => v.includes("evidence.operationId does not match journal.operationId")));
+
+  const inProgressJournal = { ...succeededJournal, status: "in-progress" };
+  assert.ok(validateRestoreBundle({ plan, evidence, journal: inProgressJournal }).some((v) => v.includes("in-progress can never coexist with evidence")));
+
+  const failedJournal = { ...succeededJournal, status: "failed", committedGeneration: null };
+  assert.ok(validateRestoreBundle({ plan, evidence, journal: failedJournal }).some((v) => v.includes("journal.status does not match evidence.status")));
+
+  const abandonedEvidence = buildRestoreEvidence({ status: "failed", error: "operator abandoned", dataRestoredCheckpointAt: null, readinessConfirmedAt: null, abandoned: true }, { plan });
+  assert.ok(validateRestoreBundle({ plan, evidence: abandonedEvidence, journal: succeededJournal }).some((v) => v.includes("evidence.abandoned: true must correspond to journal.status: failed")));
+  const journalMatchingAbandoned = { ...succeededJournal, status: "failed", committedGeneration: null };
+  assert.deepEqual(validateRestoreBundle({ plan, evidence: abandonedEvidence, journal: journalMatchingAbandoned }).filter((v) => v.includes("abandoned")), []);
+});
+
 test("validateRestoreCommittedGeneration: correctness against the real event log, independent of overall journal status", () => {
   const committed = { committedGeneration: 7 };
+  const wrongValue = { committedGeneration: 8 };
   const notCommitted = { committedGeneration: null };
   const withStateRestore = [{ step: "012.state.restore.state", phase: "succeeded" }];
   const withoutStateRestore = [{ step: "011.secret.materialize.secrets", phase: "succeeded" }];
 
-  assert.deepEqual(validateRestoreCommittedGeneration(committed, withStateRestore), []);
-  assert.deepEqual(validateRestoreCommittedGeneration(notCommitted, withoutStateRestore), []);
-  assert.ok(validateRestoreCommittedGeneration(notCommitted, withStateRestore).some((v) => v.includes("must be set once state.restore")));
-  assert.ok(validateRestoreCommittedGeneration(committed, withoutStateRestore).some((v) => v.includes("must stay null")));
+  assert.deepEqual(validateRestoreCommittedGeneration(committed, withStateRestore, 7), []);
+  assert.deepEqual(validateRestoreCommittedGeneration(notCommitted, withoutStateRestore, 7), []);
+  assert.ok(validateRestoreCommittedGeneration(notCommitted, withStateRestore, 7).some((v) => v.includes("must be set once state.restore")));
+  assert.ok(validateRestoreCommittedGeneration(committed, withoutStateRestore, 7).some((v) => v.includes("must stay null")));
+  assert.ok(validateRestoreCommittedGeneration(wrongValue, withStateRestore, 7).some((v) => v.includes("does not match the source generation")));
+});
+
+test("validateRestoreCommittedGeneration: matches state.restore by full step shape, never by loose substring", () => {
+  // A pathological step naming another action+resource whose
+  // concatenation happens to contain "state.restore" as a substring
+  // must never be mistaken for the real state.restore step.
+  const notReallyStateRestore = [{ step: "010.config.restore.state", phase: "succeeded" }];
+  assert.deepEqual(validateRestoreCommittedGeneration({ committedGeneration: null }, notReallyStateRestore, 7), []);
+  assert.ok(validateRestoreCommittedGeneration({ committedGeneration: 7 }, notReallyStateRestore, 7).some((v) => v.includes("must stay null")));
 });
 
 // =============================================================================

@@ -114,14 +114,22 @@
       "pattern": "^[a-z][a-z0-9-]{0,62}$"
     },
     "network": {
-      "description": "A network's own PHYSICAL name (render-topology.mjs's own physicalNetworkName() output) plus whether it must be created internal - the same shape plan-v2's own network.ensure operation implicitly carries (name + a conditional internal flag), made explicit here since restore has no baseline to diff against.",
+      "description": "A network's own PHYSICAL name (render-topology.mjs's own physicalNetworkName() output, always \"hof-\" + the logical key - COMPOSE_PROJECT_NAME is a fixed, hardcoded constant, not configurable) plus whether it must be created internal - the same shape plan-v2's own network.ensure operation implicitly carries (name + a conditional internal flag), made explicit here since restore has no baseline to diff against. A fourth review round found the earlier draft's name pattern accepted the bare logical key (\"hof\", never a real physical name) and left internal fully independent of name (so {name: \"hof-wachter-internal\", internal: false} - contradicting the one network plan.mjs itself ever marks internal - was schema-valid); both are now real, enforced structural constraints, not merely prose.",
       "type": "object",
       "additionalProperties": false,
       "required": ["name", "internal"],
       "properties": {
-        "name": { "$ref": "#/$defs/identifier" },
+        "name": { "type": "string", "pattern": "^hof-[a-z][a-z0-9.-]{0,75}$" },
         "internal": { "type": "boolean" }
-      }
+      },
+      "allOf": [
+        {
+          "description": "Only hof-wachter-internal (WACHTER_INTERNAL_NETWORK_NAME) is ever internal - render-topology.mjs's own physicalNetworkName(\"wachter-internal\") - every other physical network is external.",
+          "if": { "properties": { "name": { "const": "hof-wachter-internal" } } },
+          "then": { "properties": { "internal": { "const": true } } },
+          "else": { "properties": { "internal": { "const": false } } }
+        }
+      ]
     },
     "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
     "operationId": {

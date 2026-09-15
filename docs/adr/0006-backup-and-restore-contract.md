@@ -136,7 +136,21 @@ a `lock`, `journal`, or `event` argument at all, so `operationId`,
 `operationKind`, `target`, `approvedPlanId`, `inputDigests`, and every
 event's own `step`/`operationId`/`operationKind` went entirely
 unchecked. Both functions now take optional `lock`/`journal`/`events`
-parameters and check all of the above when supplied.
+parameters and check all of the above when supplied - a fourth review
+round then found `evidence` itself was still an island: nothing checked
+`evidence.operationId` against `lock.operationId`/`journal.operationId`,
+nor that a `journal`'s own terminal `status` actually reconciles with
+what `evidence` claims (`journal.status: in-progress` can never coexist
+with evidence at all - `evidence.write` is what terminates the journal;
+`succeeded` must correspond to `evidence.status: succeeded`; `failed`
+can never correspond to `evidence.status: succeeded`; `evidence.
+abandoned: true` must correspond to `journal.status: failed`, since
+abandonment is itself a terminal failure). Both bundle validators now
+check this too. `operation-journal-v2.schema.json`'s own embedded `plan`
+also required only `apiVersion` until this same round - a schema-valid
+journal could omit `planId` entirely, contradicting the bundle
+validators' own assumption that `journal.plan.planId` exists; `plan` now
+requires both.
 
 **`operation-event-v2` exists alongside the unchanged
 `operation-event-v1` for a semantic reason, not because lock/journal
@@ -247,6 +261,13 @@ while quietly carrying its OWN, different `destinations` or `retention`
 what the plan does. `scripts/backup-flow.mjs`'s own `validateBackupBundle()`
 now also requires `plan.destinations`/`plan.retention` to exactly,
 structurally match the supplied policy's own - not merely share an id.
+A fourth review round found one more way the same bypass could happen:
+nothing checked `plan.generation === policy.appliedGeneration` either,
+so a plan built at a NEWER generation than the policy's own last
+reconfirmation could still be authorized by a genuinely stale policy -
+exactly the freshness check `appliedGeneration`'s own field description
+already promised but `validateBackupBundle()` never implemented. It now
+does.
 
 **`backupId` is a domain-separated digest, never a content-id of the
 plan - and a new, monotonic `backupSequence` is why. `backupSequence`
@@ -429,7 +450,10 @@ Planning-time: obtain the recovery kit, the recovery age identity, the
 destination, and the `backupId`; verify the restic snapshot, the backup
 manifest embedded in it (confirming the manifest's own
 `recoveryKitDigest` matches the kit actually obtained, before trusting
-anything else in the snapshot), and the signed historical release lock
+anything else in the snapshot - a fourth review round found this exact
+check, despite being named right here since this ADR's own first draft,
+had never actually been implemented in `validateRestoreBundle()`; it now
+is), and the signed historical release lock
 it names (a release lock from `v0.2.1`, say, restored onto a target
 running today's tooling, still verifies against exactly the signature
 identity it was originally signed with); pin the new target's own
@@ -468,7 +492,14 @@ made `restore-plan-v1` the one inconsistent network-naming contract in
 the whole repo. Each network entry also carries its own `internal` flag
 - `plan.mjs`'s own `network.ensure` sets it for exactly one network,
 `hof-wachter-internal`, and restore must recreate that same property,
-not merely the network's bare existence) and `data.restore` for the full
+not merely the network's bare existence. A fourth review round found the
+third round's own fix was still prose-only - `{name: "hof", internal:
+false}` and `{name: "hof-wachter-internal", internal: false}` were both
+still schema-valid. `restore-plan-v1.schema.json`'s own `network` $def
+now really enforces both: `name` must match `^hof-[a-z][a-z0-9.-]{0,75}$`
+(rejecting the bare logical key outright), and `internal` is `const true`
+exactly when `name` is `"hof-wachter-internal"`, `const false` for every
+other name) and `data.restore` for the full
 consistency set; `manifest.verify` and `database.integrity-check`
 against the actually-restored files, before any container using them
 ever starts; `checkpoint.data-restored` (a durable, resumable marker -
@@ -483,18 +514,28 @@ that this generation's data arrived via a restore, from which backup,
 onto which new host - is recorded separately from `current.json`, never
 folded into the generation history itself); `service.start`
 (dependencies-first, gateway last), `readiness.wait`; finally
-`evidence.write`. Completeness and the FULL ordering chain (network
-before volume, volume before its own data.restore, every data.restore
-before verification, verification before the sole privileged checkpoint,
-config/secret/state restoration before service.start, service.start
-before readiness.wait) are checked by `scripts/backup-flow.mjs`'s own
-pure `validateRestorePlanOperations()`, the restore-side sibling of the
+`evidence.write`. Completeness and the FULL ordering chain (`target.
+verify-clean` before `snapshot.verify` before any `network.create` -
+nothing is provisioned before the target and the snapshot are both
+confirmed genuine; network before volume; volume before its own
+`data.restore`; every `data.restore` before verification; verification
+before the sole privileged checkpoint; config/secret/state restoration
+before `service.start`; `service.start` before `readiness.wait`) are
+checked by `scripts/backup-flow.mjs`'s own pure
+`validateRestorePlanOperations()`, the restore-side sibling of the
 backup one above - a third review round found the first two drafts of
 this same function checked only a handful of these relationships (data.
 restore-before-checkpoint, config/secret/state-after-checkpoint),
 silently accepting volume.create after its own data.restore, network.
 create after volume.create, or verification after the checkpoint it is
-supposed to gate.
+supposed to gate; a fourth round found it still let a restore create
+networks/volumes or touch data before the target's own cleanliness or
+the snapshot's own genuineness were ever confirmed. Both flow validators
+also now detect a SECOND, uniquely-IDed operation quietly targeting a
+destination/resource/network already covered - the earlier Map-based
+cardinality check (one entry per key) silently let a second write
+overwrite the first's own index, so the count-of-keys check alone never
+actually caught the duplicate.
 
 **Failure semantics and resumability.** All configured destinations are
 required for a backup's own overall success, exactly as stated above.

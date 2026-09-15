@@ -248,6 +248,13 @@ test("operation-journal-v2: rejects a missing input digest", async () => {
   assert.equal(validate(journal), false);
 });
 
+test("operation-journal-v2: rejects an embedded plan with no planId - a fourth review round found the earlier draft required only apiVersion, leaving the bundle validators' own journal.plan.planId assumption unenforced by schema", async () => {
+  const validate = await validatorFor("operation-journal-v2.schema.json");
+  const journal = journalFixture();
+  delete journal.plan.planId;
+  assert.equal(validate(journal), false);
+});
+
 test("operation-journal-v2: rejects an SSH-mode target with no host key", async () => {
   const validate = await validatorFor("operation-journal-v2.schema.json");
   assert.equal(validate(journalFixture({ target: targetBinding({ hostKeySha256: null }) })), false);

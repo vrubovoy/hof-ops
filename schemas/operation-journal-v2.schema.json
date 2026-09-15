@@ -19,11 +19,12 @@
     },
     "target": { "$ref": "#/$defs/targetBinding" },
     "plan": {
-      "description": "The full, exact plan document this operation was approved against - not just its planId. Loosely typed here on purpose (no schema in this repo cross-references another by $id) - already validated against the schema matching operationKind before ever being embedded. Its own apiVersion is still constrained below (backup-plan-v1 for backup, restore-plan-v1 for restore) - the one piece of the embedded document's own shape this schema can and does check directly, even without a full cross-schema $ref.",
+      "description": "The full, exact plan document this operation was approved against. Loosely typed here on purpose (no schema in this repo cross-references another by $id) - already validated against the schema matching operationKind before ever being embedded, so this schema only ever re-checks the two fields it can meaningfully constrain without a full cross-schema $ref: apiVersion (below) and planId. A fourth review round found the previous draft required only apiVersion, so a schema-valid journal could embed {apiVersion: \"...\"} alone with no planId at all - directly contradicting scripts/backup-flow.mjs's own bundle validators, which already assumed journal.plan.planId exists. The REST of the embedded document's own integrity (every other field genuinely matching what planId claims) is never re-validated by this schema either - it is the caller's own responsibility, verified independently by recomputing planId from the full document (scripts/backup-ids.mjs's canonicalContentId) when a caller supplies both the journal and the real plan to a bundle validator.",
       "type": "object",
-      "required": ["apiVersion"],
+      "required": ["apiVersion", "planId"],
       "properties": {
-        "apiVersion": { "type": "string" }
+        "apiVersion": { "type": "string" },
+        "planId": { "$ref": "#/$defs/planId" }
       }
     },
     "inputDigests": {

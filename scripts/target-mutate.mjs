@@ -391,10 +391,56 @@ const LEASE_SHARED_FLOCK_WAIT_S = 10;
 // own terms) before any new acquisition can even begin to take over -
 // never interleaved with one, regardless of whether every future write
 // path remembers LOCK_GUARD_PATH correctly on its own.
+// PR 2 (item 10) fourth review, high finding 1: `systemctl is-active`
+// is an ASYNCHRONOUS, userspace-bookkeeping signal - after a hard kill
+// (SIGKILL, OOM), the KERNEL releases every flock the dying process
+// held IMMEDIATELY (as part of process exit itself), but systemd's own
+// ActiveState transition is a SEPARATE, unsynchronized event, processed
+// on systemd's own event loop once it reaps the child via SIGCHLD -
+// there is a real, if narrow, window where the kernel has ALREADY freed
+// the flock but `systemctl is-active` still reports "active". A stale
+// write's own leaseFencingScript() check, run during exactly that
+// window, would see "active" AND a still-matching (never cleared, since
+// a hard kill skips the self-expiry branch entirely) owner record, and
+// wrongly proceed. round 3's own shared-flock addition does NOT close
+// this by itself - it only proves no NEW ACQUISITION is currently mid-
+// handoff; a shared lock request always succeeds instantly whether or
+// not anyone else is currently holding one, so it says nothing about
+// whether the CLAIMED holder is still genuinely alive.
+//
+// Fixed with a real, kernel-verified liveness probe that has none of
+// systemd's own lag: BEFORE ever taking this write's own shared hold,
+// attempt a bare, non-blocking EXCLUSIVE flock on EXECUTION_LEASE_PATH
+// via a throwaway fd. Kernel flock state is authoritative and
+// synchronous (unlike ActiveState) - if the probe succeeds, that is
+// definitive proof NOTHING currently holds this file at all (neither a
+// genuinely alive holder, NOR any other in-flight writer), which means
+// the owner record - whatever it claims - is unconditionally stale;
+// refused immediately, without ever even reading it. The probe is
+// released immediately either way (this write must never itself hold
+// the file exclusively) before proceeding to take its OWN shared hold
+// (fd 7, unaffected by the now-released probe) and, only if the probe
+// found someone genuinely there, falling through to the existing
+// systemctl+owner-record check as a second, complementary layer (which
+// still matters even when the probe fails to find "no one home" - a
+// GENUINE, different, currently-alive holder's own token would also
+// legitimately fail the probe, and must still be told apart from THIS
+// write's own token via the owner record). A probe attempted from a fd
+// that ALSO held this write's own shared lock would always self-block
+// (flock(2): independent open file descriptions on the same file DO
+// conflict with each other, even from the same process) - which is
+// exactly why the probe must run strictly BEFORE fd 7 is ever taken,
+// not after.
 function fencedWriteScript(leaseToken, criticalSection) {
   if (leaseToken === undefined) return withLockGuard(criticalSection);
   return `set -eu
 mkdir -p "$(dirname '${EXECUTION_LEASE_PATH}')"
+exec 6>'${EXECUTION_LEASE_PATH}'
+if flock -n -x 6; then
+  flock -u 6
+  echo HOF_MUTATE_LEASE_MISMATCH
+  exit 0
+fi
 exec 7>'${EXECUTION_LEASE_PATH}'
 flock -w ${LEASE_SHARED_FLOCK_WAIT_S} -s 7
 ${withLockGuard(`${leaseFencingScript(leaseToken)}${criticalSection}`)}`;
@@ -604,10 +650,16 @@ export async function readGenerationSnapshotReleaseLock(conn, generation) {
 // guard, immediately before the write - if anything already changed it,
 // this refuses with HOF_MUTATE_CAS_CONFLICT rather than blindly
 // overwriting whatever is actually there now.
+// PR 2 review, Low finding (third round, proactively applied here too -
+// same bug pattern the reviewer found in journalGuardForEventScript()
+// below): compares the base64-ENCODED form of the file's actual bytes,
+// not the decoded text - see that function's own comment for why a
+// decoded-text comparison is not genuinely byte-for-byte (command
+// substitution strips every trailing newline from both sides alike).
 function journalCasCheckScript(targetPath, expectedPreviousDocument) {
   if (expectedPreviousDocument === undefined) return "";
   return `expected_payload='${b64(expectedPreviousDocument)}'
-if [ ! -r '${targetPath}' ] || [ "$(cat '${targetPath}')" != "$(printf '%s' "$expected_payload" | base64 -d)" ]; then
+if [ ! -r '${targetPath}' ] || [ "$(base64 -w0 < '${targetPath}')" != "$expected_payload" ]; then
   echo HOF_MUTATE_CAS_CONFLICT
   exit 0
 fi
@@ -644,6 +696,24 @@ echo HOF_MUTATE_UPDATED`);
 // is a fixed, compact substring JSON.stringify always produces
 // verbatim, regardless of surrounding key order - safe to match with a
 // plain case pattern, no JSON parser needed in shell.
+// PR 2 review, Low finding (third round): the CAS comparison used to
+// decode both sides ($(cat targetPath) and $(printf ... | base64 -d))
+// before comparing them - but $(...) command substitution strips EVERY
+// trailing newline from its own output, on BOTH sides alike. A journal
+// file altered by nothing but an appended trailing newline (a real,
+// if narrow, tampering/corruption case) would compare EQUAL despite its
+// true bytes genuinely differing - not the byte-for-byte comparison
+// this function's own name and comment claimed. Fixed: compare the
+// base64-ENCODED form of the file's actual bytes instead of the decoded
+// text - base64 encodes every input byte (a trailing \n included) into
+// its own alphabet, never as a literal newline character in the
+// encoded output itself, so encoding-then-comparing is immune to
+// command substitution's own trailing-newline stripping (which only
+// ever removes `base64 -w0`'s own single, cosmetic, format-level
+// trailing newline - not anything reflecting the FILE's real content).
+// The terminal-status check below still safely uses the decoded text -
+// a substring match is unaffected by trailing-newline-stripping either
+// way, since it never depends on matching the very end of the string.
 function journalGuardForEventScript(journalTargetPath, expectedJournalSnapshot) {
   if (expectedJournalSnapshot === undefined) return "";
   return `expected_journal_payload='${b64(expectedJournalSnapshot)}'
@@ -651,14 +721,14 @@ if [ ! -r '${journalTargetPath}' ]; then
   echo HOF_MUTATE_CAS_CONFLICT
   exit 0
 fi
-current_journal=$(cat '${journalTargetPath}')
-case "$current_journal" in
+case "$(cat '${journalTargetPath}')" in
   *'"status":"succeeded"'*|*'"status":"failed"'*)
     echo HOF_MUTATE_JOURNAL_TERMINAL
     exit 0
     ;;
 esac
-if [ "$current_journal" != "$(printf '%s' "$expected_journal_payload" | base64 -d)" ]; then
+current_journal_payload=$(base64 -w0 < '${journalTargetPath}')
+if [ "$current_journal_payload" != "$expected_journal_payload" ]; then
   echo HOF_MUTATE_CAS_CONFLICT
   exit 0
 fi

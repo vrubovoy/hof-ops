@@ -488,6 +488,14 @@ test("fencedWriteScript: every fenced write (with a leaseToken) takes a shared f
     const script = await scriptFor(name);
     assert.match(script, new RegExp(EXECUTION_LEASE_PATH_ESCAPED), `${name}: must open EXECUTION_LEASE_PATH itself`);
     assert.match(script, /flock -w \d+ -s 7/, `${name}: must take a bounded, shared flock on it`);
+    // PR 2 fourth review, high finding 1: the kernel-verified liveness
+    // probe (fd 6, non-blocking exclusive, released immediately either
+    // way) must run BEFORE this write's own shared hold (fd 7) is ever
+    // taken - a probe attempted from a fd that already held a shared
+    // lock would always self-block (flock(2): independent open file
+    // descriptions on the same file conflict even within one process).
+    assert.match(script, /flock -n -x 6/, `${name}: must take the kernel-verified liveness probe`);
+    assert.ok(script.indexOf("flock -n -x 6") < script.indexOf("flock -w"), `${name}: the liveness probe must run before the shared exec.lease flock is ever taken`);
     // The shared lock must be taken BEFORE the fencing check/critical
     // section (LOCK_GUARD_PATH's own exclusive flock) - held for the
     // whole remaining script, not released and reacquired partway
@@ -495,12 +503,34 @@ test("fencedWriteScript: every fenced write (with a leaseToken) takes a shared f
     assert.ok(script.indexOf("flock -w") < script.indexOf("lock.flock"), `${name}: the shared exec.lease flock must be taken before entering the lock.flock-guarded critical section`);
   }
 
-  // Without a leaseToken: no exec.lease involvement at all.
+  // Without a leaseToken: no exec.lease involvement at all - neither the
+  // probe nor the shared hold.
   const unfenced = mockRun({ sshStdout: "HOF_MUTATE_APPENDED\n" });
   await appendEvent({ ...SSH_TARGET, run: unfenced.run }, OPERATION_ID, event);
   const unfencedScript = unfenced.calls.find((c) => c.command === "ssh").input;
   assert.doesNotMatch(unfencedScript, /flock -w \d+ -s 7/);
+  assert.doesNotMatch(unfencedScript, /flock -n -x 6/);
 });
+
+// PR 2 (item 10) fourth review, high finding 1: `systemctl is-active`
+// lags real kernel-level process death (a hard kill releases the flock
+// immediately; systemd's own ActiveState update is a separate,
+// asynchronous event) - a stale write racing that exact window used to
+// still see "active" and a matching owner record, and wrongly proceed.
+// The kernel-verified probe closes it: if NOTHING currently holds
+// EXECUTION_LEASE_PATH at all (neither a genuinely alive holder nor any
+// other in-flight write), the probe itself succeeds, and this is
+// treated as unconditional, definitive proof of staleness - refused
+// immediately, without ever even consulting systemctl or the owner
+// record. A mocked `run` cannot distinguish which of the two checks
+// (the probe vs. the owner-record/systemctl check) actually produced a
+// given HOF_MUTATE_LEASE_MISMATCH response - both already have their
+// own dedicated rejection tests (this file's own fencing tests above;
+// see updateJournalStatus's own "a real HOF_MUTATE_LEASE_MISMATCH
+// response..." test) and share the identical, correct handling either
+// way. Real, end-to-end confirmation that the probe actually closes the
+// SIGKILL race against a genuine target - not merely a mocked response
+// - is test/apply-acceptance.impl.mjs's own job.
 
 // PR 2 (item 10) third review, high finding 4: appendEvent() now takes
 // an optional expectedJournalSnapshot, closing the same two-round-trip

@@ -1385,16 +1385,26 @@ test("acquireMutex: real target-side flock contention across two concurrent acqu
     // its exact column format.
     await onTarget("sh", "-c", "systemctl kill -s SIGKILL 'hof-exec-lease-*.service'");
 
-    // PR 2 (item 10) third review, item 2: a stale write carrying the
+    // PR 2 (item 10) third/fourth review: a stale write carrying the
     // now-dead holder's own token must be refused EVEN BEFORE any new
-    // acquisition ever takes over - leaseFencingScript()'s own
-    // `systemctl is-active` check (for THIS token's own unit,
-    // independent of whatever the owner record file still says) is what
-    // catches this, not merely a new acquisition having since
-    // overwritten the owner record. The owner record itself still holds
+    // acquisition ever takes over. The owner record itself still holds
     // `first`'s own token at this exact point (SIGKILL never cleans it
     // up) - if this refusal only worked AFTER a handoff, it would prove
-    // the wrong mechanism.
+    // the wrong mechanism. A third review round's own `systemctl
+    // is-active` check alone was found insufficient for this exact
+    // moment: systemd's own ActiveState update lags the kernel's real,
+    // immediate flock release after a hard kill (a separate,
+    // asynchronous event on systemd's own side), a real, if narrow,
+    // window `systemctl is-active` could still answer "active" in. The
+    // fourth review's own fix - fencedWriteScript()'s kernel-verified,
+    // non-blocking exclusive probe on EXECUTION_LEASE_PATH itself, run
+    // before this write's own shared hold is ever taken - is what this
+    // real target now actually exercises: kernel flock state is
+    // synchronous with the real kill (unlike systemd's own
+    // bookkeeping), so the probe correctly finds nothing home and
+    // refuses immediately, regardless of exactly how much of systemd's
+    // own internal lag has or hasn't elapsed by the time this call
+    // actually reaches the target.
     const staleOperationId = randomUUID();
     const staleEvent = { apiVersion: "hof.dev/operation-event/v1", operationId: staleOperationId, step: "001.host.prepare", attempt: 1, phase: "started", at: new Date().toISOString() };
     await assert.rejects(

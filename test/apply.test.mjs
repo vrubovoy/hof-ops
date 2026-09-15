@@ -35,6 +35,7 @@ import { promisify } from "node:util";
 import YAML from "yaml";
 
 import { computeExpectedCommittedState, runApply } from "../scripts/apply.mjs";
+import { buildLockDocument as buildV2LockDocument } from "../scripts/operation-v2.mjs";
 import { sha256 } from "../scripts/digest.mjs";
 import { runPlan } from "../scripts/plan-command.mjs";
 import { computePlanId } from "../scripts/plan-v2.mjs";
@@ -752,6 +753,34 @@ test("lock held by a document that fails its own schema is refused, not silently
   assert.match(result.diagnostics[0], /does not satisfy its own schema/);
 });
 
+// PR 2 (item 10): v1 (apply) and v2 (backup/restore) lock.json share the
+// exact same target path - a fresh apply's own exclusive-create failure
+// might simply find a genuine, schema-valid v2 backup/restore lock
+// already held, never a corrupt v1 one. Must be reported with an
+// explicit, accurate "an in-progress <kind> operation" reason - never
+// folded into the generic schema-failure message, and never deleted or
+// otherwise treated as if it were a stale/corrupt v1 lock.
+test("a fresh apply finding a genuine, schema-valid v2 (backup/restore) lock already held is refused with an explicit reason, never as a corrupt schema, and the v2 lock is left untouched", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  const v2Lock = await buildV2LockDocument({
+    operationKind: "restore",
+    operationId: "44444444-4444-4444-4444-444444444444",
+    approvedPlanId: "sha256:" + "7".repeat(64),
+    target: plan.target,
+    acquiredBy: { user: "someone", workstation: "elsewhere", pid: 1 },
+  });
+  mutate.state.lock = v2Lock;
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lock");
+  assert.match(result.diagnostics[0], /in-progress restore operation/);
+  assert.doesNotMatch(result.diagnostics[0], /does not satisfy its own schema/, "a genuine v2 lock must never be reported as if it were corrupt");
+  assert.deepEqual(mutate.state.lock, v2Lock, "the v2 lock is never deleted or reinterpreted by a refused apply");
+  assert.equal(mutate.state.journals.size, 0);
+});
+
 test("stale-plan recheck: a host-key change between lock acquisition and the post-lock recheck is refused, and the freshly-acquired lock is released", async () => {
   const mutate = makeFakeMutate();
   const planOptions = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
@@ -920,6 +949,30 @@ test("resume: a journal that fails its own schema is refused, not silently trust
   assert.equal(result.blocked, true);
   assert.equal(result.reason, "resume");
   assert.match(result.diagnostics[0], /does not satisfy its own schema/);
+});
+
+// Same reasoning as the fresh-path test above, for --resume: apply must
+// never interpret a genuine, schema-valid v2 (backup/restore) lock as if
+// it were a corrupt v1 apply lock, and must never delete or otherwise
+// touch it.
+test("resume: finding a genuine, schema-valid v2 (backup/restore) lock is refused with an explicit reason, never as a corrupt schema, and the v2 lock is left untouched", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const v2Lock = await buildV2LockDocument({
+    operationKind: "backup",
+    operationId: "88888888-8888-8888-8888-888888888888",
+    approvedPlanId: "sha256:" + "7".repeat(64),
+    target: plan.target,
+    acquiredBy: { user: "someone", workstation: "elsewhere", pid: 1 },
+  });
+  mutate.state.lock = v2Lock;
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /in-progress backup operation/);
+  assert.doesNotMatch(result.diagnostics[0], /does not satisfy its own schema/, "a genuine v2 lock must never be reported as if it were corrupt");
+  assert.deepEqual(mutate.state.lock, v2Lock, "the v2 lock is never deleted or reinterpreted by a refused resume");
 });
 
 test("resume: a step with an unresolved (started, never confirmed) outcome blocks the whole run and keeps the lock held", async () => {

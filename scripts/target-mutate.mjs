@@ -32,7 +32,7 @@
 // (unlike target-probe.sh, which must also work before that's been
 // confirmed).
 
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -463,28 +463,46 @@ export async function readGenerationSnapshotReleaseLock(conn, generation) {
 // caller always hands the FULL, already-schema-valid updated document
 // (see operation-journal.mjs's own withJournalStatus), never a partial
 // patch for this script to merge itself.
+//
+// PR 2 (item 10) review: this used to write via a FIXED `targetPath.tmp`
+// name with no serialization of its own at all - two writers racing the
+// same fixed name (a genuine bug, a hand-run recovery script, or this
+// same function called for two different but overlapping reasons) could
+// each clobber the other's still-in-flight tmp file before its own
+// rename ran, exactly the class of bug acquireLockAndJournalScript()'s
+// own mktemp+ln fix already closed for lock/journal CREATION. Now runs
+// inside the SAME target-side flock guard that serializes lock/journal
+// creation (withLockGuard() - see its own comment), and uses a genuinely
+// unique mktemp name rather than a fixed one, for the same defense-in-
+// depth reason. Shared by both apply (v1) and backup/restore (v2) -
+// target-mutate.mjs's own raw persistence functions carry no
+// schema-specific logic at all (see this file's own top comment), so a
+// v2 journal update needs no separate implementation.
 export async function updateJournalStatus(conn, journalDocument) {
   const targetPath = journalPath(journalDocument.operationId);
-  const script = `set -eu
-payload='${b64(journalDocument)}'
-tmp='${targetPath}.tmp'
+  const script = withLockGuard(`payload='${b64(journalDocument)}'
+tmp=$(mktemp '${targetPath}.XXXXXX')
 printf '%s' "$payload" | base64 -d > "$tmp"
 mv -f "$tmp" '${targetPath}'
-echo HOF_MUTATE_UPDATED
-`;
+echo HOF_MUTATE_UPDATED`);
   const stdout = await runScript(conn, script);
   if (stdout.split("\n")[0] !== "HOF_MUTATE_UPDATED") throw new Error(`unexpected target-mutate response: ${JSON.stringify(stdout)}`);
 }
 
 // Append-only NDJSON - one line per event, never rewritten or reordered.
+// PR 2 (item 10) review: now also serialized through the same target-
+// side flock guard as updateJournalStatus()/acquireLockAndJournal() -
+// see that function's own comment on why. A single `>>` append is
+// already atomic at the syscall level for a write this small, but
+// serializing it too keeps every writer to one operationId's own
+// journal/events pair strictly ordered against every other one, never
+// relying on that syscall-level guarantee alone.
 export async function appendEvent(conn, operationId, event) {
   const targetPath = eventsPath(operationId);
-  const script = `set -eu
-payload='${b64(event)}'
+  const script = withLockGuard(`payload='${b64(event)}'
 mkdir -p "$(dirname '${targetPath}')"
 printf '%s\\n' "$(printf '%s' "$payload" | base64 -d)" >> '${targetPath}'
-echo HOF_MUTATE_APPENDED
-`;
+echo HOF_MUTATE_APPENDED`);
   const stdout = await runScript(conn, script);
   if (stdout.split("\n")[0] !== "HOF_MUTATE_APPENDED") throw new Error(`unexpected target-mutate response: ${JSON.stringify(stdout)}`);
 }
@@ -513,204 +531,169 @@ fi
 }
 
 const EXECUTION_LEASE_PATH = "/var/lib/hof/state/exec.lease";
+const EXECUTION_LEASE_OWNER_PATH = "/var/lib/hof/state/exec.lease.owner";
+const MUTEX_UNIT_PREFIX = "hof-exec-lease-";
+// A mutex token has the same shape as an operationId (randomUUID()) but
+// is a genuinely separate concept - it identifies ONE acquisition of the
+// physical mutex, not an apply/backup/restore run itself (many
+// operations across apply/backup/restore share this one flock path over
+// an installation's lifetime, each acquiring it with its own fresh
+// token). Never persisted into the durable lock/journal/event
+// documents, and never logged - see acquireMutex()'s own comment.
+const MUTEX_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-// How often the local side writes one heartbeat byte, and how long the
-// remote side waits for the next one before giving up - see
-// acquireExecutionLease()'s own comment for why a heartbeat, not a bare
-// "block on stdin until it closes", is what this needs.
+// How often the local side re-confirms ownership (a heartbeat, not a
+// passive read - see assertMutexScript()'s own comment: each call
+// refreshes the owner record's own mtime), and how long the target-side
+// unit waits without a fresh one before voluntarily giving up the flock
+// itself. Same two numbers item 9's own SSH-heartbeat design used - not
+// copied for nostalgia, but because they were already the result of
+// real, live validation against a real target (see PR2's own review
+// history) and there is no reason to pick new ones now that the
+// TRANSPORT carrying the heartbeat changed, not the operational
+// tradeoff itself (how quickly a genuinely dead local process should
+// free the mutex for a fresh --resume, versus how much transient
+// network jitter must be tolerated first).
 const LEASE_HEARTBEAT_INTERVAL_MS = 10_000;
 const LEASE_HEARTBEAT_TIMEOUT_S = 30;
+// How often the held unit itself re-checks its own owner record's mtime
+// against LEASE_HEARTBEAT_TIMEOUT_S - a fraction of that bound, so
+// expiry is noticed promptly once it's actually due, not polled so
+// tightly it burns real target-side CPU for no reason.
+const LEASE_SELF_CHECK_INTERVAL_S = 5;
+// How long (and how often) the acquire script itself polls the
+// transient unit's own systemd state before giving up - this is a
+// purely LOCAL, near-instantaneous systemd state transition (flock -n
+// is non-blocking by construction), never network-bound the way the old
+// design's heartbeat-timeout was, so this bound is short; the SSH
+// connection's own connectTimeoutSeconds is what actually bounds a
+// genuinely unreachable or hung target, exactly like every other
+// target-mutate function (this one reuses the same runScript()/`run`
+// seam, unlike the old design's own separate long-lived spawn).
+const LEASE_ACQUIRE_POLL_ATTEMPTS = 100;
+const LEASE_ACQUIRE_POLL_INTERVAL_S = "0.1";
 
-// Item 9 review fix (finding 3): the durable lock.json is a PERSISTENCE
-// lock - it survives a crash so --resume can find an interrupted
-// operation. It is NOT a liveness lease: two `hofctl apply --resume`
-// processes both read the same lock, both see the same events, and both
-// go on to dispatch the same step. This is a PROCESS-LIFETIME execution
-// lease on top of it: a long-lived SSH (or local) child holds an
-// exclusive flock on EXECUTION_LEASE_PATH for exactly as long as this
-// apply process lives, and releases it within a bounded time of this
-// process (or its connection) actually going away.
-//
-// Three real, live rounds of validation against a real sudo-enabled
-// sshd target (a sudo NOPASSWD child, same as every other mutation in
-// this module - a fake mutate/run seam can't catch a real OS/sudo/SSH
-// interaction like the two gaps found here) drove this exact design,
-// each one a genuine bug the previous attempt did not have on paper:
-//   1. `while :; do sleep 3600; done`, meant to die when the SSH
-//      connection is closed, provably does NOT: `sudo` starts its own
-//      child in a NEW session specifically to isolate it from the
-//      invoking terminal/session's own signals, so the SIGHUP a closed
-//      channel would normally deliver never reaches it - confirmed by
-//      killing the local SSH client and finding the remote flock-holder
-//      still running, independently, minutes later.
-//   2. Blocking on the remote script's OWN stdin instead (closing it -
-//      `child.stdin.end()` - to release, relying on the underlying
-//      transport closing to propagate EOF on a crash, since `sudo`
-//      isolates signals but still faithfully connects stdin/stdout/
-//      stderr through) fixed the SIGNAL problem and made an explicit,
-//      clean release() fast (~10ms, confirmed) - but a genuine crash
-//      (this process SIGKILLed) left the remote side hanging for over a
-//      minute before the transport's own teardown was ever noticed,
-//      confirmed by timed, repeated measurement, not assumed. Prompt
-//      teardown notice depends on `sudo`, the local `ssh` client, this
-//      specific network path, and the target's own kernel all
-//      cooperating quickly - not something this module can guarantee
-//      for a real, arbitrary target.
-// Both gaps are closed the same way SSH's own ServerAliveInterval/
-// ClientAliveInterval solve this exact problem, applied at this
-// module's own application layer instead (since a real target's own
-// sshd_config - ClientAliveInterval in particular - is outside this
-// module's control): the local side writes one fixed heartbeat byte
-// every LEASE_HEARTBEAT_INTERVAL_MS; the remote side, holding the flock,
-// loops reading exactly one byte with a LEASE_HEARTBEAT_TIMEOUT_S
-// bound (`timeout N head -c 1` - portable POSIX sh, not bash's own
-// `read -t`, which Debian's default /bin/sh, dash, does not implement -
-// confirmed by hitting exactly that "Illegal option -t" before landing
-// on this). A byte arriving loops again; the read TIMING OUT (rc 124 -
-// no heartbeat within the bound, however that silence came about) or
-// hitting real EOF (rc 0, but nothing read - release() ends stdin, or
-// the connection genuinely died and something already noticed) both
-// exit the loop, ending the script, closing fd 9 and the flock with it.
-// This bounds every disconnection - clean or not - to
-// LEASE_HEARTBEAT_TIMEOUT_S, never dependent on how promptly (if ever)
-// the transport itself gets around to tearing down.
-//
-// A second concurrent apply/resume fails `flock -n` immediately and is
-// refused, WITHOUT ever entering the heartbeat loop at all (the busy
-// branch exits on its own, unconditionally, the instant it prints).
-//
-// How long acquisition itself is allowed to take before this gives up -
-// a second review found the ORIGINAL version of this function had no
-// bound here at all: a hung ssh connection (no HOF_LEASE_HELD/BUSY, no
-// exit, no error - just silence) left acquireExecutionLease() awaiting
-// forever. Generous (matches dispatchOperation()'s own EE budget
-// reasoning) since a slow but genuine connection must never be mistaken
-// for a hung one.
-const LEASE_ACQUIRE_TIMEOUT_MS = 60_000;
+function mutexUnitName(token) {
+  if (!MUTEX_TOKEN_PATTERN.test(token)) throw new Error(`internal error: "${token}" is not a valid mutex token`);
+  return `${MUTEX_UNIT_PREFIX}${token}`;
+}
 
-// Returns { release, isLost, lostReason, onLost } on success. Throws on
-// contention (another live apply holds it) or a transport failure - the
-// caller turns the former into blocked("lease", ...) and must NOT
-// release the durable lock (the other process legitimately owns the
-// operation).
+// Item 9 review fix (finding 3), superseded by PR2 (item 10): the
+// durable lock.json is a PERSISTENCE lock - it survives a crash so
+// --resume can find an interrupted operation. It is NOT a liveness
+// lease: two `hofctl apply --resume` processes both read the same lock,
+// both see the same events, and both go on to dispatch the same step.
+// This is a PROCESS-LIFETIME execution mutex on top of it, shared by
+// apply/backup/restore alike (ADR 0006's own "one physical execution
+// mutex across all three kinds") - held by a target-side, TRANSIENT
+// SYSTEMD UNIT, never by a long-lived local SSH/spawn child the way the
+// original ADR 0004 design did.
 //
-// Item 9 SECOND review fix: acquiring the lease once and never looking
-// at it again is fail-OPEN, not fail-closed - a further review found
-// that once HOF_LEASE_HELD resolved this function's own returned
-// promise, `settled` was already true, so the SAME child's own later
-// `exit`/`error` handlers (a genuine loss of the lease - the remote
-// heartbeat loop timed out, the ssh connection itself died, anything)
-// were silently discarded by the `if (!settled)` guard built for a
-// DIFFERENT purpose (never resolving/rejecting the acquisition promise
-// twice) - apply.mjs kept dispatching real mutations with no live lease
-// at all behind them, exactly the double-dispatch risk this whole
-// mechanism exists to prevent. Fixed: a lease loss discovered AFTER
-// acquisition (the child exits or errors, and release() was never
-// called) is now recorded (`isLost()`/`lostReason()`) and broadcast
-// (`onLost(callback)`), and apply.mjs's own dispatch loop checks it
-// before every operation and refuses to start a new one once lost (see
-// its own comment there) - fail-closed for every step this process has
-// not yet dispatched.
+// That original design (a foreground child holding flock via an SSH
+// heartbeat - see git history for its own three-review-round account of
+// why a bare signal, then a bare stdin-EOF, both provably failed to
+// notice a dead local process promptly) tied the mutex's own lifetime to
+// ONE specific SSH channel staying open for the whole run. This design
+// decouples them: a systemd unit is a real, durable target-side
+// resource, independent of any one SSH connection - acquiring, checking,
+// and releasing it are all ordinary, bounded, ONE-SHOT round trips
+// through the exact same runScript()/`run` seam every other function in
+// this module already uses (no persistent streaming child, no spawnFn
+// seam, no signal/EPIPE/session-isolation complexity at all). The same
+// crash-safety property the old design had is preserved differently: the
+// unit itself is the one that self-expires (LEASE_HEARTBEAT_TIMEOUT_S
+// after its own owner record's mtime stops advancing), not a remote
+// process reacting to a closed pipe - so a local process that dies
+// uncleanly (SIGKILL, a lost laptop) still leaves the target free for a
+// fresh --resume within the same bound the old design promised, without
+// depending on sudo/ssh/the kernel promptly noticing a closed connection
+// at all.
 //
-// This still does NOT provide true distributed fencing (a monotonic
-// token every target-side mutation independently checks before acting,
-// the textbook fix for a lease that can expire while its holder is
-// merely paused - GC, SIGSTOP, a scheduler delay - rather than actually
-// gone): building that would mean every one of the ten Ansible roles
-// itself becoming lease-aware, not just this control-plane module, and
-// is out of this fix's own scope. What this DOES close for real: the
-// operation this process already dispatched to the target cannot be
-// recalled either way (true of ANY lease design, fenced or not), but
-// this process now provably stops queuing new ones the moment it knows
-// its own lease is gone, rather than never finding out at all.
-//
-// Item 9 THIRD review fix (findings 4 & 5): two further races in this
-// same acquire/lose lifecycle, both closed below (see each one's own
-// comment at its exact fix site):
-//   4. A timeout/late-success race in the acquisition promise itself -
-//      the timeout path used to start its own async release() BEFORE
-//      marking itself settled, leaving a real window for an
-//      already-in-flight HOF_LEASE_HELD to win the race and resolve
-//      successfully with a lease this function had already begun
-//      releasing. Fixed with a synchronous claim() gate, closed the
-//      instant any one of the four settling paths starts running -
-//      never after its own async cleanup finishes.
-//   5. A stdin EPIPE used to only ever set a local `stdinErrored` flag
-//      (read by the heartbeat and by release()) and otherwise wait for
-//      the child's own, separate "exit" event to eventually call
-//      markLost() - a real gap whenever that event's own delivery lagged
-//      behind the stream error that had already, independently, proven
-//      the lease gone. markLost() is now called directly from the stdin
-//      error handler itself.
-//
-// spawnFn: a testing seam only (see test/target-mutate.test.mjs's own
-// fake spawn) - defaults to node:child_process's real spawn, exactly
-// like every other run/exec seam in this codebase; the real CLI never
-// passes it. A long-lived, streaming child (heartbeats in, output
-// watched as it arrives) can't reuse this module's own one-shot
-// runScript()/mockRun() convention, which is why this takes its own
-// seam rather than the shared `run` one.
-export async function acquireExecutionLease(conn, spawnFn = spawn) {
+// acquireMutex(conn) returns { release, isLost, lostReason, onLost,
+// assertOwnership } on success. Throws on contention (another live
+// apply/backup/restore holds it) or a transport failure - the caller
+// turns the former into blocked("lease", ...) and must NOT release the
+// durable lock (the other process legitimately owns the operation).
+// isLost()/lostReason()/onLost() work exactly like the old design's own
+// (apply.mjs's own dispatch loop checks isLost() before every operation
+// and refuses to start a new one once lost - fail-closed, unchanged);
+// assertOwnership() is additionally exposed so a caller (or a test) can
+// force an immediate check rather than waiting on the background
+// interval below.
+export async function acquireMutex(conn) {
   const {
     mode, host, port, user, hostKeySha256, identityFile, connectTimeoutSeconds = 10, run = defaultRun,
-    // Overridable only so test/target-mutate.test.mjs's own timeout test
-    // doesn't have to wait out the real, generous default - the real
-    // CLI never sets this.
-    executionLeaseAcquireTimeoutMs = LEASE_ACQUIRE_TIMEOUT_MS,
+    // Overridable only so test/target-mutate.test.mjs's own tests don't
+    // have to wait out the real, generous default - the real CLI never
+    // sets this.
+    mutexHeartbeatIntervalMs = LEASE_HEARTBEAT_INTERVAL_MS,
   } = conn;
-  const remote = `set -eu
+  const scriptConn = { mode, host, port, user, hostKeySha256, identityFile, connectTimeoutSeconds, run };
+  const token = randomUUID();
+  const unit = mutexUnitName(token);
+
+  // The held unit's own script - never wrapped in an outer single-quoted
+  // /bin/sh -c argument that also contains single quotes of its own (a
+  // real quoting hazard): every literal this embeds (the fixed lease/
+  // owner paths, the token, the two bounds) is quote-free by
+  // construction (no spaces, no shell metacharacters), so the whole
+  // thing can be safely wrapped in a single pair of outer single quotes
+  // by acquireMutexScript() below without any nested-quote escaping.
+  const heldScript = [
+    `exec 9>${EXECUTION_LEASE_PATH}`,
+    "if flock -n -x 9; then",
+    "umask 077",
+    `printf %s ${token} > ${EXECUTION_LEASE_OWNER_PATH}`,
+    "while :; do",
+    `sleep ${LEASE_SELF_CHECK_INTERVAL_S}`,
+    `mtime=$(stat -c %Y ${EXECUTION_LEASE_OWNER_PATH} 2>/dev/null) || exit 0`,
+    "now=$(date +%s)",
+    `[ $((now - mtime)) -gt ${LEASE_HEARTBEAT_TIMEOUT_S} ] && exit 0`,
+    "done",
+    "else",
+    "exit 1",
+    "fi",
+  ].join("; ");
+
+  const acquireScript = `set -eu
 mkdir -p "$(dirname '${EXECUTION_LEASE_PATH}')"
-exec 9>'${EXECUTION_LEASE_PATH}'
-if flock -n -x 9; then
-  echo HOF_LEASE_HELD
-  while :; do
-    got=$(timeout ${LEASE_HEARTBEAT_TIMEOUT_S} head -c 1 2>/dev/null) || break
-    [ -z "$got" ] && break
-  done
-else
-  echo HOF_LEASE_BUSY
-  exit 0
-fi
+systemd-run --unit='${unit}' --quiet -- /bin/sh -c '${heldScript}' >/dev/null 2>&1
+i=0
+while [ "$i" -lt ${LEASE_ACQUIRE_POLL_ATTEMPTS} ]; do
+  state=$(systemctl is-active '${unit}.service' 2>/dev/null || true)
+  if [ "$state" = active ]; then
+    echo HOF_LEASE_HELD
+    exit 0
+  fi
+  if [ "$state" = failed ]; then
+    systemctl reset-failed '${unit}.service' >/dev/null 2>&1 || true
+    echo HOF_LEASE_BUSY
+    exit 0
+  fi
+  i=$((i + 1))
+  sleep ${LEASE_ACQUIRE_POLL_INTERVAL_S}
+done
+systemctl reset-failed '${unit}.service' >/dev/null 2>&1 || true
+echo HOF_LEASE_TIMEOUT
 `;
 
-  let child;
-  let knownHostsCleanup = () => {};
-  if (mode === "local") {
-    child = spawnFn("sudo", ["-n", "sh", "-s"], { stdio: ["pipe", "pipe", "pipe"] });
-  } else {
-    validateSshDestination(host, user, port);
-    if (!HOST_KEY_SHA256_PATTERN.test(hostKeySha256 ?? "")) throw new Error("a pinned hostKeySha256 is required for ssh mode");
-    const { file: knownHostsFile, cleanup } = await pinnedKnownHosts({ host, port, hostKeySha256, connectTimeoutSeconds, run });
-    knownHostsCleanup = cleanup;
-    const args = [
-      ...SSH_HARDENING,
-      "-o", "StrictHostKeyChecking=yes",
-      "-o", `UserKnownHostsFile=${knownHostsFile}`,
-      "-o", "GlobalKnownHostsFile=/dev/null",
-      "-o", `ConnectTimeout=${connectTimeoutSeconds}`,
-      // A second, complementary layer to the application-level heartbeat
-      // above: if the SERVER itself stops answering (not merely quiet -
-      // genuinely down/unreachable), the local ssh client gives up and
-      // exits on its own within ~45s, rather than sitting idle
-      // indefinitely believing the lease is still held.
-      "-o", "ServerAliveInterval=15",
-      "-o", "ServerAliveCountMax=3",
-      "-p", String(port),
-      ...(identityFile ? ["-i", identityFile, "-o", "IdentitiesOnly=yes"] : []),
-      "--",
-      `${user}@${host}`,
-      "sudo", "-n", "sh", "-s",
-    ];
-    child = spawnFn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
+  let stdout;
+  try {
+    stdout = await runScript(scriptConn, acquireScript);
+  } catch (error) {
+    throw new Error(`could not acquire the execution lease for this target: ${error instanceof Error ? error.message : error}`);
+  }
+  const tag = stdout.split("\n")[0];
+  if (tag === "HOF_LEASE_BUSY") {
+    throw new Error(`another apply/backup/restore process already holds the execution lease for this target (${EXECUTION_LEASE_PATH}) - refusing to run a second, concurrent operation against the same host`);
+  }
+  if (tag === "HOF_LEASE_TIMEOUT") {
+    throw new Error(`the execution-lease helper unit confirmed neither held nor busy within its own acquire poll - the target's systemd may be unreachable or hung; refusing to wait indefinitely`);
+  }
+  if (tag !== "HOF_LEASE_HELD") {
+    throw new Error(`unexpected target-mutate response acquiring the execution lease: ${JSON.stringify(stdout)}`);
   }
 
-  // Moved above the stdin error handler just below (item 9 THIRD review
-  // fix, finding 5) - markLost() itself only ever touches lost/
-  // lostReasonValue/lostCallbacks/voluntarilyReleased, none of which
-  // depend on anything declared further down (release, heartbeat), so
-  // hoisting this block costs nothing and lets that handler call it
-  // directly instead of only setting a flag nothing else ever acted on
-  // promptly.
   let voluntarilyReleased = false;
   let lost = false;
   let lostReasonValue = null;
@@ -724,192 +707,86 @@ fi
     }
   };
 
-  // Item 9 FOURTH review fix (finding 1): claim()/settled/the acquisition
-  // promise's own resolve+reject are now set up HERE, before the stdin
-  // error handler just below - not, as a third review had it, only
-  // inside the later `new Promise((resolve, reject) => {...})` executor,
-  // which the stdin handler (registered earlier, so it can catch an
-  // error raised by the very first `child.stdin.write(remote)` call)
-  // could not reach at all. A further review found that gap real: a
-  // stdin error arriving BEFORE HOF_LEASE_HELD/BUSY used to only call
-  // markLost() - recording a loss, but neither claiming nor rejecting
-  // the still-open acquisition - so a buffered HOF_LEASE_HELD arriving
-  // right after could still win claim() farther down and resolve
-  // successfully, handing the caller a lease that reports isLost() ===
-  // true from the very first check. `acquireTimeout` is declared (but
-  // not yet assigned) before claim() too - clearTimeout(undefined) is a
-  // harmless no-op, so claim() being called before acquireTimeout exists
-  // (only possible if a stdin error fires this early, before the timer
-  // below is even armed) is always safe.
-  let settled = false;
-  let acquireTimeout;
-  const claim = () => {
-    if (settled) return false;
-    settled = true;
-    clearTimeout(acquireTimeout);
-    return true;
-  };
-  let resolveAcquire, rejectAcquire;
-  const acquirePromise = new Promise((resolve, reject) => { resolveAcquire = resolve; rejectAcquire = reject; });
-
-  // A write to a pipe whose read end (or the whole remote process) is
-  // already gone raises EPIPE asynchronously as an 'error' EVENT on the
-  // stream, not a thrown exception from .write() itself - a second
-  // review found the original try/catch around child.stdin.write(".")
-  // in the heartbeat below could not and did not catch this, leaving an
-  // unhandled stream error free to crash the whole process. Handled
-  // exactly once, here, for the stream's entire lifetime.
-  //
-  // Item 9 THIRD review fix (finding 5): this used to only set
-  // stdinErrored (read by the heartbeat interval, to stop retrying a
-  // dead pipe, and by release(), to know child.stdin.end() would itself
-  // throw) and otherwise wait for the SEPARATE child "exit" event to
-  // eventually call markLost() - a real gap: a remote process that is
-  // gone but whose own OS-level exit notification is merely delayed
-  // (nothing here promises "at the same instant" for two independent
-  // event sources on two different streams of the same child) left
-  // isLost() reporting false for that whole window, even though the
-  // stdin error had already, independently, proven the pipe - and so the
-  // lease - is gone. markLost() is now called here directly and
-  // immediately; markLost()'s own idempotency guard (lost ||
-  // voluntarilyReleased) makes the later, likely-redundant call from
-  // "exit" (if it still fires) harmless.
-  //
-  // Item 9 FOURTH review fix (finding 1): if acquisition itself has not
-  // settled yet, THIS stdin error IS the acquisition's own outcome - it
-  // now claims the promise and rejects it (after the same release()
-  // teardown every other pre-acquisition failure path already uses),
-  // exactly like the child's own "error"/"exit" handlers below already
-  // do. Without this, a stdin error arriving before HOF_LEASE_HELD only
-  // recorded a lost flag nothing yet consumed, leaving the race described
-  // above wide open. release() itself is safe to call here even though
-  // it is defined a few lines further down - this handler only ever
-  // FIRES asynchronously, well after this function's own synchronous
-  // setup (including release()'s own assignment) has completed.
-  let stdinErrored = false;
-  child.stdin.on("error", (error) => {
-    stdinErrored = true;
-    const message = `stdin error on the execution-lease helper's own connection: ${error instanceof Error ? error.message : error}`;
-    markLost(message);
-    if (claim()) {
-      release().finally(() => rejectAcquire(new Error(message)));
+  // The heartbeat AND the liveness check are the same call: this
+  // doesn't just READ the owner record, it re-touches its mtime,
+  // exactly what the held unit's own self-check loop is watching for
+  // (see heldScript above) - a passive read-only check here would let
+  // the unit expire out from under a caller that dutifully polled
+  // isLost() but never actually refreshed liveness on the target.
+  async function assertOwnership() {
+    // Once a loss is already known (voluntary release, or a prior
+    // assertOwnership()/background-interval tick already found it gone),
+    // every later call is a genuine no-op - never another real round
+    // trip confirming the same already-known outcome over and over for
+    // whatever remains of this process's own lifetime.
+    if (voluntarilyReleased || lost) return;
+    let assertStdout;
+    try {
+      assertStdout = await runScript(scriptConn, `set -eu
+state=$(systemctl is-active '${unit}.service' 2>/dev/null || true)
+if [ "$state" != active ]; then
+  echo HOF_LEASE_LOST
+  exit 0
+fi
+if [ -r '${EXECUTION_LEASE_OWNER_PATH}' ] && [ "$(cat '${EXECUTION_LEASE_OWNER_PATH}')" = '${token}' ]; then
+  touch '${EXECUTION_LEASE_OWNER_PATH}'
+  echo HOF_LEASE_OK
+else
+  echo HOF_LEASE_LOST
+fi
+`);
+    } catch (error) {
+      markLost(`could not confirm the execution lease is still held: ${error instanceof Error ? error.message : error}`);
+      return;
     }
-  });
+    if (assertStdout.split("\n")[0] !== "HOF_LEASE_OK") {
+      markLost("the execution lease for this target is no longer held (its systemd unit is gone, or the owner record no longer matches this acquisition's own token)");
+    }
+  }
 
-  // Deliberately NOT ended here (unlike every other one-shot script in
-  // this module) - see this function's own top comment. The heartbeat
-  // below keeps writing to it; release() is what finally ends it.
-  child.stdin.write(remote);
-  const heartbeat = setInterval(() => {
-    if (stdinErrored) return;
-    try { child.stdin.write("."); } catch { /* the child may already be gone - release()/exit handle that */ }
-  }, LEASE_HEARTBEAT_INTERVAL_MS);
+  const heartbeat = setInterval(() => { assertOwnership().catch(() => {}); }, mutexHeartbeatIntervalMs);
   // Never keeps the whole Node process alive on its own - only real work
-  // (an in-flight apply run) does that; this is bookkeeping.
+  // (an in-flight apply/backup/restore run) does that; this is
+  // bookkeeping.
   heartbeat.unref?.();
 
   const release = async () => {
     voluntarilyReleased = true;
     clearInterval(heartbeat);
-    knownHostsCleanup();
-    if (child.exitCode === null && child.signalCode === null) {
-      // Sends EOF, not a signal - see this function's own top comment
-      // on why a signal alone never reliably reached a `sudo`-isolated
-      // remote child. The remote heartbeat loop notices (an EOF read
-      // there breaks it immediately, well inside its own timeout
-      // bound) and exits on its own; the SIGTERM/SIGKILL fallback
-      // below is only for the local ssh/sudo child itself, in case the
-      // remote side is somehow still not exiting promptly - never the
-      // primary release mechanism.
-      if (!stdinErrored) { try { child.stdin.end(); } catch { /* already gone */ } }
-      await new Promise((res) => {
-        const t = setTimeout(() => { child.kill("SIGTERM"); setTimeout(() => { child.kill("SIGKILL"); res(); }, 3000); }, 5000);
-        child.once("exit", () => { clearTimeout(t); res(); });
-      });
-    }
+    // Best-effort: a transport failure here must never throw back into
+    // the caller's own cleanup path - an unreleased unit still
+    // self-expires on its own within LEASE_HEARTBEAT_TIMEOUT_S once
+    // nothing heartbeats it again, so a failed release here degrades to
+    // "a later --resume waits out the same bound a genuine crash
+    // would", never to a permanently stuck mutex.
+    try {
+      await runScript(scriptConn, `set -eu
+if [ -r '${EXECUTION_LEASE_OWNER_PATH}' ] && [ "$(cat '${EXECUTION_LEASE_OWNER_PATH}')" = '${token}' ]; then
+  rm -f '${EXECUTION_LEASE_OWNER_PATH}'
+  systemctl stop '${unit}.service' >/dev/null 2>&1 || true
+  systemctl reset-failed '${unit}.service' >/dev/null 2>&1 || true
+  echo HOF_LEASE_RELEASED
+else
+  echo HOF_LEASE_MISMATCH
+fi
+`);
+    } catch { /* best-effort, see this function's own comment above */ }
   };
 
-  let out = "";
-  let err = "";
-  // Item 9 THIRD review fix (finding 4): claim() SYNCHRONOUSLY decides
-  // who wins the race to settle this promise, and does so the instant
-  // whichever handler runs first starts running - separated from
-  // actually calling resolve/reject, which may need to `await
-  // release()` first. The OLD code (a single `finish(fn, arg)` that
-  // checked-and-set `settled` only ONCE it was already ready to call
-  // fn(arg)) had a real gap here: the timeout path calls release()
-  // (async - clearInterval, knownHostsCleanup, then possibly an awaited
-  // child teardown) BEFORE it ever touched `settled`, leaving a real
-  // window, for the whole duration of that await, during which
-  // `settled` was still false. A HOF_LEASE_HELD chunk already in
-  // flight and delivered to the stdout "data" handler during exactly
-  // that window would see `!settled`, call its OWN finish(resolve,
-  // {...}), and WIN - resolving this call successfully with a lease
-  // object for a lease this function had already committed to
-  // releasing and was about to reject as timed out (a real,
-  // independently reachable split-brain source: the CALLER believes it
-  // holds the lease while release() is concurrently, genuinely
-  // dropping it on the target). claim() closes this: `settled` is now
-  // set (and the timeout cleared) synchronously, before ANY async work
-  // begins, on every one of the five paths now sharing it (the stdin
-  // error handler above included) - whichever one actually runs first is
-  // decided the instant it starts running (JS has no interleaving
-  // mid-callback), and every later claim() call is then a guaranteed
-  // no-op, however long that first caller's own async cleanup goes on to
-  // take.
-  acquireTimeout = setTimeout(() => {
-    if (!claim()) return;
-    const timeoutError = new Error(`execution-lease helper confirmed neither held nor busy within ${executionLeaseAcquireTimeoutMs}ms - the target may be unreachable or hung; refusing to wait indefinitely`);
-    release().finally(() => rejectAcquire(timeoutError));
-  }, executionLeaseAcquireTimeoutMs);
+  return {
+    release,
+    isLost: () => lost,
+    lostReason: () => lostReasonValue,
+    onLost: (callback) => { lostCallbacks.push(callback); },
+    assertOwnership,
+  };
+}
 
-  child.stdout.on("data", (chunk) => {
-    out += chunk.toString();
-    if (out.includes("HOF_LEASE_HELD")) {
-      if (!claim()) return;
-      resolveAcquire({
-        release,
-        isLost: () => lost,
-        lostReason: () => lostReasonValue,
-        onLost: (callback) => { lostCallbacks.push(callback); },
-      });
-    } else if (out.includes("HOF_LEASE_BUSY")) {
-      if (!claim()) return;
-      release().finally(() => rejectAcquire(new Error(`another apply process already holds the execution lease for this target (${EXECUTION_LEASE_PATH}) - refusing to run a second, concurrent apply/resume against the same host`)));
-    }
-  });
-  child.stderr.on("data", (chunk) => { err += chunk.toString(); });
-  child.on("error", (error) => {
-    clearInterval(heartbeat);
-    knownHostsCleanup();
-    if (claim()) { rejectAcquire(error); return; }
-    markLost(error instanceof Error ? error.message : String(error));
-  });
-  child.on("exit", (code, signal) => {
-    clearInterval(heartbeat);
-    knownHostsCleanup();
-    const exitError = new Error(`execution-lease helper exited before the lease was confirmed (code ${code}, signal ${signal})${err.trim() ? `: ${err.trim().split("\n").slice(-3).join("; ")}` : ""}`);
-    if (claim()) { rejectAcquire(exitError); return; }
-    markLost(`the execution-lease helper process exited unexpectedly (code ${code}, signal ${signal}) - the lease is no longer held`);
-  });
-
-  // Item 9 FOURTH review fix (finding 1): a caller must never receive a
-  // lease that is already known lost - possible if markLost() fired
-  // (post-claim, from the child's own "exit"/"error" handlers above) in
-  // the narrow window between resolveAcquire() being called and this
-  // await actually returning control here (both are plain microtask
-  // continuations, so the window is tiny, but not provably zero - a
-  // caller acting on isLost() only inside its own dispatch loop, as
-  // apply.mjs used to, is exactly the fail-open runApply() itself now
-  // additionally guards against, see its own comment on why THIS check
-  // alone is not sufficient by itself). Checked here too, as the
-  // cheapest possible place to close it for every caller at once: a
-  // lease that resolved lost is released immediately and reported as an
-  // acquisition failure, never handed back as if it were healthy.
-  const lease = await acquirePromise;
-  if (lease.isLost()) {
-    await lease.release().catch(() => {});
-    throw new Error(`execution lease resolved already lost (${lease.lostReason()}) - refusing to hand back a lease that was never actually healthy`);
-  }
-  return lease;
+// Compatibility API for apply.mjs, which has never needed to know this
+// is now a general, kind-agnostic mutex rather than something apply-
+// specific - a future backup/restore runner (PR 4/5) calls acquireMutex()
+// directly instead, against the exact same flock path and protocol, per
+// ADR 0006's own "one physical execution mutex across all three kinds".
+export async function acquireExecutionLease(conn) {
+  return acquireMutex(conn);
 }

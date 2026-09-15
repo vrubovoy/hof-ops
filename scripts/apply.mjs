@@ -31,6 +31,7 @@ import {
   assertEventValid, assertJournalResumable, assertJournalValid, assertLockValid, buildEvent, buildJournalDocument, buildLockDocument,
   currentOperator, decideStepResumption, newOperationId, withJournalStatus,
 } from "./operation-journal.mjs";
+import { isV2Lock } from "./operation-v2.mjs";
 import { checkArchitecture, checkManagedStateReadable, checkOs, observationFromSnapshot } from "./preflight.mjs";
 import { validateAppliedActions } from "./applied-actions.mjs";
 import { validateBootstrapActions } from "./bootstrap-actions.mjs";
@@ -1083,6 +1084,17 @@ export async function runApply(options) {
     try {
       await assertLockValid(lock);
     } catch (error) {
+      // PR 2 (item 10): v1 (apply) and v2 (backup/restore) lock.json
+      // share the exact same target path (operation-lock-v2.schema.json's
+      // own top-level description) - a lock that fails v1's own schema
+      // check here might simply BE a genuine, schema-valid v2 lock, never
+      // reinterpreted or deleted as if it were a corrupt v1 one. Checked
+      // explicitly, distinctly, rather than folding this into the
+      // generic "does not satisfy its own schema" message below, which
+      // would otherwise read as if the lock were actually corrupt.
+      if (await isV2Lock(lock)) {
+        return blocked("resume", `the lock on this target belongs to an in-progress ${lock.operationKind} operation (${lock.operationId}, started ${lock.acquiredAt}) - apply --resume refuses to interpret a v2 backup/restore lock as an apply lock; wait for it to finish, or investigate it directly`);
+      }
       return blocked("resume", `the lock on the target does not satisfy its own schema - refusing to trust it: ${error instanceof Error ? error.message : error}`);
     }
     operationId = lock.operationId;
@@ -1349,6 +1361,14 @@ export async function runApply(options) {
       try {
         await assertLockValid(held);
       } catch (error) {
+        // PR 2 (item 10): same reasoning as the resume path's own
+        // identical check above - v1 and v2 lock.json share the exact
+        // same target path, so a fresh apply's own exclusive-create
+        // failure may simply have found a genuine, schema-valid v2
+        // backup/restore lock already held, never a corrupt v1 one.
+        if (await isV2Lock(held)) {
+          return blocked("lock", `target is already locked by an in-progress ${held.operationKind} operation (${held.operationId}, started ${held.acquiredAt}) - apply refuses to run concurrently with backup/restore; wait for it to finish, or investigate it directly`);
+        }
         return blocked("lock", `target is locked by a document that does not satisfy its own schema - refusing to trust it: ${error instanceof Error ? error.message : error}`);
       }
       return blocked("lock", `target is already locked by operation ${held.operationId} (started ${held.acquiredAt} by ${held.acquiredBy?.user}@${held.acquiredBy?.workstation}) - use --resume to continue it, or investigate why it's stuck`);

@@ -217,15 +217,33 @@ not just same-kind contention. This mutex is a genuinely separate,
 lower-level primitive from any of the lock/journal document families
 above (mirroring ADR 0004's own execution-lease vs. durable-lock split);
 it is NOT `operation-lock-v2` itself, which is why scoping v2 to
-backup/restore only (above) does not weaken this guarantee - apply's own
-mutex acquisition (a later PR touches `scripts/operation-journal.mjs`
-for this, unchanged today) and backup/restore's each acquire the one
-shared, lower-level primitive before ever touching their own kind-
-specific lock.json. It is what lets an operation's own cleanup run to
-completion even if the SSH connection or the operator's workstation
-drops mid-backup, by moving execution onto a target-side, signed runner
-process rather than depending on the workstation's own SSH session
-staying open for the operation's entire duration.
+backup/restore only (above) does not weaken this guarantee - v1 and v2
+`lock.json` also happen to share the exact same target path (see
+`operation-lock-v2.schema.json`'s own description), so apply's own
+exclusive-create against it already fails, for real, the instant a v2
+lock is present, independent of the mutex below.
+**Implemented in PR 2 (item 10) as `scripts/target-mutate.mjs`'s
+`acquireMutex()`** - not, as this ADR originally speculated, a change to
+`scripts/operation-journal.mjs` (apply already called this exact
+primitive, under its old compatibility name `acquireExecutionLease()`,
+since item 9's own ADR 0004 execution-lease work; PR 2 only replaced
+that function's own internals and generalized it, `apply.mjs` itself is
+unchanged). A future backup/restore runner (PR 4/5) calls `acquireMutex()`
+directly, against the exact same target-side flock path and protocol -
+never a second, kind-specific implementation. The mutex is held by a
+target-side, TRANSIENT SYSTEMD UNIT (`hof-exec-lease-<token>.service`,
+never the workstation's own SSH session directly) holding a real,
+non-blocking `flock -n -x` on `/var/lib/hof/state/exec.lease`, checked
+and refreshed by short, one-shot heartbeat round trips (never a
+persistent streaming connection) rather than depending on one SSH
+channel staying open for the operation's entire duration - if the local
+process dies uncleanly, the held unit's own self-check loop notices the
+owner record has stopped being refreshed and voluntarily exits within a
+bounded window, freeing the mutex for a fresh `--resume` without any
+manual target-side cleanup. This is a distinct mechanism from the
+"target-side signed runner" a later PR in this item's own sequence
+still adds (below) - the mutex's own crash-resilience does not depend on
+that runner existing yet.
 
 **A target-side signed runner with a fixed action vocabulary - no
 generic executor, matching ADR 0004's own decision.** The runner and

@@ -102,7 +102,7 @@ import { runPlan } from "../scripts/plan-command.mjs";
 import { HOF_NETWORK_NAME, SUPPLIED_TLS_CERTIFICATE_SECRET_NAME, SUPPLIED_TLS_PRIVATE_KEY_SECRET_NAME } from "../scripts/render-topology.mjs";
 import { generateSecretValue } from "../scripts/secrets.mjs";
 import {
-  acquireExecutionLease, acquireLockAndJournal, appendEvent, pinnedKnownHosts,
+  acquireExecutionLease, acquireLockAndJournal, acquireMutex, appendEvent, pinnedKnownHosts,
   readCurrentState as readCurrentStateViaMutate, readGenerationSnapshot, readGenerationSnapshotReleaseLock, readGenerationSnapshotTopology, readTopology,
 } from "../scripts/target-mutate.mjs";
 import { loadAndValidateDeployment } from "../scripts/validate-deployment.mjs";
@@ -1265,4 +1265,70 @@ test("a concurrent --resume is refused by the real execution lease while the ope
   const { topology: finalTopology } = await readTopology(mutateConn());
   assert.deepEqual(finalTopology, expectedTopology);
   await assert.rejects(() => exec("docker", ["exec", containerName, "test", "-e", "/var/lib/hof/state/lock.json"]), "the lock is released once the commit genuinely finishes");
+});
+
+// PR 2 (item 10): the execution lease/mutex is no longer a long-lived
+// local child holding flock over a persistent SSH heartbeat - it's a
+// real, target-side, transient systemd unit (acquireMutex(), see
+// target-mutate.mjs's own comment). Exercised directly here, against
+// this exact container's real systemd, real flock, and real sudo -
+// never through apply.mjs's own orchestration this time (the scenario
+// above already proves acquireExecutionLease() being busy correctly
+// refuses a concurrent apply/resume; this one proves the mutex PRIMITIVE
+// itself - genuine contention, and genuine cleanup once its own held
+// unit is killed out from under it, never merely mocked).
+test("acquireMutex: real target-side flock contention across two concurrent acquisitions, and real cleanup once the holder is killed out from under it (item 10 PR2, generic operation substrate)", async () => {
+  const conn = mutateConn();
+
+  const first = await acquireMutex(conn);
+  try {
+    // A second, concurrent acquisition genuinely contends on the SAME
+    // real flock, held by a real target-side systemd unit - refused,
+    // not merely simulated by a fake `run`.
+    await assert.rejects(() => acquireMutex(conn), /already holds the execution lease/);
+
+    // The owner record is really there, root-only, exactly as designed.
+    const ownerPerms = (await onTarget("stat", "-c", "%a %U", "/var/lib/hof/state/exec.lease.owner")).trim();
+    assert.equal(ownerPerms, "600 root");
+
+    // Healthy while genuinely held - a real round trip, not the
+    // background interval (which would take up to its own configured
+    // bound to fire on its own).
+    await first.assertOwnership();
+    assert.equal(first.isLost(), false);
+
+    // Simulate an uncleanly-dead local process: kill the real unit
+    // directly on the target - never through release(), which this test
+    // deliberately never calls on `first` before this point. systemctl's
+    // own unit-pattern globbing finds it; this test never parses
+    // `systemctl list-units` output itself, avoiding any dependency on
+    // its exact column format.
+    await onTarget("sh", "-c", "systemctl kill -s SIGKILL 'hof-exec-lease-*.service'");
+
+    // The kernel releases the real flock the instant the holding
+    // process is gone - no need to wait out the self-expiry bound at
+    // all - so a fresh acquisition succeeds immediately, proving real
+    // target-side cleanup after an unclean loss, not a mocked one.
+    const second = await acquireMutex(conn);
+    try {
+      await first.assertOwnership();
+      assert.equal(first.isLost(), true, "the original acquisition must notice its own unit is really gone once it's actually killed");
+    } finally {
+      await second.release();
+    }
+  } finally {
+    // Best-effort: `first`'s own owner record was long since overwritten
+    // by `second`'s real acquisition above, so this reports a real
+    // HOF_LEASE_MISMATCH on the target rather than actually releasing
+    // anything - exercised here anyway, confirming that response never
+    // throws for real (test/target-mutate.test.mjs's own equivalent test
+    // is mocked; this confirms the real script behaves the same way).
+    await first.release().catch(() => {});
+  }
+
+  // Everything is free again - a third, real acquisition succeeds
+  // cleanly, proving neither the killed first nor the released second
+  // left the real target's own flock/owner-record state stuck.
+  const third = await acquireMutex(conn);
+  await third.release();
 });

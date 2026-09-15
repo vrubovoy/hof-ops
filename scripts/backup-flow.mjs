@@ -481,14 +481,22 @@ export function validateBackupBundle({ policy, plan, manifest, evidence, kit, lo
     }
     // abandoned: true asserts the flow never naturally completed - a
     // fifth review round found nothing checked this against the actual
-    // event log, so a bundle whose events show every one of the plan's
-    // own operations already succeeded (including evidence.write itself)
-    // could still honestly-looking claim abandoned: true.
+    // event log; the first fix (requiring every plan operation to have
+    // succeeded) was itself too narrow, since journal terminal semantics
+    // only ever require evidence.write itself to have run - a sixth
+    // review round gave the real minimal counterexample: journal failed,
+    // abandoned: true, evidence.write's own event succeeded, but some
+    // unrelated earlier step's event is missing. That still passed the
+    // "every step" check while evidence.write having already, genuinely
+    // succeeded is on its own the natural terminal completion abandoned
+    // claims never happened - so only evidence.write's own event matters.
     if (events && evidence.abandoned === true) {
-      const succeededSteps = new Set(events.filter((event) => event.phase === "succeeded").map((event) => event.step));
-      const everyStepSucceeded = plan.operations.every((op) => succeededSteps.has(op.id));
-      if (everyStepSucceeded) {
-        violations.push("evidence.abandoned: true is incoherent with an event log showing every one of the plan's own operations already succeeded - abandonment means the flow never naturally completed");
+      const evidenceWriteOp = plan.operations.find((op) => op.action === "evidence.write");
+      const evidenceWriteSucceeded = evidenceWriteOp
+        ? events.some((event) => event.phase === "succeeded" && event.step === evidenceWriteOp.id)
+        : false;
+      if (evidenceWriteSucceeded) {
+        violations.push("evidence.abandoned: true is incoherent with an event log showing evidence.write's own step already succeeded - a successful evidence.write is itself the flow's natural terminal completion, which abandonment means never happened");
       }
     }
   }
@@ -621,14 +629,22 @@ export function validateRestoreBundle({ plan, manifest, evidence, kit, lock, jou
     }
     // abandoned: true asserts the flow never naturally completed - a
     // fifth review round found nothing checked this against the actual
-    // event log, so a bundle whose events show every one of the plan's
-    // own operations already succeeded (including evidence.write itself)
-    // could still honestly-looking claim abandoned: true.
+    // event log; the first fix (requiring every plan operation to have
+    // succeeded) was itself too narrow, since journal terminal semantics
+    // only ever require evidence.write itself to have run - a sixth
+    // review round gave the real minimal counterexample: journal failed,
+    // abandoned: true, evidence.write's own event succeeded, but some
+    // unrelated earlier step's event is missing. That still passed the
+    // "every step" check while evidence.write having already, genuinely
+    // succeeded is on its own the natural terminal completion abandoned
+    // claims never happened - so only evidence.write's own event matters.
     if (events && evidence.abandoned === true) {
-      const succeededSteps = new Set(events.filter((event) => event.phase === "succeeded").map((event) => event.step));
-      const everyStepSucceeded = plan.operations.every((op) => succeededSteps.has(op.id));
-      if (everyStepSucceeded) {
-        violations.push("evidence.abandoned: true is incoherent with an event log showing every one of the plan's own operations already succeeded - abandonment means the flow never naturally completed");
+      const evidenceWriteOp = plan.operations.find((op) => op.action === "evidence.write");
+      const evidenceWriteSucceeded = evidenceWriteOp
+        ? events.some((event) => event.phase === "succeeded" && event.step === evidenceWriteOp.id)
+        : false;
+      if (evidenceWriteSucceeded) {
+        violations.push("evidence.abandoned: true is incoherent with an event log showing evidence.write's own step already succeeded - a successful evidence.write is itself the flow's natural terminal completion, which abandonment means never happened");
       }
     }
   }

@@ -162,8 +162,24 @@ deep-equal the real `plan` object passed in, not merely share a
 the actual event log - a bundle whose events showed every one of the
 plan's own operations already succeeded, including `evidence.write`
 itself, could still honestly-looking claim abandonment; both bundle
-validators now reject that specific contradiction when `events` is
+validators rejected that specific contradiction when `events` was
 supplied.
+
+A sixth review round found that first `abandoned` fix was itself too
+narrow: requiring every plan operation's event to show `succeeded`
+before flagging the contradiction let a real counterexample straight
+through - journal `failed`, `abandoned: true`, `evidence.write`'s own
+event genuinely `succeeded`, but some unrelated earlier step's event
+simply missing from the log. That still passed the "every step"
+check even though a successful `evidence.write` is on its own the
+flow's natural terminal completion - the one thing `abandoned: true`
+asserts never happened, regardless of what else is or isn't present
+in the log. Both bundle validators now look up the plan's own
+`evidence.write` operation directly (`plan.operations.find(op =>
+op.action === "evidence.write")` - both plan schemas' own ordering
+rule guarantees it exists and is last) and reject `abandoned: true`
+whenever that one step's own event shows `succeeded`, independent of
+every other step.
 
 **`operation-event-v2` exists alongside the unchanged
 `operation-event-v1` for a semantic reason, not because lock/journal

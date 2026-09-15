@@ -1466,21 +1466,30 @@ test("validateBackupBundle: evidence is bound to lock/journal by operationId, an
   assert.deepEqual(validateBackupBundle({ plan, evidence: abandonedEvidence, journal: failedJournal }).filter((v) => v.includes("abandoned")), []);
 
   // evidence.abandoned: true is incoherent with an event log showing
-  // every one of the plan's own operations already succeeded, including
-  // evidence.write itself - abandonment means the flow got stuck and
-  // never naturally reached its own end.
+  // evidence.write's own step already succeeded - a successful
+  // evidence.write is itself the flow's natural terminal completion,
+  // which abandonment means never happened.
   const allSucceededEvents = plan.operations.map((op) => ({
     apiVersion: "hof.dev/operation-event/v2", operationKind: "backup", operationId: OPERATION_ID,
     step: op.id, attempt: 1, phase: "succeeded", at: "2026-09-04T10:01:00Z",
     ...(op.destination ? { destination: op.destination } : {}),
   }));
   const violations = validateBackupBundle({ plan, evidence: abandonedEvidence, journal: failedJournal, events: allSucceededEvents });
-  assert.ok(violations.some((v) => v.includes("incoherent with an event log showing every")), JSON.stringify(violations));
+  assert.ok(violations.some((v) => v.includes("evidence.write's own step already succeeded")), JSON.stringify(violations));
 
   // A genuinely incomplete event log (missing evidence.write's own
-  // event, say) is coherent with abandonment.
+  // event) is coherent with abandonment.
   const incompleteEvents = allSucceededEvents.filter((event) => event.step !== plan.operations[plan.operations.length - 1].id);
   assert.deepEqual(validateBackupBundle({ plan, evidence: abandonedEvidence, journal: failedJournal, events: incompleteEvents }).filter((v) => v.includes("incoherent")), []);
+
+  // A sixth review round's minimal counterexample: evidence.write's own
+  // event succeeded, but some unrelated EARLIER step's event is missing
+  // from the log entirely. The now-fixed check must still flag this -
+  // it never depended on every other step also being present.
+  const earlierStepId = plan.operations[0].id;
+  const missingEarlierStepEvents = allSucceededEvents.filter((event) => event.step !== earlierStepId);
+  const minimalViolations = validateBackupBundle({ plan, evidence: abandonedEvidence, journal: failedJournal, events: missingEarlierStepEvents });
+  assert.ok(minimalViolations.some((v) => v.includes("evidence.write's own step already succeeded")), JSON.stringify(minimalViolations));
 });
 
 test("validateRestoreBundle: a genuinely coherent plan/manifest/evidence bundle has zero violations", () => {
@@ -1617,7 +1626,20 @@ test("validateRestoreBundle: evidence is bound to lock/journal by operationId, a
     step: op.id, attempt: 1, phase: "succeeded", at: "2026-09-04T10:01:00Z",
   }));
   const violations = validateRestoreBundle({ plan, evidence: abandonedEvidence, journal: journalMatchingAbandoned, events: allSucceededEvents });
-  assert.ok(violations.some((v) => v.includes("incoherent with an event log showing every")), JSON.stringify(violations));
+  assert.ok(violations.some((v) => v.includes("evidence.write's own step already succeeded")), JSON.stringify(violations));
+
+  // A sixth review round's minimal counterexample: evidence.write's own
+  // event succeeded, but some unrelated EARLIER step's event is missing
+  // from the log entirely - must still be flagged.
+  const earlierStepId = plan.operations[0].id;
+  const missingEarlierStepEvents = allSucceededEvents.filter((event) => event.step !== earlierStepId);
+  const minimalViolations = validateRestoreBundle({ plan, evidence: abandonedEvidence, journal: journalMatchingAbandoned, events: missingEarlierStepEvents });
+  assert.ok(minimalViolations.some((v) => v.includes("evidence.write's own step already succeeded")), JSON.stringify(minimalViolations));
+
+  // A genuinely incomplete event log missing evidence.write's own event
+  // is still coherent with abandonment.
+  const missingEvidenceWriteEvents = allSucceededEvents.filter((event) => event.step !== plan.operations[plan.operations.length - 1].id);
+  assert.deepEqual(validateRestoreBundle({ plan, evidence: abandonedEvidence, journal: journalMatchingAbandoned, events: missingEvidenceWriteEvents }).filter((v) => v.includes("incoherent")), []);
 });
 
 test("validateRestoreCommittedGeneration: correctness against the real event log, independent of overall journal status", () => {

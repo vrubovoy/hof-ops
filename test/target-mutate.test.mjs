@@ -496,6 +496,54 @@ test("leaseFencingScript (via updateJournalStatus): verifies the owner record's 
   assert.match(script, new RegExp(`"\\$owner_token" != '${LEASE_TOKEN}'`));
   assert.match(script, /if \[ -r \/proc\/\$owner_pid\/stat \]; then/, "must re-derive the claimed PID's own current start time fresh from /proc");
   assert.match(script, /"\$current_starttime" != "\$owner_starttime"/);
+  // PR 2 (item 10) sixth review, high finding 1: a matching starttime
+  // alone survives the zombie window between SIGKILL and the parent's
+  // own waitpid(2) - the script must also capture /proc's own field 3
+  // (process state) and refuse a zombie explicitly.
+  assert.match(script, /current_state=\$\{1:-\}/, "must also capture the claimed PID's current process state (field 3)");
+  assert.match(script, /"\$current_state" = "Z"/, "must explicitly refuse a zombie PID, not merely trust a matching starttime");
+});
+
+// PR 2 (item 10) sixth review, high finding 1: the shape-only assertions
+// above would still pass a script that captured process state but never
+// actually refused one. This runs the REAL generated script (same
+// capture-then-path-substitute pattern used throughout this file,
+// extended to also redirect /proc/ itself into a synthetic directory)
+// against a fake /proc entry whose starttime genuinely matches the owner
+// record but whose own state is "Z" - the exact window between SIGKILL
+// and the parent's own waitpid(2) - proving the write is genuinely
+// refused, not merely shaped to look like it would be.
+test("leaseFencingScript: a zombie PID with a genuinely matching starttime is still refused, never trusted as a live holder (item 10 PR2 sixth review, high finding 1)", async () => {
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-zombie-fence-"));
+  const fakeProcDir = await mkdtemp(path.join(tmpdir(), "hof-fakeproc-"));
+  try {
+    const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "succeeded", committedGeneration: 1 };
+    const { run, calls } = mockRun({ sshStdout: "HOF_MUTATE_UPDATED\n" });
+    await updateJournalStatus({ ...SSH_TARGET, run }, journalDoc, LEASE_TOKEN);
+    const script = calls.find((c) => c.command === "ssh").input
+      .replaceAll("/var/lib/hof/state", scratchDir)
+      .replaceAll("/proc/", `${fakeProcDir}/`);
+
+    const zombiePid = "4242";
+    const starttime = "999888";
+    await mkdir(path.join(fakeProcDir, zombiePid), { recursive: true });
+    // A deliberately pathological comm field (spaces AND parens - the
+    // same adversarial shape procStartTimeStatements' own field-parsing
+    // was verified against), state Z, and the SAME starttime the owner
+    // record below claims.
+    await writeFile(
+      path.join(fakeProcDir, zombiePid, "stat"),
+      `${zombiePid} (my) weird ) proc name) Z 1 ${zombiePid} ${zombiePid} 0 -1 4194560 100 0 0 0 0 0 0 0 20 0 1 0 ${starttime} 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0\n`,
+    );
+    await writeFile(path.join(scratchDir, "exec.lease.owner"), `${LEASE_TOKEN} ${zombiePid} ${starttime}\n`);
+
+    const { stdout } = await exec("sh", ["-c", script]);
+    assert.match(stdout, /HOF_MUTATE_LEASE_MISMATCH/, "a zombie PID, even with a perfectly matching starttime, must never be trusted as a live holder");
+    await assert.rejects(() => readFile(path.join(scratchDir, "journal", `${OPERATION_ID}.json`)), "the write must never have happened");
+  } finally {
+    await rm(scratchDir, { recursive: true, force: true });
+    await rm(fakeProcDir, { recursive: true, force: true });
+  }
 });
 
 // PR 2 (item 10) third review, critical finding 1: every fenced write
@@ -614,6 +662,41 @@ test("appendEvent: a real HOF_MUTATE_CAS_CONFLICT response (on the journal, not 
     () => appendEvent({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_CAS_CONFLICT\n" }).run }, OPERATION_ID, event, undefined, previousJournal),
     /persisted journal on the target no longer matches what was last read/,
   );
+});
+
+// PR 2 (item 10) sixth review, medium finding 2: updateJournalStatus()'s
+// own executable byte-exact CAS regression test (above) does not cover
+// appendEvent()'s own, separate CAS guard (journalGuardForEventScript) -
+// that one is still checked only via script shape and a mocked response,
+// so a regression back to `$(cat ...)` here specifically would still
+// pass every existing test. Same real-execution pattern as that test:
+// run the REAL generated script against a real persisted journal
+// differing from expectedJournalSnapshot by nothing but a trailing
+// newline, proving the base64-encoded comparison genuinely refuses it,
+// and that neither the journal nor the events file is ever touched.
+test("appendEvent: the target-side CAS check (journalGuardForEventScript) is genuinely byte-exact - a real persisted journal differing from expectedJournalSnapshot by only a trailing newline is refused as a real mismatch, never appended (item 10 PR2 sixth review, medium finding 2)", async () => {
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-cas-byte-exact-event-"));
+  try {
+    const previousJournal = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "in-progress", committedGeneration: null };
+    const persistedWithTrailingNewline = `${JSON.stringify(previousJournal)}\n`;
+    const event = { apiVersion: "hof.dev/operation-event/v1", operationId: OPERATION_ID, step: "001.host.prepare", attempt: 1, phase: "started", at: "2026-08-27T10:00:00Z" };
+
+    const { run, calls } = mockRun({ sshStdout: "HOF_MUTATE_APPENDED\n" });
+    await appendEvent({ ...SSH_TARGET, run }, OPERATION_ID, event, undefined, previousJournal);
+    const script = calls.find((c) => c.command === "ssh").input.replaceAll("/var/lib/hof/state", scratchDir);
+
+    const journalFilePath = path.join(scratchDir, "journal", `${OPERATION_ID}.json`);
+    const eventsFilePath = path.join(scratchDir, "journal", `${OPERATION_ID}.events.ndjson`);
+    await mkdir(path.dirname(journalFilePath), { recursive: true });
+    await writeFile(journalFilePath, persistedWithTrailingNewline);
+
+    const { stdout } = await exec("sh", ["-c", script]);
+    assert.match(stdout, /HOF_MUTATE_CAS_CONFLICT/, "a persisted journal differing only by a trailing newline must be refused as a genuine CAS mismatch, not silently accepted");
+    await assert.rejects(() => readFile(eventsFilePath), "the event must never have been appended on a CAS conflict");
+    assert.equal(await readFile(journalFilePath, "utf8"), persistedWithTrailingNewline, "the journal itself must be left completely untouched");
+  } finally {
+    await rm(scratchDir, { recursive: true, force: true });
+  }
 });
 
 test("readEvents: absent (never appended to yet) returns an empty array, not an error", async () => {

@@ -338,14 +338,28 @@ const EXECUTION_LEASE_OWNER_PATH = "/var/lib/hof/state/exec.lease.owner";
 // substitution across every shell this might ever run under) - a caller
 // joins them with "; " (an array-based script, like heldScript) or "\n"
 // (a multi-line template literal, like every other script here).
-function procStartTimeStatements(pidExpr, resultVar) {
+// PR 2 (item 10) sixth review, high finding 1: a start-time match alone
+// isn't proof the claimed PID still holds the mutex. After SIGKILL, the
+// kernel releases the flock and frees the process's own memory/fds
+// immediately - but the kernel keeps the PID itself around as a ZOMBIE
+// (state Z) until its parent reaps it with waitpid(2), which can lag by
+// an arbitrary amount. /proc/<pid>/stat stays readable, with the SAME
+// starttime, for that entire zombie window - a stale writer racing in
+// exactly then would see a perfectly matching PID+starttime for a
+// process that no longer owns anything. stateVar, when given, captures
+// field 3 (process state - the first field of the remainder after
+// stripping comm) alongside starttime, so callers can refuse a zombie
+// explicitly rather than trusting starttime match alone.
+function procStartTimeStatements(pidExpr, resultVar, stateVar) {
   return [
     `${resultVar}=""`,
+    ...(stateVar ? [`${stateVar}=""`] : []),
     `if [ -r /proc/${pidExpr}/stat ]; then`,
     `stat_line=$(cat /proc/${pidExpr}/stat 2>/dev/null) || stat_line=""`,
     "after_comm=${stat_line##*\\) }",
     "set -- $after_comm",
     `${resultVar}=\${20:-}`,
+    ...(stateVar ? [`${stateVar}=\${1:-}`] : []),
     "fi",
   ];
 }
@@ -402,6 +416,17 @@ function procStartTimeStatements(pidExpr, resultVar) {
 // in the meantime - a real, if rare, possibility this guards against
 // deliberately, not a hypothetical), both mean the claimed holder is
 // definitively gone; only a start time that still matches is trusted.
+//
+// PR 2 (item 10) sixth review, high finding 1: a matching start time
+// alone still wasn't enough - after the holder is SIGKILLed, the kernel
+// releases its flock and reclaims its resources immediately, but the
+// PID itself lingers as a ZOMBIE (state Z, in /proc/<pid>/stat's own
+// field 3) until its parent calls waitpid(2), which can lag arbitrarily.
+// /proc/<pid>/stat stays readable with the SAME starttime for that
+// entire window, so starttime alone would pass. procStartTimeStatements'
+// own stateVar now also captures that field, and a zombie is treated
+// exactly like start-time mismatch - genuinely gone, not merely
+// unconfirmed.
 function leaseFencingScript(leaseToken) {
   if (leaseToken === undefined) return "";
   validateLeaseToken(leaseToken);
@@ -414,8 +439,8 @@ if [ "$owner_token" != '${leaseToken}' ]; then
   echo HOF_MUTATE_LEASE_MISMATCH
   exit 0
 fi
-${procStartTimeStatements("$owner_pid", "current_starttime").join("\n")}
-if [ -z "$current_starttime" ] || [ "$current_starttime" != "$owner_starttime" ]; then
+${procStartTimeStatements("$owner_pid", "current_starttime", "current_state").join("\n")}
+if [ -z "$current_starttime" ] || [ "$current_starttime" != "$owner_starttime" ] || [ "$current_state" = "Z" ]; then
   echo HOF_MUTATE_LEASE_MISMATCH
   exit 0
 fi
@@ -1119,6 +1144,12 @@ echo HOF_LEASE_TIMEOUT
   // immediate - the exact same technique, for consistency and because a
   // check that can itself lag has no real value as an early-warning
   // signal either.
+  // PR 2 (item 10) sixth review, high finding 1: also refuses a zombie
+  // PID exactly like leaseFencingScript() now does (see that function's
+  // own comment) - a matching starttime survives the window between
+  // SIGKILL and the parent's own waitpid(2), for consistency between
+  // what the client believes and what the target-side gate itself
+  // would decide.
   async function assertOwnership() {
     // Once a loss is already known (voluntary release, or a prior
     // assertOwnership()/background-interval tick already found it gone),
@@ -1144,8 +1175,8 @@ if [ "$owner_token" != '${token}' ]; then
   echo HOF_LEASE_LOST
   exit 0
 fi
-${procStartTimeStatements("$owner_pid", "current_starttime").join("\n")}
-if [ -z "$current_starttime" ] || [ "$current_starttime" != "$owner_starttime" ]; then
+${procStartTimeStatements("$owner_pid", "current_starttime", "current_state").join("\n")}
+if [ -z "$current_starttime" ] || [ "$current_starttime" != "$owner_starttime" ] || [ "$current_state" = "Z" ]; then
   flock -u 8
   echo HOF_LEASE_LOST
   exit 0

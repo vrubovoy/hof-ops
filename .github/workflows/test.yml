@@ -19,7 +19,19 @@ jobs:
     # container runs over real SSH - genuinely more wall-clock work, not
     # a hang (confirmed for real: the bootstrap-only half alone already
     # took ~4.5 minutes on its own before this).
-    timeout-minutes: 30
+    # Item 10 (PR2) CI review: bumped again from 30 to 60 - the 30-minute
+    # bound was set before test/apply-acceptance.mjs's own generic-
+    # operation-substrate tests ever actually reached this suite (every
+    # earlier CI run failed fast, before any real work, on the real
+    # target-side bugs the review process caught first). The first run
+    # that ever got past those bugs was genuinely still running real
+    # work: test 1 (bootstrap + reconciliation) alone took ~21 real
+    # minutes, test 2 another ~7 - both legitimate wall-clock cost of
+    # real Ansible roles and real Execution Environment container runs
+    # over real SSH, not a hang - and the job was cancelled by the old
+    # 30-minute bound mid-way through test 6, before ever reaching a real
+    # failure or success on the tests this PR actually added.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4

@@ -813,25 +813,40 @@ test("acquireMutex: the held unit's own script writes the owner record AND clear
   const { run, calls } = mockSequencedRun(["HOF_LEASE_HELD\n"]);
   await acquireMutex({ ...SSH_TARGET, run });
   const script = calls.find((c) => c.command === "ssh").input;
-  // The held unit's own inner script is embedded as a single-quoted
-  // /bin/sh -c argument inside the outer acquire script - extract it.
-  const heldScript = script.match(/\/bin\/sh -c '([^']*(?:'\\''[^']*)*)'/)[1];
+  // PR 2 (item 10) CI review (real-target run, second real bug):
+  // heldScript is no longer embedded as a `/bin/sh -c '...'` argument -
+  // systemd resolves EVERY ExecStart= command line's own "$" references
+  // itself (systemd.service(5)'s own documented environment-variable
+  // substitution for command lines) before /bin/sh ever sees them, which
+  // silently mangled every one of heldScript's own shell variables ($$,
+  // $own_starttime, ...) on a real target. heldScript is now written to
+  // its own file first (a literal heredoc, so the OUTER shell doesn't
+  // expand anything either), and systemd-run is given only a plain file
+  // path (no "$" anywhere) to run via `/bin/sh PATH` - see
+  // heldScriptPath()'s own comment. Extract heldScript from that heredoc
+  // body instead.
+  assert.doesNotMatch(script, /\/bin\/sh -c '/, "heldScript must never be embedded as a systemd-run ExecStart argument again - systemd mangles every \"$\" reference in it");
+  assert.match(script, /systemd-run --unit='[^']+' --quiet -- \/bin\/sh '\/var\/lib\/hof\/state\/\.hof-exec-lease-[0-9a-f-]+\.sh'/, "systemd-run must execute the held script via a plain file path, never an inline -c argument");
+  const heldScript = script.match(/<<'HOF_HELD_SCRIPT_EOF'\n([\s\S]*?)\nHOF_HELD_SCRIPT_EOF/)[1];
   assert.match(heldScript, /exec 8>.*lock\.flock/, "must open the same LOCK_GUARD_PATH fd the rest of this module uses");
-  // PR 2 fifth review: the owner record now carries three fields - TOKEN
-  // PID STARTTIME - written via backslash-escaped, unquoted `echo`
-  // (heldScript is itself wrapped in ONE outer pair of single quotes for
-  // /bin/sh -c '...', so no quoting is available inside it).
-  assert.match(heldScript, /echo [0-9a-f-]+\\ \$\$\\ "\$own_starttime" > .*exec\.lease\.owner/, "the owner record write must still be present, now with PID and start time");
+  // PR 2 sixth review (CI fix): the owner record's three fields - TOKEN
+  // PID STARTTIME - are now written via an ordinary, properly quoted
+  // `printf` - heldScript is executed as its own real file now, not
+  // embedded in any outer single-quoted argument, so normal quoting is
+  // safe again (no more backslash-escaped-space workaround).
+  assert.match(heldScript, /printf '%s %s %s\\n' '[0-9a-f-]+' "\$\$" "\$own_starttime" > '.*exec\.lease\.owner'/, "the owner record write must still be present, now with PID and start time");
   // The write and the self-expiry clear must both be guarded - "flock -x
   // 8" must appear before EACH of them, and "flock -u 8" (or the fd
   // simply closing) after.
-  const printfIndex = heldScript.indexOf("echo ");
+  const printfIndex = heldScript.indexOf("printf ");
   const lockBeforePrintf = heldScript.lastIndexOf("flock -x 8", printfIndex);
   assert.ok(lockBeforePrintf !== -1 && lockBeforePrintf < printfIndex, "the owner-record write must be preceded by taking the guard");
-  assert.match(heldScript, /rm -f .*exec\.lease\.owner/, "self-expiry must actually REMOVE the owner record, not merely exit - a stale, uncleared token must never remain fencing-valid forever");
+  assert.match(heldScript, /rm -f '.*exec\.lease\.owner'/, "self-expiry must actually REMOVE the owner record, not merely exit - a stale, uncleared token must never remain fencing-valid forever");
   const rmIndex = heldScript.indexOf("rm -f");
   const lockBeforeRm = heldScript.lastIndexOf("flock -x 8", rmIndex);
   assert.ok(lockBeforeRm !== -1 && lockBeforeRm < rmIndex, "the self-expiry clear must also be preceded by taking the guard");
+  // Self-expiry must also clean up heldScript's own now-useless file.
+  assert.match(heldScript, /rm -f '\/var\/lib\/hof\/state\/\.hof-exec-lease-[0-9a-f-]+\.sh'/, "self-expiry must also remove the held script's own file, not leak it");
 });
 
 // PR 2 (item 10) review, critical finding 1: `systemctl is-active`

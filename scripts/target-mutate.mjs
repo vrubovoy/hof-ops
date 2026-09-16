@@ -428,47 +428,24 @@ function procStartTimeStatements(pidExpr, resultVar, stateVar) {
 // own stateVar now also captures that field, and a zombie is treated
 // exactly like start-time mismatch - genuinely gone, not merely
 // unconfirmed.
-// TEMPORARY (this debugging round only): the real acceptance suite
-// found a fresh, definitely-still-held lease's own token being refused
-// here, immediately after a successful acquisition - a real bug, but
-// one this dev machine (no /proc, no real systemd) cannot reproduce
-// locally. Every branch below now also echoes a DEBUG_LIVENESS line
-// (harmless to existing parsing - every caller only ever reads
-// stdout's own FIRST line as the tag) carrying the exact values this
-// check compared, so the next real-target CI run's own thrown error
-// (see updateJournalStatus/appendEvent/acquireLockAndJournal, which
-// now fold this line into their own HOF_MUTATE_LEASE_MISMATCH error
-// message) reveals precisely which comparison actually failed. Revert
-// once root-caused.
 function leaseFencingScript(leaseToken) {
   if (leaseToken === undefined) return "";
   validateLeaseToken(leaseToken);
   return `if [ ! -r '${EXECUTION_LEASE_OWNER_PATH}' ]; then
   echo HOF_MUTATE_LEASE_MISMATCH
-  echo "DEBUG_LIVENESS reason=owner-record-absent"
   exit 0
 fi
 read -r owner_token owner_pid owner_starttime < '${EXECUTION_LEASE_OWNER_PATH}' || true
 if [ "$owner_token" != '${leaseToken}' ]; then
   echo HOF_MUTATE_LEASE_MISMATCH
-  echo "DEBUG_LIVENESS reason=token-mismatch owner_token=[$owner_token] expected=[${leaseToken}]"
   exit 0
 fi
 ${procStartTimeStatements("$owner_pid", "current_starttime", "current_state").join("\n")}
 if [ -z "$current_starttime" ] || [ "$current_starttime" != "$owner_starttime" ] || [ "$current_state" = "Z" ]; then
   echo HOF_MUTATE_LEASE_MISMATCH
-  echo "DEBUG_LIVENESS reason=starttime-or-state owner_pid=[$owner_pid] owner_starttime=[$owner_starttime] current_starttime=[$current_starttime] current_state=[$current_state]"
   exit 0
 fi
 `;
-}
-
-// TEMPORARY (this debugging round only, see leaseFencingScript()'s own
-// comment): pulls the DEBUG_LIVENESS line (if any) out of a script's
-// raw stdout for folding into a thrown error's own message.
-function debugLivenessSuffix(stdout) {
-  const line = stdout.split("\n").find((l) => l.startsWith("DEBUG_LIVENESS"));
-  return line ? ` [${line}]` : "";
 }
 
 // How long a fenced write's own shared flock on EXECUTION_LEASE_PATH
@@ -569,7 +546,7 @@ export async function acquireLock(conn, lockDocument) {
 export async function acquireLockAndJournal(conn, lockDocument, journalDocument, leaseToken) {
   const stdout = await runScript(conn, acquireLockAndJournalScript(leaseToken, b64(lockDocument), journalPath(journalDocument.operationId), b64(journalDocument)));
   const [tag, ...rest] = stdout.split("\n");
-  if (tag === "HOF_MUTATE_LEASE_MISMATCH") throw new Error(`refusing to create lock/journal for operation ${journalDocument.operationId}: the execution lease no longer matches this write's own token on the target - another process may now hold it, or it has already self-expired${debugLivenessSuffix(stdout)}`);
+  if (tag === "HOF_MUTATE_LEASE_MISMATCH") throw new Error(`refusing to create lock/journal for operation ${journalDocument.operationId}: the execution lease no longer matches this write's own token on the target - another process may now hold it, or it has already self-expired`);
   if (tag === "HOF_MUTATE_CREATED") return { acquired: true };
   if (tag === "HOF_MUTATE_EXISTS") return { acquired: false, lock: rest.join("\n").trim() ? JSON.parse(rest.join("\n")) : null };
   if (tag === "HOF_MUTATE_JOURNAL_CONFLICT") throw new Error(`a journal for operation ${journalDocument.operationId} already existed on the target even though its lock did not - structurally impossible for a freshly generated operationId, points at real target-side corruption; the lock write was rolled back`);
@@ -752,7 +729,7 @@ mv -f "$tmp" '${targetPath}'
 echo HOF_MUTATE_UPDATED`);
   const stdout = await runScript(conn, script);
   const tag = stdout.split("\n")[0];
-  if (tag === "HOF_MUTATE_LEASE_MISMATCH") throw new Error(`refusing to update the journal for operation ${journalDocument.operationId}: the execution lease no longer matches this write's own token on the target - another process may now hold it, or it has already self-expired${debugLivenessSuffix(stdout)}`);
+  if (tag === "HOF_MUTATE_LEASE_MISMATCH") throw new Error(`refusing to update the journal for operation ${journalDocument.operationId}: the execution lease no longer matches this write's own token on the target - another process may now hold it, or it has already self-expired`);
   if (tag === "HOF_MUTATE_CAS_CONFLICT") throw new Error(`refusing to update the journal for operation ${journalDocument.operationId}: the persisted document on the target no longer matches what was last read - another writer already landed a different transition first`);
   if (tag !== "HOF_MUTATE_UPDATED") throw new Error(`unexpected target-mutate response: ${JSON.stringify(stdout)}`);
 }
@@ -841,7 +818,7 @@ printf '%s\\n' "$(printf '%s' "$payload" | base64 -d)" >> '${targetPath}'
 echo HOF_MUTATE_APPENDED`);
   const stdout = await runScript(conn, script);
   const tag = stdout.split("\n")[0];
-  if (tag === "HOF_MUTATE_LEASE_MISMATCH") throw new Error(`refusing to append an event for operation ${operationId}: the execution lease no longer matches this write's own token on the target - another process may now hold it, or it has already self-expired${debugLivenessSuffix(stdout)}`);
+  if (tag === "HOF_MUTATE_LEASE_MISMATCH") throw new Error(`refusing to append an event for operation ${operationId}: the execution lease no longer matches this write's own token on the target - another process may now hold it, or it has already self-expired`);
   if (tag === "HOF_MUTATE_JOURNAL_TERMINAL") throw new Error(`refusing to append an event for operation ${operationId}: the persisted journal is already terminal - no further events are ever appended once an operation has genuinely finished`);
   if (tag === "HOF_MUTATE_CAS_CONFLICT") throw new Error(`refusing to append an event for operation ${operationId}: the persisted journal on the target no longer matches what was last read - another writer already changed it`);
   if (tag !== "HOF_MUTATE_APPENDED") throw new Error(`unexpected target-mutate response: ${JSON.stringify(stdout)}`);
@@ -908,6 +885,38 @@ function mutexUnitName(token) {
   return `${MUTEX_UNIT_PREFIX}${token}`;
 }
 
+// PR 2 (item 10) CI review (real-target run, second real bug): heldScript
+// used to be embedded directly as the `-c` argument of
+// `systemd-run ... -- /bin/sh -c 'heldScript'`. That argument is part of
+// the transient unit's own ExecStart= command line, and systemd resolves
+// EVERY ExecStart= command line's own "$" references BEFORE ever handing
+// it to /bin/sh - this is systemd's own, documented environment-variable
+// substitution for command lines (systemd.service(5), "Command lines"):
+// `$$` is systemd's OWN escape for a literal single `$`, and `$NAME`/
+// `${NAME}` are resolved against the unit's OWN environment, never left
+// for a shell to interpret. heldScript is full of genuine shell variable
+// references using exactly that syntax ($$, $own_starttime, $stat_line,
+// $mtime, ...) - every one of them was being silently mangled by systemd
+// itself, before /bin/sh ever started: $$ (meant as this shell's own
+// PID) became a literal "$", and every other reference (no matching
+// environment variable existing) became empty. The owner record ended up
+// with a literal "$" in place of a PID and an empty starttime - which is
+// exactly why a lease that had JUST been written, checked moments later,
+// looked like PID "$" with no matching starttime and was refused as
+// mismatched. Confirmed against the exact generated script via `sh -n`
+// and direct execution (syntactically and semantically fine on its own -
+// the corruption only happens inside systemd's own ExecStart resolution,
+// which nothing short of a real systemd-run reproduces). Fixed by never
+// putting heldScript's own text inside ExecStart='s command line at all:
+// it's written to this fixed, token-derived path first (as a literal
+// heredoc - see acquireMutex()'s own acquireScript), and systemd-run is
+// given only a plain file path (no "$" anywhere) to execute via
+// `/bin/sh PATH`, entirely bypassing ExecStart's own substitution.
+function heldScriptPath(token) {
+  if (!MUTEX_TOKEN_PATTERN.test(token)) throw new Error(`internal error: "${token}" is not a valid mutex token`);
+  return `/var/lib/hof/state/.${MUTEX_UNIT_PREFIX}${token}.sh`;
+}
+
 // Item 9 review fix (finding 3), superseded by PR2 (item 10): the
 // durable lock.json is a PERSISTENCE lock - it survives a crash so
 // --resume can find an interrupted operation. It is NOT a liveness
@@ -962,13 +971,11 @@ export async function acquireMutex(conn) {
   const token = randomUUID();
   const unit = mutexUnitName(token);
 
-  // The held unit's own script - never wrapped in an outer single-quoted
-  // /bin/sh -c argument that also contains single quotes of its own (a
-  // real quoting hazard): every literal this embeds (the fixed lease/
-  // owner/guard paths, the token, the two bounds) is quote-free by
-  // construction (no spaces, no shell metacharacters), so the whole
-  // thing can be safely wrapped in a single pair of outer single quotes
-  // by acquireMutexScript() below without any nested-quote escaping.
+  // The held unit's own script - written to its own file (see
+  // heldScriptPath()'s own comment on why: systemd's own ExecStart
+  // command-line substitution, not a shell-quoting concern), so ordinary
+  // shell quoting throughout is safe, exactly like every other script in
+  // this file.
   //
   // PR 2 (item 10) second review, critical finding 1: the ORIGINAL
   // version of this script wrote the owner record (`printf ... >
@@ -1007,6 +1014,7 @@ export async function acquireMutex(conn) {
   // own leaseFencingScript() can verify genuine, current liveness via
   // /proc directly, kernel-synchronous and immediate, never through
   // systemd's own asynchronous ActiveState.
+  const heldScriptFile = heldScriptPath(token);
   const heldScript = [
     `exec 9>${EXECUTION_LEASE_PATH}`,
     "if flock -n -x 9; then",
@@ -1015,29 +1023,20 @@ export async function acquireMutex(conn) {
     "flock -x 8",
     "umask 077",
     ...procStartTimeStatements("$$", "own_starttime"),
-    // No quotes available here (heldScript is wrapped whole in a single
-    // pair of outer single quotes by acquireMutexScript() below) - a
-    // multi-word printf format string like '%s %s %s' would need
-    // quoting to survive as ONE argument, so this uses echo with
-    // backslash-escaped (not quoted) spaces between the three fields
-    // instead, confirmed correct against a real POSIX sh (dash) before
-    // landing on it: unquoted `\ ` always produces a literal space
-    // within one argument word, for any command, without needing
-    // quotes at all - and echo's own default trailing newline is what
-    // makes read -r (in leaseFencingScript() below) return a clean 0
-    // status reading this file back, rather than the >0 status read
-    // returns when it hits EOF with no trailing newline (confirmed:
-    // read -r still populates every variable correctly even then, but
-    // set -eu would abort the whole script on that spurious nonzero
-    // status regardless).
-    `echo ${token}\\ $$\\ "$own_starttime" > ${EXECUTION_LEASE_OWNER_PATH}`,
+    // heldScript is now delivered to the target as its own file (see
+    // heldScriptPath()'s own comment on why - systemd's own ExecStart
+    // command-line substitution, not a shell-quoting issue), executed
+    // fresh as `/bin/sh PATH`, not embedded in any outer single-quoted
+    // argument - ordinary single/double quoting is safe here, exactly
+    // like every other script in this file.
+    `printf '%s %s %s\\n' '${token}' "$$" "$own_starttime" > '${EXECUTION_LEASE_OWNER_PATH}'`,
     "flock -u 8",
     "while :; do",
     `sleep ${LEASE_SELF_CHECK_INTERVAL_S}`,
     "flock -x 8",
-    `mtime=$(stat -c %Y ${EXECUTION_LEASE_OWNER_PATH} 2>/dev/null) || { flock -u 8; exit 0; }`,
+    `mtime=$(stat -c %Y '${EXECUTION_LEASE_OWNER_PATH}' 2>/dev/null) || { flock -u 8; rm -f '${heldScriptFile}'; exit 0; }`,
     "now=$(date +%s)",
-    `if [ $((now - mtime)) -gt ${LEASE_HEARTBEAT_TIMEOUT_S} ]; then rm -f ${EXECUTION_LEASE_OWNER_PATH}; flock -u 8; exit 0; fi`,
+    `if [ $((now - mtime)) -gt ${LEASE_HEARTBEAT_TIMEOUT_S} ]; then rm -f '${EXECUTION_LEASE_OWNER_PATH}'; flock -u 8; rm -f '${heldScriptFile}'; exit 0; fi`,
     "flock -u 8",
     "done",
     "else",
@@ -1062,9 +1061,8 @@ export async function acquireMutex(conn) {
   // first ever made against a fresh target. Joining with "\n" instead -
   // exactly like every other multi-line script in this file - is
   // syntactically identical to a normal multi-line script file and has
-  // no such restriction; a literal newline survives being embedded
-  // inside the single-quoted `/bin/sh -c '...'` argument below exactly
-  // as well as any other character does.
+  // no such restriction; a literal newline survives being written to a
+  // real file exactly as well as any other character does.
   ].join("\n");
 
   // PR 2 (item 10) review, Critical finding 1: systemctl reporting a
@@ -1108,7 +1106,11 @@ export async function acquireMutex(conn) {
   // iterations.
   const acquireScript = `set -eu
 mkdir -p "$(dirname '${EXECUTION_LEASE_PATH}')"
-systemd-run --unit='${unit}' --quiet -- /bin/sh -c '${heldScript}' >/dev/null 2>&1
+umask 077
+cat > '${heldScriptFile}' <<'HOF_HELD_SCRIPT_EOF'
+${heldScript}
+HOF_HELD_SCRIPT_EOF
+systemd-run --unit='${unit}' --quiet -- /bin/sh '${heldScriptFile}' >/dev/null 2>&1
 i=0
 while [ "$i" -lt ${LEASE_ACQUIRE_POLL_ATTEMPTS} ]; do
   state=$(systemctl is-active '${unit}.service' 2>/dev/null || true)
@@ -1122,6 +1124,7 @@ while [ "$i" -lt ${LEASE_ACQUIRE_POLL_ATTEMPTS} ]; do
   fi
   if [ "$state" = failed ]; then
     systemctl reset-failed '${unit}.service' >/dev/null 2>&1 || true
+    rm -f '${heldScriptFile}'
     echo HOF_LEASE_BUSY
     exit 0
   fi
@@ -1211,7 +1214,6 @@ flock -x 8
 if [ ! -r '${EXECUTION_LEASE_OWNER_PATH}' ]; then
   flock -u 8
   echo HOF_LEASE_LOST
-  echo "DEBUG_LIVENESS reason=owner-record-absent"
   exit 0
 fi
 owner_token=""
@@ -1220,14 +1222,12 @@ read -r owner_token owner_pid owner_starttime < '${EXECUTION_LEASE_OWNER_PATH}' 
 if [ "$owner_token" != '${token}' ]; then
   flock -u 8
   echo HOF_LEASE_LOST
-  echo "DEBUG_LIVENESS reason=token-mismatch owner_token=[$owner_token] expected=[${token}]"
   exit 0
 fi
 ${procStartTimeStatements("$owner_pid", "current_starttime", "current_state").join("\n")}
 if [ -z "$current_starttime" ] || [ "$current_starttime" != "$owner_starttime" ] || [ "$current_state" = "Z" ]; then
   flock -u 8
   echo HOF_LEASE_LOST
-  echo "DEBUG_LIVENESS reason=starttime-or-state owner_pid=[$owner_pid] owner_starttime=[$owner_starttime] current_starttime=[$current_starttime] current_state=[$current_state]"
   exit 0
 fi
 touch '${EXECUTION_LEASE_OWNER_PATH}'
@@ -1239,7 +1239,7 @@ echo HOF_LEASE_OK
       return;
     }
     if (assertStdout.split("\n")[0] !== "HOF_LEASE_OK") {
-      markLost(`the execution lease for this target is no longer held (its systemd unit is gone, or the owner record no longer matches this acquisition's own token)${debugLivenessSuffix(assertStdout)}`);
+      markLost("the execution lease for this target is no longer held (its systemd unit is gone, or the owner record no longer matches this acquisition's own token)");
     }
   }
 
@@ -1277,6 +1277,7 @@ if [ "$owner_token" = '${token}' ]; then
   flock -u 8
   systemctl stop '${unit}.service' >/dev/null 2>&1 || true
   systemctl reset-failed '${unit}.service' >/dev/null 2>&1 || true
+  rm -f '${heldScriptFile}'
   echo HOF_LEASE_RELEASED
 else
   flock -u 8

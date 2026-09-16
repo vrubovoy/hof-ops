@@ -1375,7 +1375,7 @@ test("acquireMutex: real target-side flock contention across two concurrent acqu
     // background interval (which would take up to its own configured
     // bound to fire on its own).
     await first.assertOwnership();
-    assert.equal(first.isLost(), false);
+    assert.equal(first.isLost(), false, `unexpected loss right after a genuine, still-held acquisition: ${first.lostReason()}`);
 
     // Simulate an uncleanly-dead local process: kill the real unit
     // directly on the target - never through release(), which this test

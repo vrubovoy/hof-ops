@@ -335,9 +335,10 @@ const EXECUTION_LEASE_OWNER_PATH = "/var/lib/hof/state/exec.lease.owner";
 // this). Returned as an array of plain shell statements (never a single
 // nested $(...) expression - this file's own scripts are transmitted as
 // flat text with no compatibility guarantee for deeply nested command
-// substitution across every shell this might ever run under) - a caller
-// joins them with "; " (an array-based script, like heldScript) or "\n"
-// (a multi-line template literal, like every other script here).
+// substitution across every shell this might ever run under) - every
+// caller joins them with "\n", exactly like every other script in this
+// file (including heldScript's own outer array below - see its own
+// comment on the real bug an earlier "; " join once had).
 // PR 2 (item 10) sixth review, high finding 1: a start-time match alone
 // isn't proof the claimed PID still holds the mutex. After SIGKILL, the
 // kernel releases the flock and frees the process's own memory/fds
@@ -1019,7 +1020,29 @@ export async function acquireMutex(conn) {
     "else",
     "exit 1",
     "fi",
-  ].join("; ");
+  // PR 2 (item 10) CI review (first real-target run), critical finding:
+  // this used to join with "; " - which put a bare ";" immediately
+  // after every "then"/"do" keyword whose own body was a SEPARATE array
+  // element (e.g. "if ...; then", "stat_line=..." joins into
+  // "if ...; then; stat_line=..."; "while :; do", "sleep ..." joins into
+  // "while :; do; sleep ...") - a genuine POSIX syntax error (empty
+  // command list is never valid immediately after "then"/"do"),
+  // confirmed with `sh -n` against the exact generated text. This never
+  // showed up in any prior review round because every local/CI check up
+  // to that point only asserted the generated text's own SHAPE against
+  // a mocked `run` - heldScript itself only ever actually executes on a
+  // real target, inside a real systemd-run unit, which no mocked test
+  // exercises. The real acceptance suite (a genuine target, genuine
+  // systemd) caught it immediately: the unit failed to even start,
+  // every acquireMutex() call observed `systemctl is-active` = failed,
+  // and reported the lease busy on EVERY attempt, including the very
+  // first ever made against a fresh target. Joining with "\n" instead -
+  // exactly like every other multi-line script in this file - is
+  // syntactically identical to a normal multi-line script file and has
+  // no such restriction; a literal newline survives being embedded
+  // inside the single-quoted `/bin/sh -c '...'` argument below exactly
+  // as well as any other character does.
+  ].join("\n");
 
   // PR 2 (item 10) review, Critical finding 1: systemctl reporting a
   // unit "active" does NOT by itself prove ITS OWN flock -n -x actually

@@ -230,7 +230,15 @@ before(async () => {
   // Built once, from THIS working tree's own ansible/ - see this file's
   // own top-level comment on localEeImageTag for why only two scenarios
   // below actually use it.
-  await exec("docker", ["build", "--quiet", "--tag", localEeImageTag, "--file", path.join(root, "ansible/Dockerfile"), path.join(root, "ansible")], { timeout: 300_000 });
+  // Item 10 (PR2) CI review: bumped from 300_000 (5 min) - two
+  // consecutive real CI runs hit exactly this bound (~301s, ~300s),
+  // killing the build mid-way rather than reporting a genuine docker
+  // build failure. Not caused by anything in this PR (ansible/Dockerfile
+  // itself is untouched) - a slower-than-usual base-image pull/registry
+  // round trip on the runner at the time, which a tighter bound has no
+  // way to distinguish from a genuine hang. Generous headroom, matching
+  // this file's own contracts job timeout (also bumped in this review).
+  await exec("docker", ["build", "--quiet", "--tag", localEeImageTag, "--file", path.join(root, "ansible/Dockerfile"), path.join(root, "ansible")], { timeout: 900_000 });
 
   await exec("docker", ["build", "--quiet", "--tag", targetImageTag, fixtureDir], { timeout: 180_000 });
   await exec("docker", ["network", "create", networkName]);

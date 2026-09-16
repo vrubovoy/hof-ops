@@ -322,6 +322,34 @@ const TOPOLOGY_PATH = "/var/lib/hof/state/topology.json";
 const EXECUTION_LEASE_PATH = "/var/lib/hof/state/exec.lease";
 const EXECUTION_LEASE_OWNER_PATH = "/var/lib/hof/state/exec.lease.owner";
 
+// PR 2 (item 10) fifth review, high finding 1: extracts a PID's own
+// CURRENT start time - field 22 of /proc/<pid>/stat - into resultVar
+// (left empty if that pid doesn't exist, or never existed). Kernel-
+// synchronous and immediate, unlike `systemctl is-active` (see
+// leaseFencingScript()'s own comment on why that mattered). Robust
+// against /proc/<pid>/stat's own 2nd field (`comm`, in parens) itself
+// containing spaces or even parens - a well-known parsing pitfall this
+// avoids by stripping everything through the LAST ") " before splitting
+// the remaining, always-simple numeric fields on whitespace (confirmed
+// against a deliberately pathological comm value before landing on
+// this). Returned as an array of plain shell statements (never a single
+// nested $(...) expression - this file's own scripts are transmitted as
+// flat text with no compatibility guarantee for deeply nested command
+// substitution across every shell this might ever run under) - a caller
+// joins them with "; " (an array-based script, like heldScript) or "\n"
+// (a multi-line template literal, like every other script here).
+function procStartTimeStatements(pidExpr, resultVar) {
+  return [
+    `${resultVar}=""`,
+    `if [ -r /proc/${pidExpr}/stat ]; then`,
+    `stat_line=$(cat /proc/${pidExpr}/stat 2>/dev/null) || stat_line=""`,
+    "after_comm=${stat_line##*\\) }",
+    "set -- $after_comm",
+    `${resultVar}=\${20:-}`,
+    "fi",
+  ];
+}
+
 // PR 2 (item 10) review: appendEvent()/updateJournalStatus() used to
 // trust their own CALLER's cached isLost() check alone - a real
 // TOCTOU gap (a lease genuinely lost strictly between that check and
@@ -332,23 +360,62 @@ const EXECUTION_LEASE_OWNER_PATH = "/var/lib/hof/state/exec.lease.owner";
 // its own flock guard (the same one acquireMutex()'s held script uses
 // to serialize acquisition against release - see that function's own
 // comment): the write proceeds only if the owner record still holds
-// EXACTLY this leaseToken AND systemctl genuinely confirms THAT
-// TOKEN'S OWN unit is still active - not merely the file's content
-// (PR 2 third review, critical finding 1: a belt-and-suspenders check
-// independent of whatever cleared or didn't clear the owner record -
-// catches a partially-failed cleanup or a future bug in that logic,
-// not just a token mismatch) - otherwise nothing is written at all,
-// atomically, decided under the same mutual exclusion the mutex itself
-// already provides - never merely a client-side, best-effort check.
-// leaseToken is optional (omitted entirely for a caller with no lease
-// concept at all) - when omitted, this returns an empty string and the
-// write proceeds unguarded, exactly like before this review.
+// EXACTLY this leaseToken AND its own claimed PID is genuinely still
+// alive with a matching start time - otherwise nothing is written at
+// all, atomically, decided under the same mutual exclusion the mutex
+// itself already provides - never merely a client-side, best-effort
+// check. leaseToken is optional (omitted entirely for a caller with no
+// lease concept at all) - when omitted, this returns an empty string
+// and the write proceeds unguarded, exactly like before this review.
+//
+// PR 2 fourth review, high finding 1's own fix (a `systemctl is-active`
+// check) was itself superseded by the fifth review: ActiveState is an
+// ASYNCHRONOUS, userspace-bookkeeping signal - after a hard kill, the
+// KERNEL releases every flock the dying process held IMMEDIATELY (as
+// part of process exit itself), but systemd's own ActiveState
+// transition is a SEPARATE, unsynchronized event on systemd's own event
+// loop - a real window where the kernel already freed the mutex but
+// `systemctl is-active` still answers "active". The fourth review's own
+// attempted fix - a kernel-level, non-blocking EXCLUSIVE probe taken
+// BEFORE this write's own shared hold - turned out to have its own,
+// different race: the probe only proves the state at the INSTANT it
+// runs, with no link to the write's own LATER shared-lock acquisition
+// and fencing decision - the real holder could die in the gap between
+// the probe succeeding (finding it alive) and this write actually
+// taking its own shared fd, and the STILL-unmodified owner record would
+// then pass the very next check regardless.
+//
+// This is fixed for real by moving the liveness check to run AFTER
+// fencedWriteScript() has ALREADY taken this write's own shared hold on
+// EXECUTION_LEASE_PATH (see that function's own comment on why that
+// hold is what actually matters) - once held, NO new acquisition can
+// possibly complete its own handoff (write a fresh token into the owner
+// record) until this write releases, so a liveness check made from
+// HERE ON stays valid for the rest of this write's own lifetime, not
+// merely at one earlier instant. The check itself no longer asks
+// systemd at all: the owner record now carries the holder's own PID and
+// start time (written by heldScript below) alongside the token -
+// procStartTimeStatements() re-derives that PID's CURRENT start time
+// fresh from /proc, kernel-synchronous and immediate. A PID that no
+// longer exists at all, or one that does but whose start time no longer
+// matches (the PID number was reused by a genuinely different process
+// in the meantime - a real, if rare, possibility this guards against
+// deliberately, not a hypothetical), both mean the claimed holder is
+// definitively gone; only a start time that still matches is trusted.
 function leaseFencingScript(leaseToken) {
   if (leaseToken === undefined) return "";
   validateLeaseToken(leaseToken);
-  const unit = mutexUnitName(leaseToken);
-  return `owner_unit_state=$(systemctl is-active '${unit}.service' 2>/dev/null || true)
-if [ "$owner_unit_state" != active ] || [ ! -r '${EXECUTION_LEASE_OWNER_PATH}' ] || [ "$(cat '${EXECUTION_LEASE_OWNER_PATH}')" != '${leaseToken}' ]; then
+  return `if [ ! -r '${EXECUTION_LEASE_OWNER_PATH}' ]; then
+  echo HOF_MUTATE_LEASE_MISMATCH
+  exit 0
+fi
+read -r owner_token owner_pid owner_starttime < '${EXECUTION_LEASE_OWNER_PATH}' || true
+if [ "$owner_token" != '${leaseToken}' ]; then
+  echo HOF_MUTATE_LEASE_MISMATCH
+  exit 0
+fi
+${procStartTimeStatements("$owner_pid", "current_starttime").join("\n")}
+if [ -z "$current_starttime" ] || [ "$current_starttime" != "$owner_starttime" ]; then
   echo HOF_MUTATE_LEASE_MISMATCH
   exit 0
 fi
@@ -386,61 +453,22 @@ const LEASE_SHARED_FLOCK_WAIT_S = 10;
 // while ANY of them - the current holder OR any write still in flight,
 // regardless of which token it carries - still holds it. This closes
 // the residual window a lock.flock-only design left structurally open:
-// a write that has already, genuinely confirmed a still-active unit and
-// a matching owner token is now GUARANTEED to finish (or fail on its
-// own terms) before any new acquisition can even begin to take over -
-// never interleaved with one, regardless of whether every future write
-// path remembers LOCK_GUARD_PATH correctly on its own.
-// PR 2 (item 10) fourth review, high finding 1: `systemctl is-active`
-// is an ASYNCHRONOUS, userspace-bookkeeping signal - after a hard kill
-// (SIGKILL, OOM), the KERNEL releases every flock the dying process
-// held IMMEDIATELY (as part of process exit itself), but systemd's own
-// ActiveState transition is a SEPARATE, unsynchronized event, processed
-// on systemd's own event loop once it reaps the child via SIGCHLD -
-// there is a real, if narrow, window where the kernel has ALREADY freed
-// the flock but `systemctl is-active` still reports "active". A stale
-// write's own leaseFencingScript() check, run during exactly that
-// window, would see "active" AND a still-matching (never cleared, since
-// a hard kill skips the self-expiry branch entirely) owner record, and
-// wrongly proceed. round 3's own shared-flock addition does NOT close
-// this by itself - it only proves no NEW ACQUISITION is currently mid-
-// handoff; a shared lock request always succeeds instantly whether or
-// not anyone else is currently holding one, so it says nothing about
-// whether the CLAIMED holder is still genuinely alive.
+// once this hold is taken, no new acquisition can even begin to take
+// over until this write finishes (or fails on its own terms) - never
+// interleaved with one, regardless of whether every future write path
+// remembers LOCK_GUARD_PATH correctly on its own.
 //
-// Fixed with a real, kernel-verified liveness probe that has none of
-// systemd's own lag: BEFORE ever taking this write's own shared hold,
-// attempt a bare, non-blocking EXCLUSIVE flock on EXECUTION_LEASE_PATH
-// via a throwaway fd. Kernel flock state is authoritative and
-// synchronous (unlike ActiveState) - if the probe succeeds, that is
-// definitive proof NOTHING currently holds this file at all (neither a
-// genuinely alive holder, NOR any other in-flight writer), which means
-// the owner record - whatever it claims - is unconditionally stale;
-// refused immediately, without ever even reading it. The probe is
-// released immediately either way (this write must never itself hold
-// the file exclusively) before proceeding to take its OWN shared hold
-// (fd 7, unaffected by the now-released probe) and, only if the probe
-// found someone genuinely there, falling through to the existing
-// systemctl+owner-record check as a second, complementary layer (which
-// still matters even when the probe fails to find "no one home" - a
-// GENUINE, different, currently-alive holder's own token would also
-// legitimately fail the probe, and must still be told apart from THIS
-// write's own token via the owner record). A probe attempted from a fd
-// that ALSO held this write's own shared lock would always self-block
-// (flock(2): independent open file descriptions on the same file DO
-// conflict with each other, even from the same process) - which is
-// exactly why the probe must run strictly BEFORE fd 7 is ever taken,
-// not after.
+// PR 2 fourth review, high finding 1 added (and the fifth review then
+// REMOVED) a kernel-level, non-blocking EXCLUSIVE probe taken BEFORE
+// this shared hold - see leaseFencingScript()'s own comment on why that
+// probe had its own, different race (a snapshot with no link to this
+// write's own later shared-lock acquisition) and was superseded by
+// moving liveness verification to run AFTER this hold instead, inside
+// leaseFencingScript() itself.
 function fencedWriteScript(leaseToken, criticalSection) {
   if (leaseToken === undefined) return withLockGuard(criticalSection);
   return `set -eu
 mkdir -p "$(dirname '${EXECUTION_LEASE_PATH}')"
-exec 6>'${EXECUTION_LEASE_PATH}'
-if flock -n -x 6; then
-  flock -u 6
-  echo HOF_MUTATE_LEASE_MISMATCH
-  exit 0
-fi
 exec 7>'${EXECUTION_LEASE_PATH}'
 flock -w ${LEASE_SHARED_FLOCK_WAIT_S} -s 7
 ${withLockGuard(`${leaseFencingScript(leaseToken)}${criticalSection}`)}`;
@@ -659,7 +687,7 @@ export async function readGenerationSnapshotReleaseLock(conn, generation) {
 function journalCasCheckScript(targetPath, expectedPreviousDocument) {
   if (expectedPreviousDocument === undefined) return "";
   return `expected_payload='${b64(expectedPreviousDocument)}'
-if [ ! -r '${targetPath}' ] || [ "$(base64 -w0 < '${targetPath}')" != "$expected_payload" ]; then
+if [ ! -r '${targetPath}' ] || [ "$(base64 < '${targetPath}' | tr -d '\\n')" != "$expected_payload" ]; then
   echo HOF_MUTATE_CAS_CONFLICT
   exit 0
 fi
@@ -709,11 +737,15 @@ echo HOF_MUTATE_UPDATED`);
 // its own alphabet, never as a literal newline character in the
 // encoded output itself, so encoding-then-comparing is immune to
 // command substitution's own trailing-newline stripping (which only
-// ever removes `base64 -w0`'s own single, cosmetic, format-level
-// trailing newline - not anything reflecting the FILE's real content).
-// The terminal-status check below still safely uses the decoded text -
-// a substring match is unaffected by trailing-newline-stripping either
-// way, since it never depends on matching the very end of the string.
+// ever removes base64's own single, cosmetic, format-level trailing
+// newline - not anything reflecting the FILE's real content). Piped
+// through `tr -d '\n'` (never GNU coreutils' own `base64 -w0` - the
+// same portable technique target-probe.sh's own base64 encoding already
+// uses elsewhere in this repo, rather than adding an unnecessary
+// platform-specific dependency of this primitive's own). The terminal-
+// status check below still safely uses the decoded text - a substring
+// match is unaffected by trailing-newline-stripping either way, since
+// it never depends on matching the very end of the string.
 function journalGuardForEventScript(journalTargetPath, expectedJournalSnapshot) {
   if (expectedJournalSnapshot === undefined) return "";
   return `expected_journal_payload='${b64(expectedJournalSnapshot)}'
@@ -727,7 +759,7 @@ case "$(cat '${journalTargetPath}')" in
     exit 0
     ;;
 esac
-current_journal_payload=$(base64 -w0 < '${journalTargetPath}')
+current_journal_payload=$(base64 < '${journalTargetPath}' | tr -d '\\n')
 if [ "$current_journal_payload" != "$expected_journal_payload" ]; then
   echo HOF_MUTATE_CAS_CONFLICT
   exit 0
@@ -920,6 +952,12 @@ export async function acquireMutex(conn) {
   // NOT coexist with a FUTURE acquisition's own exclusive check, which
   // is exactly the point - see fencedWriteScript()'s own comment for
   // the full reasoning.
+  // PR 2 (item 10) fifth review, high finding 1: the owner record now
+  // carries this unit's own PID and start time alongside its token -
+  // see procStartTimeStatements()'s own comment - so a fenced write's
+  // own leaseFencingScript() can verify genuine, current liveness via
+  // /proc directly, kernel-synchronous and immediate, never through
+  // systemd's own asynchronous ActiveState.
   const heldScript = [
     `exec 9>${EXECUTION_LEASE_PATH}`,
     "if flock -n -x 9; then",
@@ -927,7 +965,23 @@ export async function acquireMutex(conn) {
     `exec 8>${LOCK_GUARD_PATH}`,
     "flock -x 8",
     "umask 077",
-    `printf %s ${token} > ${EXECUTION_LEASE_OWNER_PATH}`,
+    ...procStartTimeStatements("$$", "own_starttime"),
+    // No quotes available here (heldScript is wrapped whole in a single
+    // pair of outer single quotes by acquireMutexScript() below) - a
+    // multi-word printf format string like '%s %s %s' would need
+    // quoting to survive as ONE argument, so this uses echo with
+    // backslash-escaped (not quoted) spaces between the three fields
+    // instead, confirmed correct against a real POSIX sh (dash) before
+    // landing on it: unquoted `\ ` always produces a literal space
+    // within one argument word, for any command, without needing
+    // quotes at all - and echo's own default trailing newline is what
+    // makes read -r (in leaseFencingScript() below) return a clean 0
+    // status reading this file back, rather than the >0 status read
+    // returns when it hits EOF with no trailing newline (confirmed:
+    // read -r still populates every variable correctly even then, but
+    // set -eu would abort the whole script on that spurious nonzero
+    // status regardless).
+    `echo ${token}\\ $$\\ "$own_starttime" > ${EXECUTION_LEASE_OWNER_PATH}`,
     "flock -u 8",
     "while :; do",
     `sleep ${LEASE_SELF_CHECK_INTERVAL_S}`,
@@ -988,8 +1042,9 @@ i=0
 while [ "$i" -lt ${LEASE_ACQUIRE_POLL_ATTEMPTS} ]; do
   state=$(systemctl is-active '${unit}.service' 2>/dev/null || true)
   if [ "$state" = active ]; then
-    owner=$(cat '${EXECUTION_LEASE_OWNER_PATH}' 2>/dev/null || true)
-    if [ "$owner" = '${token}' ]; then
+    owner_token=""
+    read -r owner_token _ _ < '${EXECUTION_LEASE_OWNER_PATH}' 2>/dev/null || true
+    if [ "$owner_token" = '${token}' ]; then
       echo HOF_LEASE_HELD
       exit 0
     fi
@@ -1054,6 +1109,16 @@ echo HOF_LEASE_TIMEOUT
   // through fd 8 makes "read mtime, decide, clear" (heldScript) and
   // "verify token, touch" (here) strictly ordered relative to each
   // other, never interleaved.
+  // PR 2 (item 10) fifth review, high finding 1: no longer consults
+  // `systemctl is-active` at all - the same asynchronous-lag reasoning
+  // leaseFencingScript() itself was fixed for (see that function's own
+  // comment) applies just as much here, even though this is only ever
+  // the client's own periodic heartbeat/self-check, never the actual
+  // write-time gate. Reads the owner record's own PID+start time back
+  // and re-verifies them fresh against /proc, kernel-synchronous and
+  // immediate - the exact same technique, for consistency and because a
+  // check that can itself lag has no real value as an early-warning
+  // signal either.
   async function assertOwnership() {
     // Once a loss is already known (voluntary release, or a prior
     // assertOwnership()/background-interval tick already found it gone),
@@ -1064,21 +1129,30 @@ echo HOF_LEASE_TIMEOUT
     let assertStdout;
     try {
       assertStdout = await runScript(scriptConn, `set -eu
-state=$(systemctl is-active '${unit}.service' 2>/dev/null || true)
-if [ "$state" != active ]; then
+exec 8>'${LOCK_GUARD_PATH}'
+flock -x 8
+if [ ! -r '${EXECUTION_LEASE_OWNER_PATH}' ]; then
+  flock -u 8
   echo HOF_LEASE_LOST
   exit 0
 fi
-exec 8>'${LOCK_GUARD_PATH}'
-flock -x 8
-if [ -r '${EXECUTION_LEASE_OWNER_PATH}' ] && [ "$(cat '${EXECUTION_LEASE_OWNER_PATH}')" = '${token}' ]; then
-  touch '${EXECUTION_LEASE_OWNER_PATH}'
-  flock -u 8
-  echo HOF_LEASE_OK
-else
+owner_token=""
+owner_pid=""
+read -r owner_token owner_pid owner_starttime < '${EXECUTION_LEASE_OWNER_PATH}' || true
+if [ "$owner_token" != '${token}' ]; then
   flock -u 8
   echo HOF_LEASE_LOST
+  exit 0
 fi
+${procStartTimeStatements("$owner_pid", "current_starttime").join("\n")}
+if [ -z "$current_starttime" ] || [ "$current_starttime" != "$owner_starttime" ]; then
+  flock -u 8
+  echo HOF_LEASE_LOST
+  exit 0
+fi
+touch '${EXECUTION_LEASE_OWNER_PATH}'
+flock -u 8
+echo HOF_LEASE_OK
 `);
     } catch (error) {
       markLost(`could not confirm the execution lease is still held: ${error instanceof Error ? error.message : error}`);
@@ -1116,7 +1190,9 @@ fi
       await runScript(scriptConn, `set -eu
 exec 8>'${LOCK_GUARD_PATH}'
 flock -x 8
-if [ -r '${EXECUTION_LEASE_OWNER_PATH}' ] && [ "$(cat '${EXECUTION_LEASE_OWNER_PATH}')" = '${token}' ]; then
+owner_token=""
+read -r owner_token _ _ < '${EXECUTION_LEASE_OWNER_PATH}' 2>/dev/null || true
+if [ "$owner_token" = '${token}' ]; then
   rm -f '${EXECUTION_LEASE_OWNER_PATH}'
   flock -u 8
   systemctl stop '${unit}.service' >/dev/null 2>&1 || true

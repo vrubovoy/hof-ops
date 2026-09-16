@@ -17,7 +17,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { link, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -416,6 +416,41 @@ test("updateJournalStatus: a real HOF_MUTATE_CAS_CONFLICT response is refused wi
   );
 });
 
+// PR 2 (item 10) fifth review, medium finding 2: every CAS test above
+// only checks the generated script's own SHAPE against a mocked `run` -
+// none of them actually EXECUTE the comparison, so a regression back to
+// the original `$(cat '${targetPath}')` form (which command substitution
+// silently strips ALL trailing newlines from, on both sides) would still
+// have passed every one of them. This test runs the REAL script (same
+// capture-then-path-substitute pattern as the orphaned-hard-link test
+// above) against a real persisted file that differs from
+// expectedPreviousDocument by nothing but a trailing newline, proving the
+// base64-encoded comparison genuinely catches it (base64 encodes that
+// trailing newline as data, immune to command-substitution stripping),
+// and that the file is left untouched on that conflict.
+test("updateJournalStatus: the target-side CAS check is genuinely byte-exact - a real persisted file differing from expectedPreviousDocument by only a trailing newline is refused as a real mismatch, not silently accepted (item 10 PR2 fifth review, medium finding 2)", async () => {
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-cas-byte-exact-"));
+  try {
+    const previous = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "in-progress", committedGeneration: null };
+    const persistedWithTrailingNewline = `${JSON.stringify(previous)}\n`;
+    const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "succeeded", committedGeneration: 1 };
+
+    const { run, calls } = mockRun({ sshStdout: "HOF_MUTATE_UPDATED\n" });
+    await updateJournalStatus({ ...SSH_TARGET, run }, journalDoc, undefined, previous);
+    const script = calls.find((c) => c.command === "ssh").input.replaceAll("/var/lib/hof/state", scratchDir);
+
+    const journalFilePath = path.join(scratchDir, "journal", `${OPERATION_ID}.json`);
+    await mkdir(path.dirname(journalFilePath), { recursive: true });
+    await writeFile(journalFilePath, persistedWithTrailingNewline);
+
+    const { stdout } = await exec("sh", ["-c", script]);
+    assert.match(stdout, /HOF_MUTATE_CAS_CONFLICT/, "a persisted file differing only by a trailing newline must be refused as a genuine CAS mismatch, not silently accepted");
+    assert.equal(await readFile(journalFilePath, "utf8"), persistedWithTrailingNewline, "the file must be left completely untouched on a CAS conflict");
+  } finally {
+    await rm(scratchDir, { recursive: true, force: true });
+  }
+});
+
 // Both gates can be active at once - the fencing check (leaseToken) and
 // the CAS check (expectedPreviousDocument) are genuinely independent,
 // and target-mutate.mjs's own script must run the fencing gate FIRST
@@ -444,17 +479,23 @@ test("appendEvent: with a leaseToken, embeds the same real target-side fencing c
   );
 });
 
-// PR 2 (item 10) third review, critical finding 1: leaseFencingScript()
-// now also checks `systemctl is-active` for the SPECIFIC unit this
-// token's own acquisition would have created - not merely the owner
-// record's own file content - a belt-and-suspenders check independent
-// of whatever cleared (or didn't) the owner record.
-test("leaseFencingScript (via updateJournalStatus): checks systemctl is-active for the token-derived unit name, not just the owner record's file content", async () => {
+// PR 2 (item 10) fifth review, high finding 1: leaseFencingScript() no
+// longer consults `systemctl is-active` at all (that check's own
+// asynchronous lag relative to real, kernel-level process death was
+// itself the fourth review's own unresolved gap - see this file's own
+// fencedWriteScript-related tests further down for the full history).
+// It now reads the owner record's own PID+start-time and re-verifies
+// them fresh against /proc, kernel-synchronous and immediate.
+test("leaseFencingScript (via updateJournalStatus): verifies the owner record's own token AND its claimed PID's current /proc start time - never systemctl", async () => {
   const journalDoc = { apiVersion: "hof.dev/operation-journal/v1", operationId: OPERATION_ID, status: "succeeded", committedGeneration: 1 };
   const { run, calls } = mockRun({ sshStdout: "HOF_MUTATE_UPDATED\n" });
   await updateJournalStatus({ ...SSH_TARGET, run }, journalDoc, LEASE_TOKEN);
   const script = calls.find((c) => c.command === "ssh").input;
-  assert.match(script, new RegExp(`systemctl is-active 'hof-exec-lease-${LEASE_TOKEN}\\.service'`));
+  assert.doesNotMatch(script, /systemctl is-active/, "must never consult systemd's own ActiveState for this check");
+  assert.match(script, /read -r owner_token owner_pid owner_starttime < '.*exec\.lease\.owner'/);
+  assert.match(script, new RegExp(`"\\$owner_token" != '${LEASE_TOKEN}'`));
+  assert.match(script, /if \[ -r \/proc\/\$owner_pid\/stat \]; then/, "must re-derive the claimed PID's own current start time fresh from /proc");
+  assert.match(script, /"\$current_starttime" != "\$owner_starttime"/);
 });
 
 // PR 2 (item 10) third review, critical finding 1: every fenced write
@@ -488,14 +529,15 @@ test("fencedWriteScript: every fenced write (with a leaseToken) takes a shared f
     const script = await scriptFor(name);
     assert.match(script, new RegExp(EXECUTION_LEASE_PATH_ESCAPED), `${name}: must open EXECUTION_LEASE_PATH itself`);
     assert.match(script, /flock -w \d+ -s 7/, `${name}: must take a bounded, shared flock on it`);
-    // PR 2 fourth review, high finding 1: the kernel-verified liveness
-    // probe (fd 6, non-blocking exclusive, released immediately either
-    // way) must run BEFORE this write's own shared hold (fd 7) is ever
-    // taken - a probe attempted from a fd that already held a shared
-    // lock would always self-block (flock(2): independent open file
-    // descriptions on the same file conflict even within one process).
-    assert.match(script, /flock -n -x 6/, `${name}: must take the kernel-verified liveness probe`);
-    assert.ok(script.indexOf("flock -n -x 6") < script.indexOf("flock -w"), `${name}: the liveness probe must run before the shared exec.lease flock is ever taken`);
+    // PR 2 fifth review, high finding 1: the fourth review's own
+    // kernel-level, non-blocking EXCLUSIVE probe (fd 6, taken BEFORE
+    // this shared hold) was itself found to have a different, real race
+    // (a snapshot with no link to this write's own LATER shared-lock
+    // acquisition and fencing decision - see leaseFencingScript()'s own
+    // comment) and was removed - liveness is now verified via /proc
+    // AFTER this shared hold, inside leaseFencingScript() itself, where
+    // it stays valid for this write's own entire remaining lifetime.
+    assert.doesNotMatch(script, /flock -n -x 6/, `${name}: the removed liveness probe must never reappear`);
     // The shared lock must be taken BEFORE the fencing check/critical
     // section (LOCK_GUARD_PATH's own exclusive flock) - held for the
     // whole remaining script, not released and reacquired partway
@@ -503,13 +545,11 @@ test("fencedWriteScript: every fenced write (with a leaseToken) takes a shared f
     assert.ok(script.indexOf("flock -w") < script.indexOf("lock.flock"), `${name}: the shared exec.lease flock must be taken before entering the lock.flock-guarded critical section`);
   }
 
-  // Without a leaseToken: no exec.lease involvement at all - neither the
-  // probe nor the shared hold.
+  // Without a leaseToken: no exec.lease involvement at all.
   const unfenced = mockRun({ sshStdout: "HOF_MUTATE_APPENDED\n" });
   await appendEvent({ ...SSH_TARGET, run: unfenced.run }, OPERATION_ID, event);
   const unfencedScript = unfenced.calls.find((c) => c.command === "ssh").input;
   assert.doesNotMatch(unfencedScript, /flock -w \d+ -s 7/);
-  assert.doesNotMatch(unfencedScript, /flock -n -x 6/);
 });
 
 // PR 2 (item 10) fourth review, high finding 1: `systemctl is-active`
@@ -694,11 +734,15 @@ test("acquireMutex: the held unit's own script writes the owner record AND clear
   // /bin/sh -c argument inside the outer acquire script - extract it.
   const heldScript = script.match(/\/bin\/sh -c '([^']*(?:'\\''[^']*)*)'/)[1];
   assert.match(heldScript, /exec 8>.*lock\.flock/, "must open the same LOCK_GUARD_PATH fd the rest of this module uses");
-  assert.match(heldScript, /printf %s [0-9a-f-]+ > .*exec\.lease\.owner/, "the owner record write must still be present");
+  // PR 2 fifth review: the owner record now carries three fields - TOKEN
+  // PID STARTTIME - written via backslash-escaped, unquoted `echo`
+  // (heldScript is itself wrapped in ONE outer pair of single quotes for
+  // /bin/sh -c '...', so no quoting is available inside it).
+  assert.match(heldScript, /echo [0-9a-f-]+\\ \$\$\\ "\$own_starttime" > .*exec\.lease\.owner/, "the owner record write must still be present, now with PID and start time");
   // The write and the self-expiry clear must both be guarded - "flock -x
   // 8" must appear before EACH of them, and "flock -u 8" (or the fd
   // simply closing) after.
-  const printfIndex = heldScript.indexOf("printf %s");
+  const printfIndex = heldScript.indexOf("echo ");
   const lockBeforePrintf = heldScript.lastIndexOf("flock -x 8", printfIndex);
   assert.ok(lockBeforePrintf !== -1 && lockBeforePrintf < printfIndex, "the owner-record write must be preceded by taking the guard");
   assert.match(heldScript, /rm -f .*exec\.lease\.owner/, "self-expiry must actually REMOVE the owner record, not merely exit - a stale, uncleared token must never remain fencing-valid forever");
@@ -727,9 +771,9 @@ test("acquireMutex: 'active' alone is never trusted as proof of ownership - the 
   // ever printing HOF_LEASE_HELD - not merely check systemctl state.
   const activeBranch = script.slice(script.indexOf('"$state" = active'), script.indexOf("HOF_LEASE_HELD"));
   assert.match(activeBranch, /exec\.lease\.owner/, "the active branch must read the owner record, not just trust systemctl's own state");
-  assert.match(activeBranch, /owner=\$\(cat/, "must capture the owner record's own current content");
+  assert.match(activeBranch, /read -r owner_token \S+ \S+ < '.*exec\.lease\.owner'/, "must read the owner record's own current token field back");
   const token = script.match(/--unit='hof-exec-lease-([0-9a-f-]+)'/)[1];
-  assert.match(activeBranch, new RegExp(`"\\$owner" = '${token}'`), "must compare the owner record against exactly this acquisition's own token before concluding HELD");
+  assert.match(activeBranch, new RegExp(`"\\$owner_token" = '${token}'`), "must compare the owner record against exactly this acquisition's own token before concluding HELD");
 });
 
 test("acquireMutex: two separate acquisitions embed two genuinely different, unique tokens - never a reused unit name", async () => {
@@ -772,7 +816,8 @@ test("acquireMutex: release() reports the raw HOF_LEASE_RELEASED round trip - st
   const releaseScript = calls.filter((c) => c.command === "ssh")[1].input;
   assert.match(releaseScript, /rm -f/);
   assert.match(releaseScript, /systemctl stop/);
-  assert.match(releaseScript, /\[ "\$\(cat '.*exec\.lease\.owner'\)" = '.*' \]/);
+  assert.match(releaseScript, /read -r owner_token \S+ \S+ < '.*exec\.lease\.owner'/);
+  assert.match(releaseScript, /\[ "\$owner_token" = '.*' \]/);
   assert.match(releaseScript, /exec 8>.*lock\.flock/);
   assert.match(releaseScript, /flock -x 8/);
 });

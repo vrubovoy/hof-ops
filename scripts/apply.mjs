@@ -31,6 +31,7 @@ import {
   assertEventValid, assertJournalResumable, assertJournalValid, assertLockValid, buildEvent, buildJournalDocument, buildLockDocument,
   currentOperator, decideStepResumption, newOperationId, withJournalStatus,
 } from "./operation-journal.mjs";
+import { isV2Lock } from "./operation-v2.mjs";
 import { checkArchitecture, checkManagedStateReadable, checkOs, observationFromSnapshot } from "./preflight.mjs";
 import { validateAppliedActions } from "./applied-actions.mjs";
 import { validateBootstrapActions } from "./bootstrap-actions.mjs";
@@ -1083,6 +1084,17 @@ export async function runApply(options) {
     try {
       await assertLockValid(lock);
     } catch (error) {
+      // PR 2 (item 10): v1 (apply) and v2 (backup/restore) lock.json
+      // share the exact same target path (operation-lock-v2.schema.json's
+      // own top-level description) - a lock that fails v1's own schema
+      // check here might simply BE a genuine, schema-valid v2 lock, never
+      // reinterpreted or deleted as if it were a corrupt v1 one. Checked
+      // explicitly, distinctly, rather than folding this into the
+      // generic "does not satisfy its own schema" message below, which
+      // would otherwise read as if the lock were actually corrupt.
+      if (await isV2Lock(lock)) {
+        return blocked("resume", `the lock on this target belongs to an in-progress ${lock.operationKind} operation (${lock.operationId}, started ${lock.acquiredAt}) - apply --resume refuses to interpret a v2 backup/restore lock as an apply lock; wait for it to finish, or investigate it directly`);
+      }
       return blocked("resume", `the lock on the target does not satisfy its own schema - refusing to trust it: ${error instanceof Error ? error.message : error}`);
     }
     operationId = lock.operationId;
@@ -1344,11 +1356,26 @@ export async function runApply(options) {
     // them left a lock durably created with no journal at all, which
     // resume then had nothing to do but refuse forever, since it
     // requires an existing journal before it will trust anything.
-    const { acquired, lock: held } = await m.acquireLockAndJournal(mutateConn, lockDoc, journal);
+    //
+    // PR 2 (item 10) second review, high finding 2: executionLease?.token
+    // threaded through here too - without it, a holder that had already
+    // lost the physical mutex (self-expired, or explicitly released)
+    // could still create a brand new lock+journal pair on the target
+    // afterward, the same class of gap already closed for every other
+    // lease-gated write in this function.
+    const { acquired, lock: held } = await m.acquireLockAndJournal(mutateConn, lockDoc, journal, executionLease?.token);
     if (!acquired) {
       try {
         await assertLockValid(held);
       } catch (error) {
+        // PR 2 (item 10): same reasoning as the resume path's own
+        // identical check above - v1 and v2 lock.json share the exact
+        // same target path, so a fresh apply's own exclusive-create
+        // failure may simply have found a genuine, schema-valid v2
+        // backup/restore lock already held, never a corrupt v1 one.
+        if (await isV2Lock(held)) {
+          return blocked("lock", `target is already locked by an in-progress ${held.operationKind} operation (${held.operationId}, started ${held.acquiredAt}) - apply refuses to run concurrently with backup/restore; wait for it to finish, or investigate it directly`);
+        }
         return blocked("lock", `target is locked by a document that does not satisfy its own schema - refusing to trust it: ${error instanceof Error ? error.message : error}`);
       }
       return blocked("lock", `target is already locked by operation ${held.operationId} (started ${held.acquiredAt} by ${held.acquiredBy?.user}@${held.acquiredBy?.workstation}) - use --resume to continue it, or investigate why it's stuck`);
@@ -1679,11 +1706,25 @@ export async function runApply(options) {
             // readTopology) are covered by this same check now being the
             // very next thing that runs after all of them, with nothing
             // async in between it and appendEvent() below.
+            //
+            // PR 2 (item 10) review, critical finding 2: assertOwnership()
+            // is now called here too, fresh, immediately before this
+            // write - refuseIfLeaseLost() alone only ever reads a
+            // possibly-stale cached flag (last updated whenever the
+            // background heartbeat interval, or another explicit check,
+            // last happened to run); a loss in the gap since then would
+            // otherwise go unnoticed until the NEXT check. The actual
+            // write below is separately, atomically fenced on the target
+            // itself too (executionLease's own token, passed as
+            // appendEvent()'s third argument) - this call is what turns a
+            // real loss into a clean, well-diagnosed refusal instead of
+            // relying on that target-side fencing alone to reject it.
             {
+              await executionLease?.assertOwnership?.();
               const lost = refuseIfLeaseLost();
               if (lost) return lost;
             }
-            await m.appendEvent(mutateConn, operationId, recovered);
+            await m.appendEvent(mutateConn, operationId, recovered, executionLease?.token);
             emit(recovered);
             outcome = "skip";
           } else if (snapshotMatches) {
@@ -1737,11 +1778,18 @@ export async function runApply(options) {
             // this process's first call ever), so a check placed before
             // it left the exact same real await window open, one call
             // too early.
+            //
+            // PR 2 (item 10) review, critical finding 2: assertOwnership()
+            // fresh, immediately before this write - see the sibling
+            // check above for why a cached refuseIfLeaseLost() alone
+            // isn't enough; the write itself also carries the lease's own
+            // token for real, target-side fencing.
             {
+              await executionLease?.assertOwnership?.();
               const lost = refuseIfLeaseLost();
               if (lost) return lost;
             }
-            await m.appendEvent(mutateConn, operationId, recovered);
+            await m.appendEvent(mutateConn, operationId, recovered, executionLease?.token);
             emit(recovered);
             outcome = "skip";
           }
@@ -1785,7 +1833,15 @@ export async function runApply(options) {
           const lost = refuseIfLeaseLost();
           if (lost) return lost;
         }
-        await m.appendEvent(mutateConn, operationId, started);
+        // PR 2 (item 10) review, critical finding 2: executionLease?.token
+        // threaded through as this write's own fencing token - a real,
+        // target-side check (under the same flock guard, atomically)
+        // that this write's own lease is still the one actually holding
+        // the mutex, closing the gap a client-side isLost() read alone
+        // cannot (a loss strictly between that read and this write
+        // actually reaching the target). Every appendEvent()/
+        // updateJournalStatus() call in this function now carries it.
+        await m.appendEvent(mutateConn, operationId, started, executionLease?.token);
         emit(started);
 
         // Item 9 THIRD review fix (finding 3): re-checked AGAIN here,
@@ -1805,10 +1861,27 @@ export async function runApply(options) {
           await dispatchOperation(operation, { ...context, commitGeneration: generation, imageTrustByUnit });
         } catch (error) {
           const failed = await buildEvent({ operationId, step: operation.id, attempt, phase: "failed", error: sanitizeError(error) });
-          await m.appendEvent(mutateConn, operationId, failed);
+          // PR 2 (item 10) review, critical finding 2: this catch block
+          // used to write the failed event/journal status unconditionally,
+          // with no lease check at all - dispatchOperation() itself can
+          // run for a long time (a real Ansible role), a genuine window
+          // for the lease to be lost while it ran. assertOwnership() is
+          // called fresh here, right before these two terminal writes,
+          // and refuseIfLeaseLost() then refuses cleanly if it's gone -
+          // never writing a "failed" record this process no longer has
+          // any business writing, which could otherwise land on top of
+          // whatever a legitimately new lease-holder is doing. The writes
+          // themselves also carry the lease's own token for real,
+          // target-side fencing, independent of this check.
+          await executionLease?.assertOwnership?.();
+          {
+            const lost = refuseIfLeaseLost();
+            if (lost) return lost;
+          }
+          await m.appendEvent(mutateConn, operationId, failed, executionLease?.token);
           emit(failed);
           const failedJournal = await withJournalStatus(journal, { status: "failed" });
-          await m.updateJournalStatus(mutateConn, failedJournal);
+          await m.updateJournalStatus(mutateConn, failedJournal, executionLease?.token);
           // Item 9 (ADR 0005): a failed applied reconciliation attempt
           // never talks about "a fresh bootstrap" - there's already a
           // real installation on this target; a failure here calls for
@@ -1824,12 +1897,34 @@ export async function runApply(options) {
         }
 
         const succeeded = await buildEvent({ operationId, step: operation.id, attempt, phase: "succeeded" });
-        await m.appendEvent(mutateConn, operationId, succeeded);
+        // PR 2 (item 10) review, critical finding 2: assertOwnership()
+        // fresh, right after dispatchOperation() returns - the dispatch
+        // itself is a real, often long-running await (a genuine Ansible
+        // role run), a real window for the lease to be lost since the
+        // last check before dispatch. Never write a "succeeded" record
+        // this process can no longer prove it's still authorized to
+        // write. The write itself also carries the lease's own token.
+        await executionLease?.assertOwnership?.();
+        {
+          const lost = refuseIfLeaseLost();
+          if (lost) return lost;
+        }
+        await m.appendEvent(mutateConn, operationId, succeeded, executionLease?.token);
         emit(succeeded);
       }
 
       const committedJournal = await withJournalStatus(journal, { status: "succeeded", committedGeneration: generation });
-      await m.updateJournalStatus(mutateConn, committedJournal);
+      // PR 2 (item 10) review, critical finding 2: the truest "terminal
+      // write" of the whole run - assert ownership fresh one last time
+      // immediately before it. refuseIfLeaseLost() itself is declared
+      // inside the for loop above and out of scope here, so this reads
+      // executionLease directly; the message names this write, not "the
+      // next operation" (there is no next one).
+      await executionLease?.assertOwnership?.();
+      if (executionLease?.isLost?.()) {
+        return blocked("lease", `the execution lease for this target was lost mid-run (${executionLease.lostReason()}) - refusing to write the final committed journal status; the target may now be held by a different process, investigate directly (the lock remains held)`);
+      }
+      await m.updateJournalStatus(mutateConn, committedJournal, executionLease?.token);
       const release = await tryReleaseLock(m, mutateConn, operationId);
       if (!release.released) {
         // The operation itself genuinely did succeed - state committed,

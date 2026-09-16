@@ -102,7 +102,7 @@ import { runPlan } from "../scripts/plan-command.mjs";
 import { HOF_NETWORK_NAME, SUPPLIED_TLS_CERTIFICATE_SECRET_NAME, SUPPLIED_TLS_PRIVATE_KEY_SECRET_NAME } from "../scripts/render-topology.mjs";
 import { generateSecretValue } from "../scripts/secrets.mjs";
 import {
-  acquireExecutionLease, acquireLockAndJournal, appendEvent, pinnedKnownHosts,
+  acquireExecutionLease, acquireLockAndJournal, acquireMutex, appendEvent, pinnedKnownHosts,
   readCurrentState as readCurrentStateViaMutate, readGenerationSnapshot, readGenerationSnapshotReleaseLock, readGenerationSnapshotTopology, readTopology,
 } from "../scripts/target-mutate.mjs";
 import { loadAndValidateDeployment } from "../scripts/validate-deployment.mjs";
@@ -230,7 +230,15 @@ before(async () => {
   // Built once, from THIS working tree's own ansible/ - see this file's
   // own top-level comment on localEeImageTag for why only two scenarios
   // below actually use it.
-  await exec("docker", ["build", "--quiet", "--tag", localEeImageTag, "--file", path.join(root, "ansible/Dockerfile"), path.join(root, "ansible")], { timeout: 300_000 });
+  // Item 10 (PR2) CI review: bumped from 300_000 (5 min) - two
+  // consecutive real CI runs hit exactly this bound (~301s, ~300s),
+  // killing the build mid-way rather than reporting a genuine docker
+  // build failure. Not caused by anything in this PR (ansible/Dockerfile
+  // itself is untouched) - a slower-than-usual base-image pull/registry
+  // round trip on the runner at the time, which a tighter bound has no
+  // way to distinguish from a genuine hang. Generous headroom, matching
+  // this file's own contracts job timeout (also bumped in this review).
+  await exec("docker", ["build", "--quiet", "--tag", localEeImageTag, "--file", path.join(root, "ansible/Dockerfile"), path.join(root, "ansible")], { timeout: 900_000 });
 
   await exec("docker", ["build", "--quiet", "--tag", targetImageTag, fixtureDir], { timeout: 180_000 });
   await exec("docker", ["network", "create", networkName]);
@@ -1265,4 +1273,199 @@ test("a concurrent --resume is refused by the real execution lease while the ope
   const { topology: finalTopology } = await readTopology(mutateConn());
   assert.deepEqual(finalTopology, expectedTopology);
   await assert.rejects(() => exec("docker", ["exec", containerName, "test", "-e", "/var/lib/hof/state/lock.json"]), "the lock is released once the commit genuinely finishes");
+});
+
+// PR 2 (item 10) review, Critical finding 1: `systemctl is-active`
+// reporting a unit active does NOT by itself prove its own `flock -n -x`
+// actually won - a unit's ActiveState turns "active" the instant its
+// process starts, well before the script inside it ever reaches its own
+// flock line. Two GENUINELY SIMULTANEOUS acquisitions (both fired in the
+// same tick, via Promise.allSettled, never one awaited before the other
+// starts) are the only way to actually exercise that narrow window
+// against a real target - a sequential "acquire, then acquire again"
+// (the scenario below) never reaches it at all, since by the time the
+// second call starts, the first is already long since fully resolved.
+// Run several times in a loop - a real race is not guaranteed to be hit
+// by a single attempt, even with the bug present (target-mutate.mjs's
+// own fix reads the owner record's actual token, not just ActiveState,
+// before ever concluding HOF_LEASE_HELD).
+test("acquireMutex: genuinely simultaneous acquisitions against the real target never both win - real flock arbitration, not merely simulated by a fake `run` (item 10 PR2 review, critical finding 1)", async () => {
+  const conn = mutateConn();
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const results = await Promise.allSettled([acquireMutex(conn), acquireMutex(conn)]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    assert.equal(fulfilled.length, 1, `attempt ${attempt}: exactly one of two simultaneous acquisitions must win, got ${fulfilled.length}: ${JSON.stringify(results.map((r) => r.status))}`);
+    assert.equal(rejected.length, 1, `attempt ${attempt}: the other must be refused, never silently ignored or itself also succeeding`);
+    assert.match(rejected[0].reason.message, /already holds the execution lease/);
+    await fulfilled[0].value.release();
+  }
+});
+
+// PR 2 (item 10) review, Medium finding 6: the sibling scenario below
+// proves killing the held unit directly releases its flock - true of
+// ANY dead process, self-expiry logic or not, so it does NOT actually
+// exercise the self-check loop's OWN timeout logic (heldScript's own
+// `while :; do sleep ...; [ age -gt TIMEOUT ] && exit 0; done`). This
+// scenario instead stops only the LOCAL heartbeat (never touching the
+// target directly, never killing anything) and waits out the real
+// self-expiry bound - the held unit must notice entirely on its own
+// that nothing has refreshed its owner record's mtime, and voluntarily
+// give up the real flock, before a fresh acquisition can succeed.
+test("acquireMutex: a real target-side self-expiry once heartbeats genuinely stop, never a killed unit - the held unit's own timeout logic, exercised for real (item 10 PR2 review, medium finding 6)", async () => {
+  const conn = mutateConn();
+  const stuck = await acquireMutex(conn);
+  stuck.stopHeartbeatForTesting();
+
+  // Still genuinely, actively held immediately after - nothing has
+  // expired yet.
+  await assert.rejects(() => acquireMutex(conn), /already holds the execution lease/);
+
+  // Wait out the real self-expiry bound with no external intervention
+  // at all - LEASE_HEARTBEAT_TIMEOUT_S (30s) + LEASE_SELF_CHECK_INTERVAL_S
+  // (5s, the held unit's own poll cadence) + a real margin, matching
+  // target-mutate.mjs's own current constants.
+  await new Promise((resolve) => setTimeout(resolve, 40_000));
+
+  // The unit gave up its own flock on its own - a fresh acquisition now
+  // succeeds without anything external ever having touched the target.
+  const fresh = await acquireMutex(conn);
+  try {
+    // PR 2 (item 10) second review, Medium finding 6: real fenced
+    // append/status from the OLD (now-expired, now-superseded) token,
+    // after a genuine handoff to a new holder - not merely a mocked
+    // response. `stuck`'s own token is stale twice over now (its own
+    // unit self-expired, AND a completely different acquisition already
+    // holds the real mutex) - a real appendEvent() carrying it must be
+    // refused by the target itself, never silently accepted.
+    const eventOperationId = randomUUID();
+    const staleEvent = { apiVersion: "hof.dev/operation-event/v1", operationId: eventOperationId, step: "001.host.prepare", attempt: 1, phase: "started", at: new Date().toISOString() };
+    await assert.rejects(
+      () => appendEvent(conn, eventOperationId, staleEvent, stuck.token),
+      /execution lease no longer matches this write's own token/,
+      "a write carrying the old, expired-and-superseded token must be refused by the real target, not silently accepted",
+    );
+    // The CURRENT holder's own token, by contrast, is genuinely accepted -
+    // confirming the refusal above is real fencing, not a broken write path.
+    await appendEvent(conn, eventOperationId, staleEvent, fresh.token);
+    const written = await onTarget("cat", `/var/lib/hof/state/journal/${eventOperationId}.events.ndjson`);
+    assert.deepEqual(JSON.parse(written.trim()), staleEvent, "the current holder's own token must genuinely succeed in writing to the real target");
+  } finally {
+    await fresh.release();
+  }
+});
+
+// PR 2 (item 10): the execution lease/mutex is no longer a long-lived
+// local child holding flock over a persistent SSH heartbeat - it's a
+// real, target-side, transient systemd unit (acquireMutex(), see
+// target-mutate.mjs's own comment). Exercised directly here, against
+// this exact container's real systemd, real flock, and real sudo -
+// never through apply.mjs's own orchestration this time (the scenario
+// above already proves acquireExecutionLease() being busy correctly
+// refuses a concurrent apply/resume; this one proves the mutex PRIMITIVE
+// itself - genuine contention, and genuine cleanup once its own held
+// unit is killed out from under it, never merely mocked).
+test("acquireMutex: real target-side flock contention across two concurrent acquisitions, and real cleanup once the holder is killed out from under it (item 10 PR2, generic operation substrate)", async () => {
+  const conn = mutateConn();
+
+  const first = await acquireMutex(conn);
+  try {
+    // A second, concurrent acquisition genuinely contends on the SAME
+    // real flock, held by a real target-side systemd unit - refused,
+    // not merely simulated by a fake `run`.
+    await assert.rejects(() => acquireMutex(conn), /already holds the execution lease/);
+
+    // The owner record is really there, root-only, exactly as designed.
+    const ownerPerms = (await onTarget("stat", "-c", "%a %U", "/var/lib/hof/state/exec.lease.owner")).trim();
+    assert.equal(ownerPerms, "600 root");
+
+    // Healthy while genuinely held - a real round trip, not the
+    // background interval (which would take up to its own configured
+    // bound to fire on its own).
+    await first.assertOwnership();
+    assert.equal(first.isLost(), false, `unexpected loss right after a genuine, still-held acquisition: ${first.lostReason()}`);
+
+    // Simulate an uncleanly-dead local process: kill the real unit
+    // directly on the target - never through release(), which this test
+    // deliberately never calls on `first` before this point. systemctl's
+    // own unit-pattern globbing finds it; this test never parses
+    // `systemctl list-units` output itself, avoiding any dependency on
+    // its exact column format.
+    await onTarget("sh", "-c", "systemctl kill -s SIGKILL 'hof-exec-lease-*.service'");
+
+    // PR 2 (item 10) third/fourth/fifth review: a stale write carrying
+    // the now-dead holder's own token must be refused EVEN BEFORE any
+    // new acquisition ever takes over. The owner record itself still
+    // holds `first`'s own token at this exact point (SIGKILL never
+    // cleans it up) - if this refusal only worked AFTER a handoff, it
+    // would prove the wrong mechanism. A third review round's own
+    // `systemctl is-active` check alone was found insufficient for this
+    // exact moment: systemd's own ActiveState update lags the kernel's
+    // real, immediate flock release after a hard kill (a separate,
+    // asynchronous event on systemd's own side), a real, if narrow,
+    // window `systemctl is-active` could still answer "active" in. The
+    // fourth review's own fix - a kernel-verified, non-blocking
+    // exclusive probe taken BEFORE this write's own shared hold - was
+    // itself found, in the fifth review, to have a different race of its
+    // own (a probe only proves state at the instant it runs, with no
+    // link to this write's own LATER shared-lock acquisition and fencing
+    // decision - a holder dying in that gap reopens the exact race the
+    // probe was meant to close). The actual, now-current fix -
+    // leaseFencingScript()'s own /proc/<pid>/stat start-time check,
+    // which runs AFTER this write's own shared exec.lease hold is
+    // already taken, and so stays valid for this write's own entire
+    // remaining lifetime - is what this real target now actually
+    // exercises: reading /proc is kernel-synchronous with the real kill
+    // (unlike systemd's own bookkeeping), so the claimed PID's start
+    // time no longer matches the one recorded at acquire time, and the
+    // write is refused immediately, regardless of exactly how much of
+    // systemd's own internal lag has or hasn't elapsed by the time this
+    // call actually reaches the target.
+    const staleOperationId = randomUUID();
+    const staleEvent = { apiVersion: "hof.dev/operation-event/v1", operationId: staleOperationId, step: "001.host.prepare", attempt: 1, phase: "started", at: new Date().toISOString() };
+    await assert.rejects(
+      () => appendEvent(conn, staleOperationId, staleEvent, first.token),
+      /execution lease no longer matches this write's own token/,
+      "a write carrying the just-killed holder's own token must be refused immediately, before any new acquisition ever takes over",
+    );
+
+    // The kernel releases the real flock the instant the holding
+    // process is gone - no need to wait out the self-expiry bound at
+    // all - so a fresh acquisition succeeds immediately, proving real
+    // target-side cleanup after an unclean loss, not a mocked one.
+    const second = await acquireMutex(conn);
+    try {
+      await first.assertOwnership();
+      assert.equal(first.isLost(), true, "the original acquisition must notice its own unit is really gone once it's actually killed");
+
+      // After the real handoff: the stale (dead) token is still refused
+      // (now doubly so - its unit is gone AND the owner record has been
+      // overwritten), and the CURRENT holder's own token genuinely
+      // succeeds - confirming the refusal above isn't merely a broken
+      // write path.
+      await assert.rejects(
+        () => appendEvent(conn, staleOperationId, staleEvent, first.token),
+        /execution lease no longer matches this write's own token/,
+      );
+      await appendEvent(conn, staleOperationId, staleEvent, second.token);
+      const written = await onTarget("cat", `/var/lib/hof/state/journal/${staleOperationId}.events.ndjson`);
+      assert.deepEqual(JSON.parse(written.trim()), staleEvent, "the current holder's own token must genuinely succeed in writing to the real target after a genuine handoff");
+    } finally {
+      await second.release();
+    }
+  } finally {
+    // Best-effort: `first`'s own owner record was long since overwritten
+    // by `second`'s real acquisition above, so this reports a real
+    // HOF_LEASE_MISMATCH on the target rather than actually releasing
+    // anything - exercised here anyway, confirming that response never
+    // throws for real (test/target-mutate.test.mjs's own equivalent test
+    // is mocked; this confirms the real script behaves the same way).
+    await first.release().catch(() => {});
+  }
+
+  // Everything is free again - a third, real acquisition succeeds
+  // cleanly, proving neither the killed first nor the released second
+  // left the real target's own flock/owner-record state stuck.
+  const third = await acquireMutex(conn);
+  await third.release();
 });

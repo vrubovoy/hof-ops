@@ -35,6 +35,7 @@ import { promisify } from "node:util";
 import YAML from "yaml";
 
 import { computeExpectedCommittedState, runApply } from "../scripts/apply.mjs";
+import { buildLockDocument as buildV2LockDocument } from "../scripts/operation-v2.mjs";
 import { sha256 } from "../scripts/digest.mjs";
 import { runPlan } from "../scripts/plan-command.mjs";
 import { computePlanId } from "../scripts/plan-v2.mjs";
@@ -752,6 +753,34 @@ test("lock held by a document that fails its own schema is refused, not silently
   assert.match(result.diagnostics[0], /does not satisfy its own schema/);
 });
 
+// PR 2 (item 10): v1 (apply) and v2 (backup/restore) lock.json share the
+// exact same target path - a fresh apply's own exclusive-create failure
+// might simply find a genuine, schema-valid v2 backup/restore lock
+// already held, never a corrupt v1 one. Must be reported with an
+// explicit, accurate "an in-progress <kind> operation" reason - never
+// folded into the generic schema-failure message, and never deleted or
+// otherwise treated as if it were a stale/corrupt v1 lock.
+test("a fresh apply finding a genuine, schema-valid v2 (backup/restore) lock already held is refused with an explicit reason, never as a corrupt schema, and the v2 lock is left untouched", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  const v2Lock = await buildV2LockDocument({
+    operationKind: "restore",
+    operationId: "44444444-4444-4444-4444-444444444444",
+    approvedPlanId: "sha256:" + "7".repeat(64),
+    target: plan.target,
+    acquiredBy: { user: "someone", workstation: "elsewhere", pid: 1 },
+  });
+  mutate.state.lock = v2Lock;
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lock");
+  assert.match(result.diagnostics[0], /in-progress restore operation/);
+  assert.doesNotMatch(result.diagnostics[0], /does not satisfy its own schema/, "a genuine v2 lock must never be reported as if it were corrupt");
+  assert.deepEqual(mutate.state.lock, v2Lock, "the v2 lock is never deleted or reinterpreted by a refused apply");
+  assert.equal(mutate.state.journals.size, 0);
+});
+
 test("stale-plan recheck: a host-key change between lock acquisition and the post-lock recheck is refused, and the freshly-acquired lock is released", async () => {
   const mutate = makeFakeMutate();
   const planOptions = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
@@ -793,6 +822,79 @@ test("an operation failure marks the journal failed, releases the lock, and stop
   assert.ok(failedEvent);
   assert.match(failedEvent.error, /fatal/);
   assert.ok(!failedEvent.error.includes("undefined"));
+});
+
+// PR 2 (item 10) review, critical finding 2: this catch block used to
+// write the failed event/journal status completely unconditionally,
+// with no lease check of its own at all - dispatchOperation() itself is
+// a real, often long-running await, a genuine window for the lease to
+// be lost while it ran. The lease here starts healthy and only reports
+// lost the FIRST time assertOwnership() is actually called - which, for
+// this fixture (a fresh bootstrap failing on its second dispatched
+// operation, no resume/recovery paths ever reached), is exactly the
+// fresh check apply.mjs's own catch block now makes immediately before
+// its own terminal writes. Proves the check is real (a fresh round trip
+// the catch block itself triggers), not merely a coincidence of some
+// earlier cached state.
+test("an operation failure discovered as a lost lease (via a fresh assertOwnership() call, not a stale cached isLost()) never writes the failed event/journal - refused as reason 'lease', not 'operation' (item 10 PR2 review, critical finding 2)", async () => {
+  const mutate = makeFakeMutate();
+  let calls = 0;
+  const options = baseApplyOptions({
+    mutate, inspect: async () => cleanSnapshot(),
+    dockerRun: async () => { calls += 1; if (calls === 2) throw Object.assign(new Error("ansible-playbook exited 2"), { stdout: "TASK [assert]\nfatal: [target]: FAILED!" }); return { stdout: "", stderr: "" }; },
+  });
+  let lost = false;
+  let assertOwnershipCalls = 0;
+  mutate.acquireExecutionLease = async () => ({
+    release: async () => {},
+    isLost: () => lost,
+    lostReason: () => "simulated: discovered lost via a fresh assertOwnership() call, right before the failed-path terminal writes",
+    onLost: () => {},
+    assertOwnership: async () => { assertOwnershipCalls += 1; lost = true; },
+  });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  const events = [];
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath, emit: (event) => events.push(event) }));
+
+  assert.equal(assertOwnershipCalls, 1, "fixture assumption: assertOwnership() is called exactly once, by the failed-path check itself");
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lease", "refused because the lease was found lost, not because the operation itself failed");
+  assert.ok(!events.some((event) => event.phase === "failed"), "the failed event must never be written once the lease is known lost");
+  const journal = [...mutate.state.journals.values()][0];
+  assert.equal(journal.status, "in-progress", "the journal must never be rewritten to failed once the lease is known lost - it stays exactly as the fresh-path creation left it");
+});
+
+// PR 2 (item 10) review, critical finding 2: the truest "terminal
+// write" of a whole run - committedJournal, written after every
+// operation has already genuinely succeeded. The lease here stays
+// healthy through every per-step succeeded-event check (each one also
+// now calls assertOwnership(), per this same review) and only reports
+// lost on the VERY LAST such call - the dedicated check apply.mjs now
+// makes immediately before this final write, proving it is a real,
+// distinct gate of its own, not merely inherited from an earlier
+// per-step check.
+test("a lease lost strictly before the final committedJournal write (discovered only on that write's own fresh assertOwnership() call) refuses the write - the run never reports a false success (item 10 PR2 review, critical finding 2)", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan, planPath } = await computeApprovedPlan(options);
+  assert.ok(plan.operations.length > 1, "fixture assumption: a real bootstrap has more than one operation");
+
+  let assertOwnershipCalls = 0;
+  mutate.acquireExecutionLease = async () => ({
+    release: async () => {},
+    isLost: () => assertOwnershipCalls > plan.operations.length,
+    lostReason: () => "simulated: discovered lost only on the final committedJournal write's own fresh assertOwnership() call",
+    onLost: () => {},
+    assertOwnership: async () => { assertOwnershipCalls += 1; },
+  });
+
+  const result = await withFakeCosign("success", () => runApply({ ...options, approvePlanId: plan.planId, planPath }));
+
+  assert.equal(assertOwnershipCalls, plan.operations.length + 1, "one call per operation's own succeeded-event check, plus exactly one more for the final committedJournal write");
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "lease");
+  const journal = [...mutate.state.journals.values()][0];
+  assert.equal(journal.status, "in-progress", "committedJournal must never be written once the lease is found lost immediately before it - the journal stays exactly as its fresh-path creation left it");
 });
 
 test("resume: an already-succeeded step is skipped, never re-dispatched, and the run still commits", async () => {
@@ -920,6 +1022,30 @@ test("resume: a journal that fails its own schema is refused, not silently trust
   assert.equal(result.blocked, true);
   assert.equal(result.reason, "resume");
   assert.match(result.diagnostics[0], /does not satisfy its own schema/);
+});
+
+// Same reasoning as the fresh-path test above, for --resume: apply must
+// never interpret a genuine, schema-valid v2 (backup/restore) lock as if
+// it were a corrupt v1 apply lock, and must never delete or otherwise
+// touch it.
+test("resume: finding a genuine, schema-valid v2 (backup/restore) lock is refused with an explicit reason, never as a corrupt schema, and the v2 lock is left untouched", async () => {
+  const mutate = makeFakeMutate();
+  const options = baseApplyOptions({ mutate, inspect: async () => cleanSnapshot() });
+  const { plan } = await computeApprovedPlan(options);
+  const v2Lock = await buildV2LockDocument({
+    operationKind: "backup",
+    operationId: "88888888-8888-8888-8888-888888888888",
+    approvedPlanId: "sha256:" + "7".repeat(64),
+    target: plan.target,
+    acquiredBy: { user: "someone", workstation: "elsewhere", pid: 1 },
+  });
+  mutate.state.lock = v2Lock;
+  const result = await withFakeCosign("success", () => runApply({ ...options, resume: true }));
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "resume");
+  assert.match(result.diagnostics[0], /in-progress backup operation/);
+  assert.doesNotMatch(result.diagnostics[0], /does not satisfy its own schema/, "a genuine v2 lock must never be reported as if it were corrupt");
+  assert.deepEqual(mutate.state.lock, v2Lock, "the v2 lock is never deleted or reinterpreted by a refused resume");
 });
 
 test("resume: a step with an unresolved (started, never confirmed) outcome blocks the whole run and keeps the lock held", async () => {

@@ -17,7 +17,7 @@
       "$ref": "#/$defs/operationId"
     },
     "approvedPlanId": {
-      "description": "The approved plan's own planId - a plan-v2, backup-plan-v1, or restore-plan-v1 planId depending on operationKind (all three use the same sha256-of-inputs shape).",
+      "description": "The approved plan's own planId - a backup-plan-v1 or restore-plan-v1 planId depending on operationKind (both use the same sha256-of-inputs shape). Never a plan-v2 (apply) planId - this schema is scoped strictly to operationKind backup/restore, see this schema's own top-level description.",
       "$ref": "#/$defs/planId"
     },
     "target": { "$ref": "#/$defs/targetBinding" },

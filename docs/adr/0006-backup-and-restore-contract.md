@@ -856,25 +856,38 @@ never generated, stored, or held by Hof on any host. Without some
 host-local credential material, a scheduled run has no way to reach its
 own backup destinations (restic repository password, S3 keys) at all.
 
-- **Host-local encrypted runner credential store, decided.** A new,
-  target-local, root-only store - genuinely independent of
-  `recovery-kit-v1`'s own age-encrypted envelope and its external
-  identity, both of which remain completely unchanged. It holds exactly
-  what `scripts/backup-credentials.mjs`'s own store already types
-  (`resticPassword`, and for `s3` `accessKeyId`/`secretAccessKey`/an
-  optional `sessionToken`) - nothing else, never application secrets or
-  TLS material. Mechanism: a random 256-bit symmetric key, generated
-  once, directly on the target, by a target-side script (never
-  transmitted as its own artifact, never leaves the host) at `hofctl
-  backup configure` time; the credentials payload is encrypted with it
-  (AES-256-GCM via the already-depended-on `openssl` - see
-  `scripts/supplied-tls.mjs`'s own precedent for shelling out to it) and
-  both files are written root-only (0600) under a fixed path, atomically
-  (the same mktemp+rename discipline every other atomic write in this
-  codebase already uses). No age, no SOPS, no KMS - a deliberately
-  simpler, different primitive than every other secret-at-rest in this
-  platform, precisely so it is never confusable with, and never a
-  substitute for, the recovery kit's own external identity.
+- **Host-local encrypted runner credential store, decided - via
+  `systemd-creds`, not a hand-rolled cipher.** A first draft of this
+  erratum proposed a hand-rolled symmetric key plus `openssl enc
+  -aes-256-gcm`; a review caught this dead on arrival - `openssl enc`
+  has never supported AEAD ciphers at all (confirmed by hand: `openssl
+  enc -aes-256-gcm` fails outright with `"AEAD ciphers not supported"`
+  on a real, current OpenSSL build - there is no flag or workaround, the
+  `enc` subcommand simply doesn't implement GCM's authentication tag
+  handling). The same review found a second, independent problem with
+  that draft even if a working cipher had been picked: a separately
+  atomically-written key file and ciphertext file are not thereby an
+  atomic PAIR - a crash between the two writes leaves either a new key
+  with the old ciphertext or vice versa, silently breaking a scheduled
+  run's own ability to decrypt. Both problems, and the credential-naming
+  and at-rest handling this decision still needs, are exactly what
+  `systemd-creds`(1) - a real, already-shipped systemd facility, not
+  code this project would own or maintain - already solves: `systemd-creds
+  encrypt --name=NAME plaintext-file output-file` produces a single,
+  genuinely AES-256-GCM-authenticated (real AEAD, correctly implemented)
+  credential file, with the credential's own `NAME` cryptographically
+  bound into it (a renamed/repurposed credential file is detected, not
+  silently accepted); a systemd unit references it directly via
+  `LoadCredentialEncrypted=NAME:/path/to/output-file` and systemd itself
+  decrypts it at service start into a private, `$CREDENTIALS_DIRECTORY`-
+  rooted **tmpfs** path - the plaintext restic/S3 credentials never touch
+  persistent storage at all, not even transiently, which no hand-rolled
+  scheme in this codebase could offer without inventing its own tmpfs
+  handling. Rotation is a single atomic replace of that one file (the
+  same mktemp+rename discipline every other atomic write in this
+  codebase already uses) - `systemd-creds encrypt` writing one document,
+  not a key/ciphertext pair, is what actually closes the second review
+  finding, not a smarter two-file protocol.
 - **Explicitly not a reversal of "private age identity is ALWAYS
   external."** That decision governs the *disaster-recovery* identity
   alone - the one thing that must still be recoverable after a genuinely
@@ -884,24 +897,56 @@ own backup destinations (restic repository password, S3 keys) at all.
   the target itself is gone - which is exactly why the recovery kit, not
   this store, remains the actual disaster-recovery mechanism the Decision
   above already fixes.
-- **Threat model.** Reading this store requires root on the target - the
-  same root-compromise threat model SECURITY.md's Model 1 already accepts
-  for this whole item, and the same one TLS private keys on the target
-  already carry under this ADR's own Decision above (root-only, no
-  HSM/KMS). A host compromised at the root level already defeats backup
-  integrity by simpler means (the runner itself must hold root to drive
-  restic and manage services) - this store introduces no new class of
-  risk, only makes an already-necessary local capability explicit and
-  typed rather than ad hoc.
-- **Lifecycle: rotation, not disaster provenance.** Unlike the recovery
-  kit (which permanently refuses any overwrite - see
-  `publishRecoveryKit()`'s own comment in `scripts/target-mutate.mjs`),
-  this store is routine operational material and supports in-place
-  rotation: `hofctl backup configure` run again with new destination
-  credentials atomically replaces both the local key and the encrypted
-  payload. A rotation revokes the old materials by construction - the old
-  ciphertext becomes permanently undecryptable the instant the key file
-  is replaced - no separate "revoke" step is needed.
+- **Threat model, stated honestly rather than claimed uniformly.**
+  `systemd-creds`' own encryption key is, by its own documented `auto`
+  policy, derived from a local TPM2 chip **when one is present and not
+  inside a container**, and otherwise falls back to a host key at
+  `/var/lib/systemd/credential.secret` (auto-generated by systemd itself
+  on first use, root-only). These are two genuinely different guarantees,
+  and this erratum does not pretend they are the same one:
+  - **With a real TPM2 backing it** (common on bare-metal and on several
+    cloud providers' "shielded"/"trusted launch" VM tiers, not
+    universal), the encrypted credential file is *genuinely host-bound* -
+    copying it off the host, even together with every other file on
+    disk, is not sufficient to decrypt it; the physical/virtual TPM
+    itself must be present and unsealed correctly. This is a real
+    security boundary a copied-file attack cannot cross, which no
+    same-host key-file scheme (hand-rolled or not) can claim.
+  - **Without a TPM2** (the common case on a plain VPS), the host key is
+    itself just another root-only file on the same disk as the
+    credential it protects - a review finding correctly named this
+    degrades to the *same* threat model as root-only plaintext, no
+    matter what cipher wraps it: whoever can read one root-only file can
+    typically read the other. This erratum does not claim otherwise. What
+    `systemd-creds` still adds in this case, over literal plaintext, is
+    real, correctly-implemented, already-audited AEAD (defense in depth
+    against a partial-read or single-file-leak scenario a plain file
+    would not survive at all) and a decrypted value that only ever
+    exists in a private tmpfs for the life of the service, never written
+    to persistent storage even transiently - genuine improvements, just
+    not a host-bound guarantee, and this erratum says so rather than
+    implying otherwise.
+  - Either way, this is the same root-compromise threat model
+    SECURITY.md's Model 1 already accepts for this whole item, and the
+    same one TLS private keys on the target already carry under this
+    ADR's own Decision above (root-only, no universal HSM/KMS
+    requirement) - not a new class of risk.
+- **Verification required before this is trusted as more than "root-only
+  plaintext with extra steps."** Nothing above has been confirmed against
+  a real Debian 12/Ubuntu 24.04 target yet - `systemd-creds` has a
+  documented history of distro-specific build-flag gaps (a past Debian
+  bug where its package briefly shipped without the crypto backend
+  encrypted credentials need), so this erratum commits PR4's own
+  implementation to a real target-side acceptance test (the same
+  `HOF_ALLOW_PRIVILEGED_ACCEPTANCE=1` real-systemd-target discipline
+  PR2's own CI already established) proving `systemd-creds
+  encrypt`/`LoadCredentialEncrypted=` genuinely round-trip a credential
+  on both supported distributions, before the runner is ever built to
+  depend on it. If that acceptance test finds either target OS's
+  `systemd-creds` genuinely non-functional, the fallback is the second
+  option the review round itself named: an explicit, honestly-labeled
+  root-only plaintext store, no encrypted-at-rest claim at all - not a
+  return to the broken `openssl enc` draft.
 - No code implementing this decision exists yet; it is fixed here only so
   PR4's own executor/runner/CLI work has a settled foundation to build
   against, exactly as this ADR's own Decision section already does for

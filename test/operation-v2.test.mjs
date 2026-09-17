@@ -43,21 +43,50 @@ function restoreTargetBinding(overrides = {}) {
   };
 }
 
+// A pre-PR4 review found operation-v2.mjs never actually ran
+// validateBackupPlanOperations()/validateRestorePlanOperations() (see
+// operation-v2.mjs's own assertPlanValid() comment) - so these fixtures
+// were never checked for real flow completeness/ordering, only for
+// per-field schema shape. The short, 4/4-step lists this file used to
+// have here were never actually coherent flows (missing service.stop/
+// start, snapshot.create/retention.apply, readiness.wait entirely) - now
+// that assertBundleBinding()/assertPlanValid() enforce this for real,
+// they must be genuinely complete. Mirrors test/backup-contracts.test.mjs's
+// own fullBackupOperations()/fullRestoreOperations() (that file remains
+// the authority for exhaustive coverage of validateBackupPlanOperations/
+// validateRestorePlanOperations themselves), trimmed to this file's own
+// single destination ("onsite") and single consistencySet/network entry.
 function fullBackupOperations() {
   return [
     { id: "001.maintenance.enter.platform", phase: "maintenance", action: "maintenance.enter", resource: "platform", reason: "begin backup" },
-    { id: "002.staging.build.tree", phase: "staging", action: "staging.build", resource: "tree", reason: "build allowlisted staging tree" },
-    { id: "003.maintenance.exit.platform", phase: "maintenance", action: "maintenance.exit", resource: "platform", reason: "end backup" },
-    { id: "004.evidence.write.platform", phase: "evidence", action: "evidence.write", resource: "platform", reason: "record evidence" },
+    { id: "002.service.stop.schlussel", phase: "service", action: "service.stop", resource: "schlussel", reason: "quiesce before staging" },
+    { id: "003.staging.build.tree", phase: "staging", action: "staging.build", resource: "tree", reason: "build allowlisted staging tree" },
+    { id: "004.snapshot.create.onsite", phase: "snapshot", action: "snapshot.create", resource: "onsite", destination: "onsite", reason: "snapshot to onsite" },
+    { id: "005.retention.apply.onsite", phase: "retention", action: "retention.apply", resource: "onsite", destination: "onsite", reason: "apply retention onsite" },
+    { id: "006.service.start.schlussel", phase: "service", action: "service.start", resource: "schlussel", reason: "restart after staging" },
+    { id: "007.readiness.wait.platform", phase: "readiness", action: "readiness.wait", resource: "platform", condition: "healthy", reason: "confirm platform healthy" },
+    { id: "008.maintenance.exit.platform", phase: "maintenance", action: "maintenance.exit", resource: "platform", reason: "end backup" },
+    { id: "009.evidence.write.platform", phase: "evidence", action: "evidence.write", resource: "platform", reason: "record evidence" },
   ];
 }
 
 function fullRestoreOperations() {
   return [
     { id: "001.runner.install.runner", phase: "runner", action: "runner.install", resource: "runner", reason: "install signed runner" },
-    { id: "002.checkpoint.data-restored.all", phase: "checkpoint", action: "checkpoint.data-restored", resource: "all", reason: "privileged checkpoint" },
-    { id: "003.state.restore.state", phase: "state", action: "state.restore", resource: "state", reason: "restore state verbatim" },
-    { id: "004.evidence.write.platform", phase: "evidence", action: "evidence.write", resource: "platform", reason: "record evidence" },
+    { id: "002.target.verify-clean.target", phase: "target", action: "target.verify-clean", resource: "target", reason: "confirm genuinely clean" },
+    { id: "003.snapshot.verify.offsite", phase: "snapshot", action: "snapshot.verify", resource: "offsite", reason: "verify pinned snapshot" },
+    { id: "004.network.create.hof-hof", phase: "data", action: "network.create", resource: "hof-hof", reason: "create the hof network" },
+    { id: "005.volume.create.schlussel-data", phase: "data", action: "volume.create", resource: "schlussel-data", reason: "create schlussel-data volume" },
+    { id: "006.data.restore.schlussel-data", phase: "data", action: "data.restore", resource: "schlussel-data", reason: "restore schlussel-data" },
+    { id: "007.manifest.verify.manifest", phase: "verification", action: "manifest.verify", resource: "manifest", reason: "verify restored manifest" },
+    { id: "008.database.integrity-check.schlussel", phase: "verification", action: "database.integrity-check", resource: "schlussel", reason: "integrity-check schlussel" },
+    { id: "009.checkpoint.data-restored.all", phase: "checkpoint", action: "checkpoint.data-restored", resource: "all", reason: "privileged checkpoint" },
+    { id: "010.config.restore.config", phase: "config", action: "config.restore", resource: "config", reason: "restore generated config" },
+    { id: "011.secret.materialize.secrets", phase: "secret", action: "secret.materialize", resource: "secrets", reason: "materialize runtime secrets" },
+    { id: "012.state.restore.state", phase: "state", action: "state.restore", resource: "state", reason: "restore state verbatim" },
+    { id: "013.service.start.schlussel", phase: "service", action: "service.start", resource: "schlussel", reason: "start restored services" },
+    { id: "014.readiness.wait.platform", phase: "readiness", action: "readiness.wait", resource: "platform", condition: "healthy", reason: "confirm platform healthy" },
+    { id: "015.evidence.write.platform", phase: "evidence", action: "evidence.write", resource: "platform", reason: "record evidence" },
   ];
 }
 
@@ -242,20 +271,38 @@ test("withJournalStatus: an extra field on its own second argument (options) nev
 // --- assertBundleBinding: routes to validateBackupBundle/
 // validateRestoreBundle by operationKind, and throws on any violation. --
 
-test("assertBundleBinding: a coherent backup bundle (plan alone) passes; an incoherent one throws naming the actual violation", () => {
+test("assertBundleBinding: a coherent backup bundle (plan alone) passes; an incoherent one throws naming the actual violation", async () => {
   const plan = buildBackupPlan();
-  assertBundleBinding("backup", { plan }); // must not throw
+  await assertBundleBinding("backup", { plan }); // must not throw
 
   const tamperedPlan = { ...plan, target: { ...plan.target, installationId: "someone-else" } };
-  assert.throws(() => assertBundleBinding("backup", { plan: tamperedPlan }), /plan\.target\.installationId does not match plan\.installationId/);
+  await assert.rejects(() => assertBundleBinding("backup", { plan: tamperedPlan }), /plan\.target\.installationId does not match plan\.installationId/);
 });
 
-test("assertBundleBinding: a coherent restore bundle (plan alone) passes; routes to validateRestoreBundle for operationKind restore", () => {
+test("assertBundleBinding: a coherent restore bundle (plan alone) passes; routes to validateRestoreBundle for operationKind restore", async () => {
   const plan = buildRestorePlan();
-  assertBundleBinding("restore", { plan }); // must not throw
+  await assertBundleBinding("restore", { plan }); // must not throw
 
   const tamperedPlan = { ...plan, manifestDigest: sha("0") };
-  assert.throws(() => assertBundleBinding("restore", { plan: tamperedPlan, manifest: { backupId: plan.backupId, installationId: "inst-1", generation: 3, release: "0.2.3", releaseLockDigest: plan.source.releaseLockDigest, backupToolLockDigest: plan.backupToolLockDigest, recoveryKitDigest: plan.recoveryKitDigest, consistencySet: plan.consistencySet } }), /manifestDigest/);
+  await assert.rejects(() => assertBundleBinding("restore", { plan: tamperedPlan, manifest: { backupId: plan.backupId, installationId: "inst-1", generation: 3, release: "0.2.3", releaseLockDigest: plan.source.releaseLockDigest, backupToolLockDigest: plan.backupToolLockDigest, recoveryKitDigest: plan.recoveryKitDigest, consistencySet: plan.consistencySet } }), /manifestDigest/);
+});
+
+// PR 3 review, "pre-PR4 gap" finding: assertBundleBinding()/assertPlanValid()
+// now also run validateBackupPlanOperations()/validateRestorePlanOperations()
+// against bundle.plan - this is the regression test proving a SCHEMA-VALID
+// plan with an incoherent operations sequence is refused before it ever
+// reaches a write, not merely a plan with a bad id/digest binding (the two
+// tests above). Uses a plan whose operations omit service.start entirely -
+// schema-valid (backup-plan-v1 doesn't know about flow completeness at
+// all - see backup-flow.mjs's own top comment on why), but a real gap
+// validateBackupPlanOperations() alone can catch.
+test("assertBundleBinding: a schema-valid plan whose own operations sequence is incoherent (missing service.start) is refused, never reaches a write", async () => {
+  const incompleteOps = fullBackupOperations().filter((op) => op.action !== "service.start");
+  const plan = buildBackupPlan({ operations: incompleteOps });
+  await assert.rejects(
+    () => assertBundleBinding("backup", { plan }),
+    /expected at least one service\.start operation/,
+  );
 });
 
 // --- Write wrappers: require an active lease, validate before ever
@@ -380,6 +427,31 @@ test("writeLockAndJournal: refuses a bundle-binding violation before ever reachi
     /bundle binding is violated/,
   );
   assert.equal(mutate.calls.length, 0);
+});
+
+// PR 3 review, "pre-PR4 gap" finding, integration-level regression test:
+// a SCHEMA-VALID plan (buildJournalDocument's own schema check, and
+// backup-plan-v1 itself, both pass it) whose own operations sequence is
+// genuinely incoherent (here: a duplicate operation id) must never reach
+// writeLockAndJournal()'s own raw transport call - proving
+// validateBackupPlanOperations() is actually wired into the real write
+// path a caller uses, not merely reachable by calling assertBundleBinding()
+// directly (the unit-level test above already covers that).
+test("writeLockAndJournal: a schema-valid plan with an incoherent operations sequence (duplicate operation id) never reaches the raw transport", async () => {
+  const opsWithDuplicateId = fullBackupOperations();
+  opsWithDuplicateId[1] = { ...opsWithDuplicateId[1], id: opsWithDuplicateId[0].id };
+  const plan = buildBackupPlan({ operations: opsWithDuplicateId });
+  const lockDoc = await buildLockDocument({ operationKind: "backup", operationId: OPERATION_ID, approvedPlanId: plan.planId, target: plan.target });
+  const journalDoc = await buildJournalDocument({
+    operationKind: "backup", operationId: OPERATION_ID, approvedPlanId: plan.planId, target: plan.target, plan,
+    inputDigests: { releaseLockDigest: plan.releaseLockDigest, backupToolLockDigest: plan.backupToolLockDigest, backupPolicyId: plan.backupPolicyId },
+  });
+  const mutate = fakeMutate();
+  await assert.rejects(
+    () => writeLockAndJournal(mutate, {}, healthyLease(), { operationKind: "backup", lockDoc, journalDoc }),
+    /duplicate operation id/,
+  );
+  assert.equal(mutate.calls.length, 0, "the raw target-mutate transport must never be reached for an incoherent plan");
 });
 
 test("writeLockAndJournal: a healthy lease and a coherent bundle reach the raw transport exactly once, after a real assertOwnership() call, with the exact documents", async () => {
@@ -597,14 +669,12 @@ test("writeEvent: refuses an event naming a step that isn't part of the persiste
 });
 
 test("writeEvent: refuses an event whose own destination doesn't match the persisted journal's own plan step for a per-destination action", async () => {
-  const journalDoc = await realBackupJournal({
-    plan: buildBackupPlan({
-      operations: [
-        ...fullBackupOperations().slice(0, 3),
-        { id: "004.snapshot.create.onsite", phase: "snapshot", action: "snapshot.create", resource: "onsite", destination: "onsite", reason: "snapshot to onsite" },
-      ],
-    }),
-  });
+  // A genuinely complete, coherent plan (unlike before assertPlanValid()
+  // ran validateBackupPlanOperations() at every write - see that
+  // function's own comment - a truncated operations list would now be
+  // refused for incompleteness before this test's own destination check
+  // ever ran) - only the event's own destination is deliberately wrong.
+  const journalDoc = await realBackupJournal({ plan: buildBackupPlan() });
   const event = await realBackupEvent({ step: "004.snapshot.create.onsite", destination: "offsite" });
   const mutate = fakeMutate({ journals: new Map([[OPERATION_ID, journalDoc]]) });
   await assert.rejects(

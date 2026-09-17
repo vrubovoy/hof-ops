@@ -844,3 +844,65 @@ existing `backup.destinations[].type: "local"`.
   sequence builds on top of them, never revisits this ADR's own Decision
   in place (only appends dated Errata, exactly like ADRs 0004 and 0005
   already do).
+
+## Errata (2026-09-17, pre-PR4 architecture review)
+
+A review of PR4's own planned scope, before any of it started, found an
+unresolved conflict this ADR's Decision section did not anticipate:
+`backup.schedule`'s own systemd timer must run genuinely unattended (the
+workstation is not present at trigger time, by design), but the Decision
+above fixes the recovery kit's private age identity as *always* external -
+never generated, stored, or held by Hof on any host. Without some
+host-local credential material, a scheduled run has no way to reach its
+own backup destinations (restic repository password, S3 keys) at all.
+
+- **Host-local encrypted runner credential store, decided.** A new,
+  target-local, root-only store - genuinely independent of
+  `recovery-kit-v1`'s own age-encrypted envelope and its external
+  identity, both of which remain completely unchanged. It holds exactly
+  what `scripts/backup-credentials.mjs`'s own store already types
+  (`resticPassword`, and for `s3` `accessKeyId`/`secretAccessKey`/an
+  optional `sessionToken`) - nothing else, never application secrets or
+  TLS material. Mechanism: a random 256-bit symmetric key, generated
+  once, directly on the target, by a target-side script (never
+  transmitted as its own artifact, never leaves the host) at `hofctl
+  backup configure` time; the credentials payload is encrypted with it
+  (AES-256-GCM via the already-depended-on `openssl` - see
+  `scripts/supplied-tls.mjs`'s own precedent for shelling out to it) and
+  both files are written root-only (0600) under a fixed path, atomically
+  (the same mktemp+rename discipline every other atomic write in this
+  codebase already uses). No age, no SOPS, no KMS - a deliberately
+  simpler, different primitive than every other secret-at-rest in this
+  platform, precisely so it is never confusable with, and never a
+  substitute for, the recovery kit's own external identity.
+- **Explicitly not a reversal of "private age identity is ALWAYS
+  external."** That decision governs the *disaster-recovery* identity
+  alone - the one thing that must still be recoverable after a genuinely
+  total loss of every host this platform runs on. This store protects a
+  completely different asset (routine backup-destination credentials for
+  an *already-running*, *already-reachable* target) and is worthless once
+  the target itself is gone - which is exactly why the recovery kit, not
+  this store, remains the actual disaster-recovery mechanism the Decision
+  above already fixes.
+- **Threat model.** Reading this store requires root on the target - the
+  same root-compromise threat model SECURITY.md's Model 1 already accepts
+  for this whole item, and the same one TLS private keys on the target
+  already carry under this ADR's own Decision above (root-only, no
+  HSM/KMS). A host compromised at the root level already defeats backup
+  integrity by simpler means (the runner itself must hold root to drive
+  restic and manage services) - this store introduces no new class of
+  risk, only makes an already-necessary local capability explicit and
+  typed rather than ad hoc.
+- **Lifecycle: rotation, not disaster provenance.** Unlike the recovery
+  kit (which permanently refuses any overwrite - see
+  `publishRecoveryKit()`'s own comment in `scripts/target-mutate.mjs`),
+  this store is routine operational material and supports in-place
+  rotation: `hofctl backup configure` run again with new destination
+  credentials atomically replaces both the local key and the encrypted
+  payload. A rotation revokes the old materials by construction - the old
+  ciphertext becomes permanently undecryptable the instant the key file
+  is replaced - no separate "revoke" step is needed.
+- No code implementing this decision exists yet; it is fixed here only so
+  PR4's own executor/runner/CLI work has a settled foundation to build
+  against, exactly as this ADR's own Decision section already does for
+  everything else PR4 depends on.

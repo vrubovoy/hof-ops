@@ -897,34 +897,63 @@ own backup destinations (restic repository password, S3 keys) at all.
   undefined." `systemd-creds encrypt`'s own `INPUT`/`OUTPUT` positional
   arguments each independently accept `-` for stdin/stdout (confirmed
   against its own manual page) - the fix is to use that, not a plaintext
-  file at all, exactly the same stdin-only transport discipline
-  `scripts/secrets.mjs`'s own real `sops`/`age` invocations already use
-  for every other secret this codebase ever moves:
+  file at all. A SECOND review round then caught that the first fix's own
+  step 1 was itself wrong in a different way: it claimed this reuses
+  `scripts/target-mutate.mjs`'s existing `run(command, args, { input })`
+  seam as-is, but that seam's `input` is already spoken for -
+  `runScript()` (every other function in that module) sends the entire
+  fixed *script text* as the remote `sudo -n sh -s` process's own stdin
+  (confirmed in `runScript()`'s own code: `input: scriptText`, both
+  locally and over `ssh ... sudo -n sh -s`) - there is no second stdin
+  channel left over on that same connection to also carry the credential
+  bytes. Genuinely new, narrowly-scoped wiring is required, not a rename
+  of something that already does this:
   1. `hofctl backup configure` (workstation-driven) reads the plaintext
      destination credentials from its own already-decrypted, in-memory
      `backup-credentials.mjs` store - never re-serialized to a file on
-     the *workstation* either - and pipes them, as the SSH child
-     process's own **stdin** (`scripts/target-mutate.mjs`'s existing
-     `run(command, args, { input })` seam - the same one `secrets.mjs`/
-     `backup-credentials.mjs` already use), never as an argv element or
-     an environment variable (both are visible to every other local
-     process via `/proc/<pid>/cmdline` or `/proc/<pid>/environ`, argv is
-     also visible in `ps`, and both routinely end up quoted into shell
-     history or diagnostics - stdin is invisible to all of them).
-  2. The target-side script this connection runs is fixed and carries no
-     secret material of its own (the same discipline every other
-     target-mutate.mjs script already follows - only regex-validated
-     identifiers/digests are ever interpolated into script text): it
-     runs, under the SAME `umask 077` guard every other atomic write in
-     this module already uses (so the file is 0600 from the instant
-     `systemd-creds` creates it - no window where it is ever wider),
-     `systemd-creds encrypt --name=<fixed-name> - "$tmp_output"` where
-     `$tmp_output` is a fresh, unique `mktemp` path and the leading `-`
-     is the command's own stdin - the plaintext credentials the SSH
-     connection's stdin is already carrying flow directly into
-     `systemd-creds`' own process memory and are encrypted there; no
-     shell variable, no `printf`, no intermediate file ever holds the
-     plaintext at any point in the script.
+     the *workstation* either. Because the target-side operation below
+     needs **zero** caller-supplied interpolated content at all (a fixed
+     credential name, a fixed final path, a `mktemp`-generated temp name
+     computed *inside* the script, never by the caller) - unlike every
+     other target-mutate.mjs script, which interpolates an operationId,
+     a token, or a payload and therefore needs `runScript()`'s
+     script-over-stdin delivery - the entire script can instead be a
+     single, 100%-static literal, passed as the SSH remote command's own
+     **argv** (`sudo -n sh -c '<fixed literal>'`, the literal baked into
+     this project's own source, never templated), exactly the same way
+     `sudo -n sh -s` itself is already always a static argv element in
+     every other call. That frees the connection's stdin entirely, for
+     the first time in this module, to carry a real payload: the
+     credential bytes, piped through as this SSH child process's own
+     stdin - never an argv element, never an environment variable (both
+     are visible to every other local process via `/proc/<pid>/cmdline`
+     or `/proc/<pid>/environ`, argv is also visible in `ps`, and both
+     routinely end up quoted into shell history or diagnostics - stdin is
+     invisible to all of them). This is a genuinely new SSH-invocation
+     path this module does not have today - a fixed-argv-command,
+     stdin-as-payload variant of `runScript()`'s own local/ssh branching,
+     never a reuse of the existing script-over-stdin one - and PR4's own
+     implementation must add it, and cover it with the same real-shell-
+     execution regression testing (a fake SSH target, then a genuine
+     local-shell run of the exact captured argv/stdin) every other
+     target-mutate.mjs primitive in this codebase already has, before
+     anything depends on it.
+  2. The static literal this new path sends carries no secret material
+     of its own (nothing to validate - there is nothing dynamic in it at
+     all, the one case in this module where even the
+     `validateDigest()`/`validateOperationId()`-style regex gates every
+     *other* script needs are inapplicable, precisely because nothing is
+     ever interpolated into this one): it runs, under the SAME `umask
+     077` guard every other atomic write in this module already uses (so
+     the file is 0600 from the instant `systemd-creds` creates it - no
+     window where it is ever wider), `systemd-creds encrypt
+     --name=<fixed-name> - "$tmp_output"` where `$tmp_output` is a fresh,
+     unique `mktemp` path and the leading `-` is the command's own stdin
+     - the plaintext credentials the SSH connection's stdin is already
+     carrying (per step 1 above) flow directly into `systemd-creds`' own
+     process memory and are encrypted there; no shell variable, no
+     `printf`, no intermediate file ever holds the plaintext at any point
+     in the script.
   3. `systemd-creds` writes only the already-encrypted ciphertext to
      `$tmp_output` (0600, by the umask above); the script then atomically
      renames `$tmp_output` onto the fixed, final credential path (a

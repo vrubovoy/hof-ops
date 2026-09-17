@@ -873,21 +873,83 @@ own backup destinations (restic repository password, S3 keys) at all.
   and at-rest handling this decision still needs, are exactly what
   `systemd-creds`(1) - a real, already-shipped systemd facility, not
   code this project would own or maintain - already solves: `systemd-creds
-  encrypt --name=NAME plaintext-file output-file` produces a single,
-  genuinely AES-256-GCM-authenticated (real AEAD, correctly implemented)
-  credential file, with the credential's own `NAME` cryptographically
-  bound into it (a renamed/repurposed credential file is detected, not
-  silently accepted); a systemd unit references it directly via
-  `LoadCredentialEncrypted=NAME:/path/to/output-file` and systemd itself
-  decrypts it at service start into a private, `$CREDENTIALS_DIRECTORY`-
-  rooted **tmpfs** path - the plaintext restic/S3 credentials never touch
-  persistent storage at all, not even transiently, which no hand-rolled
-  scheme in this codebase could offer without inventing its own tmpfs
-  handling. Rotation is a single atomic replace of that one file (the
-  same mktemp+rename discipline every other atomic write in this
-  codebase already uses) - `systemd-creds encrypt` writing one document,
-  not a key/ciphertext pair, is what actually closes the second review
-  finding, not a smarter two-file protocol.
+  encrypt` produces a single, genuinely AES-256-GCM-authenticated (real
+  AEAD, correctly implemented) credential file, with the credential's own
+  `NAME` cryptographically bound into it (a renamed/repurposed credential
+  file is detected, not silently accepted); a systemd unit references it
+  directly via `LoadCredentialEncrypted=NAME:/path/to/output-file` and
+  systemd itself decrypts it at service start into a private,
+  `$CREDENTIALS_DIRECTORY`-rooted **tmpfs** path - the plaintext restic/S3
+  credentials never touch persistent storage at all, not even
+  transiently, which no hand-rolled scheme in this codebase could offer
+  without inventing its own tmpfs handling. Rotation is a single atomic
+  replace of that one file (the same mktemp+rename discipline every other
+  atomic write in this codebase already uses) - `systemd-creds encrypt`
+  writing one document, not a key/ciphertext pair, is what actually
+  closes the second review finding, not a smarter two-file protocol.
+- **Exact provisioning protocol, fixed here so the plaintext credential
+  never itself has an at-rest moment on the target.** A review round
+  correctly caught that citing `systemd-creds encrypt --name=NAME
+  plaintext-file output-file` without saying where `plaintext-file` comes
+  from left an unstated choice between "it exists on the target's own
+  persistent disk" (directly contradicting the "never touches persistent
+  storage" claim two paragraphs up) and "the protocol is simply
+  undefined." `systemd-creds encrypt`'s own `INPUT`/`OUTPUT` positional
+  arguments each independently accept `-` for stdin/stdout (confirmed
+  against its own manual page) - the fix is to use that, not a plaintext
+  file at all, exactly the same stdin-only transport discipline
+  `scripts/secrets.mjs`'s own real `sops`/`age` invocations already use
+  for every other secret this codebase ever moves:
+  1. `hofctl backup configure` (workstation-driven) reads the plaintext
+     destination credentials from its own already-decrypted, in-memory
+     `backup-credentials.mjs` store - never re-serialized to a file on
+     the *workstation* either - and pipes them, as the SSH child
+     process's own **stdin** (`scripts/target-mutate.mjs`'s existing
+     `run(command, args, { input })` seam - the same one `secrets.mjs`/
+     `backup-credentials.mjs` already use), never as an argv element or
+     an environment variable (both are visible to every other local
+     process via `/proc/<pid>/cmdline` or `/proc/<pid>/environ`, argv is
+     also visible in `ps`, and both routinely end up quoted into shell
+     history or diagnostics - stdin is invisible to all of them).
+  2. The target-side script this connection runs is fixed and carries no
+     secret material of its own (the same discipline every other
+     target-mutate.mjs script already follows - only regex-validated
+     identifiers/digests are ever interpolated into script text): it
+     runs, under the SAME `umask 077` guard every other atomic write in
+     this module already uses (so the file is 0600 from the instant
+     `systemd-creds` creates it - no window where it is ever wider),
+     `systemd-creds encrypt --name=<fixed-name> - "$tmp_output"` where
+     `$tmp_output` is a fresh, unique `mktemp` path and the leading `-`
+     is the command's own stdin - the plaintext credentials the SSH
+     connection's stdin is already carrying flow directly into
+     `systemd-creds`' own process memory and are encrypted there; no
+     shell variable, no `printf`, no intermediate file ever holds the
+     plaintext at any point in the script.
+  3. `systemd-creds` writes only the already-encrypted ciphertext to
+     `$tmp_output` (0600, by the umask above); the script then atomically
+     renames `$tmp_output` onto the fixed, final credential path (a
+     plain atomic rename, not the mktemp+ln exclusive-create idiom
+     `recovery-kit.json` uses - this store legitimately supports
+     rotation/overwrite, unlike a recovery kit's permanent refuse-on-
+     exists).
+  4. No plaintext temp file is ever created on the target, at any step -
+     the entire point of the stdin-in, ciphertext-out pipeline above is
+     that a plaintext copy of these credentials never exists as a file
+     on the target's filesystem, not even transiently, not even under a
+     name this project's own cleanup code would remove.
+  5. Whatever this connection's own transcript/diagnostics capture (the
+     same discipline `secrets.mjs`'s own real `sops`/`age` calls already
+     follow) - the script text itself, its exit status, `systemd-creds`'
+     own stderr - must never include the credential content; a
+     successful `systemd-creds encrypt` writes only its own status to
+     stderr and the encrypted OUTPUT to the path given (never the
+     plaintext INPUT back to stdout/stderr - confirmed against its own
+     manual page: `-p`/`--pretty` only changes how the already-encrypted
+     result is formatted for embedding in a unit file, an orthogonal
+     concern this decision does not use), and this project's own logging
+     around the call is bound by the same "no secrets in artifacts,
+     argv, logs, journals, or events" rule PR4's own plan already states
+     for every other credential path.
 - **Explicitly not a reversal of "private age identity is ALWAYS
   external."** That decision governs the *disaster-recovery* identity
   alone - the one thing that must still be recoverable after a genuinely

@@ -21,6 +21,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import YAML from "yaml";
+
 import { canonicalDocumentDigest } from "../scripts/backup-ids.mjs";
 import { verifyRecoveryKit } from "../scripts/backup-flow.mjs";
 import { loadContracts } from "../scripts/contracts.mjs";
@@ -140,10 +142,6 @@ function realisticPayload(overrides = {}) {
   };
 }
 
-function stateFixture(overrides = {}) {
-  return { installationId: "inst-1", generation: 3, ...overrides };
-}
-
 function backupToolLockFixture(overrides = {}) {
   return {
     apiVersion: "hof.dev/backup-tool-lock/v1",
@@ -175,6 +173,41 @@ function backupToolLockFixture(overrides = {}) {
 
 function localDestination(overrides = {}) {
   return { name: "onsite", type: "local", path: "/mnt/hof-backups", secretRef: "backup-onsite-key", ...overrides };
+}
+
+// PR 3 review, high finding: assembleRecoveryPayload() now requires
+// manifestBytes/releaseLockBytes/backupToolLockBytes (the exact raw
+// bytes, never a pre-parsed object) and cross-checks their own recomputed
+// sha256 against state.manifestDigest/state.releaseLockDigest/
+// expectedBackupToolLockDigest before ever trusting them - see that
+// function's own comment. This builds a genuinely SELF-CONSISTENT bundle
+// (state's own digests actually match the given manifest/releaseLock's
+// own serialized bytes) so every test below exercises the real
+// cross-check passing, not a pre-defeated one - the specific mismatch
+// tests further down deliberately break one digest at a time instead.
+function manifestBytesFor(manifestObj) {
+  return Buffer.from(YAML.stringify(manifestObj), "utf8");
+}
+
+function jsonBytesFor(obj) {
+  return Buffer.from(JSON.stringify(obj), "utf8");
+}
+
+function trustedArtifacts({ manifest, releaseLock = { apiVersion: "hof.dev/release-lock/v1" }, backupToolLock = backupToolLockFixture(), stateOverrides = {} } = {}) {
+  const manifestBytes = manifestBytesFor(manifest);
+  const releaseLockBytes = jsonBytesFor(releaseLock);
+  const backupToolLockBytes = jsonBytesFor(backupToolLock);
+  return {
+    state: {
+      installationId: "inst-1", generation: 3,
+      manifestDigest: sha256(manifestBytes),
+      releaseLockDigest: sha256(releaseLockBytes),
+      ...stateOverrides,
+    },
+    manifestBytes, releaseLockBytes, backupToolLockBytes,
+    releaseLock, backupToolLock,
+    expectedBackupToolLockDigest: sha256(backupToolLockBytes),
+  };
 }
 
 // --- createRecoveryKit / openRecoveryKit: the real (fake-seam) round trip
@@ -328,20 +361,52 @@ test("validateClosedRecoveryPayload: rejects a non-string application secret val
   assert.ok(violations.some((v) => v.includes('applicationSecrets["a"]')));
 });
 
+// PR 3 review, high finding: this used to check only entry.type's own
+// enum, never the per-type required fields, never closed-field
+// semantics - a decrypted kit could pass this check while being
+// genuinely useless for restore. Now reuses
+// backup-credentials.mjs's own validateCredentialEntry() - these tests
+// confirm that reuse actually closes the gap, at the payload-validation
+// layer specifically (backup-credentials.test.mjs already covers
+// validateCredentialEntry()/validateBackupCredentials() directly).
+
+test("validateClosedRecoveryPayload: rejects an s3 destinationCredentials entry missing accessKeyId/secretAccessKey - a decrypted kit that would be useless for restore", () => {
+  const violations = validateClosedRecoveryPayload(realisticPayload({
+    destinationCredentials: { "backup-onsite-key": { type: "s3", resticPassword: "p" } },
+  }));
+  assert.ok(violations.some((v) => v.includes("accessKeyId")));
+  assert.ok(violations.some((v) => v.includes("secretAccessKey")));
+});
+
+test("validateClosedRecoveryPayload: rejects a local destinationCredentials entry with an empty resticPassword", () => {
+  const violations = validateClosedRecoveryPayload(realisticPayload({
+    destinationCredentials: { "backup-onsite-key": { type: "local", resticPassword: "" } },
+  }));
+  assert.ok(violations.some((v) => v.includes("resticPassword")));
+});
+
+test("validateClosedRecoveryPayload: rejects a destinationCredentials entry carrying an unexpected field for its own type - closed-field semantics, not merely required-fields-present", () => {
+  const violations = validateClosedRecoveryPayload(realisticPayload({
+    destinationCredentials: { "backup-onsite-key": { type: "local", resticPassword: "p", accessKeyId: "should-not-be-here" } },
+  }));
+  assert.ok(violations.some((v) => v.includes("unexpected field") && v.includes("accessKeyId")));
+});
+
 // --- assembleRecoveryPayload ---------------------------------------------
 
-test("assembleRecoveryPayload: requires manifest.tls.mode === supplied - acme-http01 is refused BEFORE ever touching age, encryption, or secrets", async () => {
+test("assembleRecoveryPayload: requires manifest.tls.mode === supplied - acme-http01 is refused before ever touching age or secrets, after the state/digest bindings pass", async () => {
+  const acmeManifest = { ...manifest, tls: { mode: "acme-http01", email: "a@example.com" } };
+  const artifacts = trustedArtifacts({ manifest: acmeManifest });
   const calls = [];
   const run = async (...args) => { calls.push(args); throw new Error("must not be called"); };
   await assert.rejects(
     () => assembleRecoveryPayload({
-      state: stateFixture(),
-      manifest: { ...manifest, tls: { mode: "acme-http01", email: "a@example.com" } },
+      ...artifacts,
       catalog,
       enabledIds: [],
       secretsStorePath: path.join(workDir, "does-not-exist.sops.json"),
-      releaseLock: {}, releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
-      backupToolLock: backupToolLockFixture(), backupToolLockSignature: "s", backupToolLockCertificate: "c",
+      releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
+      backupToolLockSignature: "s", backupToolLockCertificate: "c",
       destinations: [], destinationCredentials: {},
       run,
     }),
@@ -351,36 +416,133 @@ test("assembleRecoveryPayload: requires manifest.tls.mode === supplied - acme-ht
 });
 
 test("assembleRecoveryPayload: requires a trusted state document - installationId/generation are never accepted as free-standing metadata", async () => {
-  // The state check runs BEFORE the TLS-mode check (see
-  // assembleRecoveryPayload's own comment on why installationId/
-  // generation are never free-standing metadata) - a placeholder,
-  // never-actually-read certificatePath/privateKeyPath is enough to
-  // prove that ordering.
+  // The state check runs FIRST, before even the byte-source/digest
+  // checks - undefined manifestBytes/releaseLockBytes/etc. are enough to
+  // prove that ordering, since a real value is never needed to reach
+  // this refusal.
   await assert.rejects(
     () => assembleRecoveryPayload({
       state: { installationId: "inst-1" }, // missing generation
-      manifest: suppliedManifest({ certificatePath: "/never/read.pem", privateKeyPath: "/never/read-key.pem" }),
-      catalog, enabledIds: [],
+      catalog: undefined, enabledIds: [],
       secretsStorePath: path.join(workDir, "does-not-exist.sops.json"),
-      releaseLock: {}, releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
-      backupToolLock: backupToolLockFixture(), backupToolLockSignature: "s", backupToolLockCertificate: "c",
+      releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
+      backupToolLockSignature: "s", backupToolLockCertificate: "c",
       destinations: [], destinationCredentials: {},
     }),
     /requires a trusted state document/,
   );
 });
 
+// --- assembleRecoveryPayload: the digest-binding findings' own regression tests
+
+test("assembleRecoveryPayload: refuses manifestBytes that does not match state.manifestDigest - manifest is never accepted as a free-standing input", async () => {
+  const artifacts = trustedArtifacts({ manifest: suppliedManifest({ certificatePath: "/never/read.pem", privateKeyPath: "/never/read-key.pem" }) });
+  const tamperedManifestBytes = manifestBytesFor({ ...manifest, domains: { base: "a-completely-different-manifest.example.com" } });
+  await assert.rejects(
+    () => assembleRecoveryPayload({
+      ...artifacts,
+      manifestBytes: tamperedManifestBytes,
+      catalog, enabledIds: [],
+      secretsStorePath: path.join(workDir, "does-not-exist.sops.json"),
+      releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
+      backupToolLockSignature: "s", backupToolLockCertificate: "c",
+      destinations: [], destinationCredentials: {},
+    }),
+    /manifestBytes does not match state\.manifestDigest/,
+  );
+});
+
+test("assembleRecoveryPayload: refuses releaseLockBytes that does not match state.releaseLockDigest", async () => {
+  const artifacts = trustedArtifacts({ manifest: suppliedManifest({ certificatePath: "/never/read.pem", privateKeyPath: "/never/read-key.pem" }) });
+  await assert.rejects(
+    () => assembleRecoveryPayload({
+      ...artifacts,
+      releaseLockBytes: jsonBytesFor({ apiVersion: "hof.dev/release-lock/v1", tampered: true }),
+      catalog, enabledIds: [],
+      secretsStorePath: path.join(workDir, "does-not-exist.sops.json"),
+      releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
+      backupToolLockSignature: "s", backupToolLockCertificate: "c",
+      destinations: [], destinationCredentials: {},
+    }),
+    /releaseLockBytes does not match state\.releaseLockDigest/,
+  );
+});
+
+test("assembleRecoveryPayload: refuses backupToolLockBytes that does not match expectedBackupToolLockDigest - backup-tool-lock's own binding is caller-trusted, not state-derived", async () => {
+  const artifacts = trustedArtifacts({ manifest: suppliedManifest({ certificatePath: "/never/read.pem", privateKeyPath: "/never/read-key.pem" }) });
+  await assert.rejects(
+    () => assembleRecoveryPayload({
+      ...artifacts,
+      backupToolLockBytes: jsonBytesFor({ ...backupToolLockFixture(), tampered: true }),
+      catalog, enabledIds: [],
+      secretsStorePath: path.join(workDir, "does-not-exist.sops.json"),
+      releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
+      backupToolLockSignature: "s", backupToolLockCertificate: "c",
+      destinations: [], destinationCredentials: {},
+    }),
+    /backupToolLockBytes does not match expectedBackupToolLockDigest/,
+  );
+});
+
+test("assembleRecoveryPayload: refuses when state carries no manifestDigest/releaseLockDigest at all - an incomplete trusted state can never bind anything", async () => {
+  const artifacts = trustedArtifacts({ manifest: suppliedManifest({ certificatePath: "/never/read.pem", privateKeyPath: "/never/read-key.pem" }) });
+  await assert.rejects(
+    () => assembleRecoveryPayload({
+      ...artifacts,
+      state: { ...artifacts.state, manifestDigest: null },
+      catalog, enabledIds: [],
+      secretsStorePath: path.join(workDir, "does-not-exist.sops.json"),
+      releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
+      backupToolLockSignature: "s", backupToolLockCertificate: "c",
+      destinations: [], destinationCredentials: {},
+    }),
+    /requires state\.manifestDigest/,
+  );
+});
+
+test("assembleRecoveryPayload: requires expectedBackupToolLockDigest to be explicitly supplied", async () => {
+  const artifacts = trustedArtifacts({ manifest: suppliedManifest({ certificatePath: "/never/read.pem", privateKeyPath: "/never/read-key.pem" }) });
+  await assert.rejects(
+    () => assembleRecoveryPayload({
+      ...artifacts,
+      expectedBackupToolLockDigest: undefined,
+      catalog, enabledIds: [],
+      secretsStorePath: path.join(workDir, "does-not-exist.sops.json"),
+      releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
+      backupToolLockSignature: "s", backupToolLockCertificate: "c",
+      destinations: [], destinationCredentials: {},
+    }),
+    /requires expectedBackupToolLockDigest/,
+  );
+});
+
+test("assembleRecoveryPayload: refuses manifestBytes/releaseLockBytes/backupToolLockBytes that are not real byte sources (e.g. a pre-parsed object)", async () => {
+  const artifacts = trustedArtifacts({ manifest: suppliedManifest({ certificatePath: "/never/read.pem", privateKeyPath: "/never/read-key.pem" }) });
+  await assert.rejects(
+    () => assembleRecoveryPayload({
+      ...artifacts,
+      manifestBytes: manifest, // a plain object, not bytes
+      catalog, enabledIds: [],
+      secretsStorePath: path.join(workDir, "does-not-exist.sops.json"),
+      releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
+      backupToolLockSignature: "s", backupToolLockCertificate: "c",
+      destinations: [], destinationCredentials: {},
+    }),
+    /requires manifestBytes\/releaseLockBytes\/backupToolLockBytes as the exact raw bytes/,
+  );
+});
+
 test("assembleRecoveryPayload: a mismatched supplied TLS certificate/private key pair is refused - propagated from the existing PEM/key-match validation, never re-implemented here", async () => {
   const { certPath } = await generateKeyAndCert();
   const { keyPath: mismatchedKeyPath } = await generateKeyAndCert();
+  const artifacts = trustedArtifacts({ manifest: suppliedManifest({ certificatePath: certPath, privateKeyPath: mismatchedKeyPath }) });
   await assert.rejects(
     () => assembleRecoveryPayload({
-      state: stateFixture(),
-      manifest: suppliedManifest({ certificatePath: certPath, privateKeyPath: mismatchedKeyPath }),
+      ...artifacts,
       catalog, enabledIds: [],
       secretsStorePath: path.join(workDir, "does-not-exist.sops.json"),
-      releaseLock: {}, releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
-      backupToolLock: backupToolLockFixture(), backupToolLockSignature: "s", backupToolLockCertificate: "c",
+      releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
+      backupToolLockSignature: "s", backupToolLockCertificate: "c",
       destinations: [], destinationCredentials: {},
     }),
     /does not correspond to the certificate/,
@@ -417,22 +579,28 @@ test("assembleRecoveryPayload: a genuine, matching supplied TLS pair plus applic
 
   const { recipient: recoveryRecipient } = await fakeAgePair("recov");
   const destinations = [localDestination()];
-  const destinationCredentials = { "backup-onsite-key": { type: "local", resticPassword: "resticpw" } };
-  const releaseLock = { apiVersion: "hof.dev/release-lock/v1" };
-  const backupToolLock = backupToolLockFixture();
+  // A deliberately BROADER credentials store than `destinations` needs -
+  // "backup-offsite-key" belongs to no destination at all (a stale entry
+  // from a since-removed destination, say). Proves finding 3's own fix:
+  // it must never block assembly, and must never reach the embedded
+  // payload either.
+  const destinationCredentials = {
+    "backup-onsite-key": { type: "local", resticPassword: "resticpw" },
+    "backup-offsite-key": { type: "s3", resticPassword: "unrelated", accessKeyId: "AKIAUNRELATED", secretAccessKey: "unrelated-secret" },
+  };
+  const artifacts = trustedArtifacts({ manifest: suppliedManifest({ certificatePath: certPath, privateKeyPath: keyPath }) });
 
   process.env.PATH = `${fakeSopsDir}${path.delimiter}${originalPath}`;
   let payload;
   try {
     payload = await assembleRecoveryPayload({
-      state: stateFixture(),
-      manifest: suppliedManifest({ certificatePath: certPath, privateKeyPath: keyPath }),
+      ...artifacts,
       catalog,
       enabledIds: ["schlussel", "glocke"],
       secretsStorePath,
       secretsIdentityFile: opIdentityFile,
-      releaseLock, releaseLockSignature: "relsig", releaseLockCertificate: "relcert", releaseLockSigningIdentity: "https://github.com/x", releaseLockOidcIssuer: "https://token.actions.githubusercontent.com",
-      backupToolLock, backupToolLockSignature: "btlsig", backupToolLockCertificate: "btlcert",
+      releaseLockSignature: "relsig", releaseLockCertificate: "relcert", releaseLockSigningIdentity: "https://github.com/x", releaseLockOidcIssuer: "https://token.actions.githubusercontent.com",
+      backupToolLockSignature: "btlsig", backupToolLockCertificate: "btlcert",
       destinations, destinationCredentials,
     });
   } finally {
@@ -442,11 +610,13 @@ test("assembleRecoveryPayload: a genuine, matching supplied TLS pair plus applic
   assert.equal(payload.installationId, "inst-1");
   assert.equal(payload.generation, 3);
   assert.deepEqual(payload.sanitizedManifest, sanitizeManifest(suppliedManifest({ certificatePath: certPath, privateKeyPath: keyPath })));
-  assert.equal(payload.releaseLock.document, releaseLock);
-  assert.equal(payload.backupToolLock.document, backupToolLock);
+  assert.deepEqual(payload.releaseLock.document, artifacts.releaseLock);
+  assert.deepEqual(payload.backupToolLock.document, artifacts.backupToolLock);
   assert.deepEqual(payload.applicationSecrets, requiredValues);
   assert.match(payload.suppliedTls.certificatePem, /-----BEGIN CERTIFICATE-----/);
-  assert.deepEqual(payload.destinationCredentials, destinationCredentials);
+  // Only the referenced ref survives - the foreign "backup-offsite-key"
+  // entry from the broader store above must never reach the kit.
+  assert.deepEqual(payload.destinationCredentials, { "backup-onsite-key": destinationCredentials["backup-onsite-key"] });
   assert.deepEqual(validateClosedRecoveryPayload(payload), []);
 
   // And the whole thing survives a genuine encrypt/decrypt round trip,
@@ -459,15 +629,15 @@ test("assembleRecoveryPayload: a genuine, matching supplied TLS pair plus applic
 
 test("assembleRecoveryPayload: refuses when the secrets store is missing a currently-required secret", () => withFakeAge(async () => {
   const { certPath, keyPath } = await generateKeyAndCert();
+  const artifacts = trustedArtifacts({ manifest: suppliedManifest({ certificatePath: certPath, privateKeyPath: keyPath }) });
   await assert.rejects(
     () => assembleRecoveryPayload({
-      state: stateFixture(),
-      manifest: suppliedManifest({ certificatePath: certPath, privateKeyPath: keyPath }),
+      ...artifacts,
       catalog,
       enabledIds: ["schlussel", "glocke"],
       secretsStorePath: path.join(workDir, "genuinely-missing.sops.json"),
-      releaseLock: {}, releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
-      backupToolLock: backupToolLockFixture(), backupToolLockSignature: "s", backupToolLockCertificate: "c",
+      releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
+      backupToolLockSignature: "s", backupToolLockCertificate: "c",
       destinations: [], destinationCredentials: {},
     }),
     /missing required secret/,
@@ -476,14 +646,14 @@ test("assembleRecoveryPayload: refuses when the secrets store is missing a curre
 
 test("assembleRecoveryPayload: refuses when destinationCredentials is missing a credential for a configured destination", () => withFakeAge(async () => {
   const { certPath, keyPath } = await generateKeyAndCert();
+  const artifacts = trustedArtifacts({ manifest: suppliedManifest({ certificatePath: certPath, privateKeyPath: keyPath }) });
   await assert.rejects(
     () => assembleRecoveryPayload({
-      state: stateFixture(),
-      manifest: suppliedManifest({ certificatePath: certPath, privateKeyPath: keyPath }),
+      ...artifacts,
       catalog, enabledIds: [],
       secretsStorePath: path.join(workDir, "does-not-exist-2.sops.json"),
-      releaseLock: {}, releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
-      backupToolLock: backupToolLockFixture(), backupToolLockSignature: "s", backupToolLockCertificate: "c",
+      releaseLockSignature: "s", releaseLockCertificate: "c", releaseLockSigningIdentity: "i", releaseLockOidcIssuer: "o",
+      backupToolLockSignature: "s", backupToolLockCertificate: "c",
       destinations: [localDestination()], destinationCredentials: {},
     }),
     /missing credential/,

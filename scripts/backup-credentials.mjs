@@ -90,6 +90,50 @@ function endpointCarriesEmbeddedCredential(endpoint) {
 // Returns an array of violation strings; empty means the credentials
 // store is exactly, genuinely sufficient for these destinations - no
 // more, no less.
+// A single credential entry's own internal shape - real object, a known
+// type, every field that type requires present and a non-empty string,
+// every optional field (when present) also non-empty, and closed
+// (additionalProperties: false style - a field the entry's own type
+// never uses must never silently pass through, since a typo'd field
+// name would otherwise leave the REAL required field missing while
+// looking superficially populated). Deliberately independent of any
+// `destinations` array - this is the one piece of this module's own
+// validation that recovery-kit.mjs's own validateClosedRecoveryPayload()
+// also needs (a decrypted kit's own destinationCredentials carries no
+// destinations array of its own to cross-reference at all), so it is
+// exported and reused there rather than re-implemented a second time.
+// Returns an array of violation strings, each already prefixed with the
+// given label (typically `credentials["ref"]` or an equivalent payload
+// path) so a caller's own message reads naturally either way.
+export function validateCredentialEntry(label, entry) {
+  const violations = [];
+  if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+    return [`${label} is not an object`];
+  }
+  if (entry.type !== "local" && entry.type !== "s3") {
+    return [`${label}.type ("${entry.type}") is not a known destination type`];
+  }
+  const required = REQUIRED_FIELDS_BY_TYPE[entry.type] ?? [];
+  const optional = OPTIONAL_FIELDS_BY_TYPE[entry.type] ?? [];
+  for (const field of required) {
+    if (!isNonEmptyString(entry[field])) {
+      violations.push(`${label}.${field} is required and must be a non-empty string for a "${entry.type}" destination`);
+    }
+  }
+  const allowed = new Set(["type", ...required, ...optional]);
+  for (const field of Object.keys(entry)) {
+    if (!allowed.has(field)) {
+      violations.push(`${label} carries an unexpected field "${field}" for a "${entry.type}" destination`);
+    }
+  }
+  for (const field of optional) {
+    if (field in entry && !isNonEmptyString(entry[field])) {
+      violations.push(`${label}.${field}, when present, must be a non-empty string`);
+    }
+  }
+  return violations;
+}
+
 export function validateBackupCredentials(destinations, credentials) {
   const violations = [];
 
@@ -120,37 +164,11 @@ export function validateBackupCredentials(destinations, credentials) {
     const destination = destinationByRef.get(ref);
     if (!destination) continue; // already reported above as foreign
     const entry = credentials[ref];
-    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
-      violations.push(`credentials["${ref}"] is not an object`);
-      continue;
-    }
-    if (entry.type !== destination.type) {
+    if (entry !== null && typeof entry === "object" && !Array.isArray(entry) && entry.type !== undefined && entry.type !== destination.type) {
       violations.push(`credentials["${ref}"].type ("${entry.type}") does not match destination "${destination.name}"'s own type ("${destination.type}")`);
       continue;
     }
-    const required = REQUIRED_FIELDS_BY_TYPE[entry.type] ?? [];
-    const optional = OPTIONAL_FIELDS_BY_TYPE[entry.type] ?? [];
-    for (const field of required) {
-      if (!isNonEmptyString(entry[field])) {
-        violations.push(`credentials["${ref}"].${field} is required and must be a non-empty string for a "${entry.type}" destination`);
-      }
-    }
-    // additionalProperties-style closedness: a field this entry's own
-    // type never uses (an S3 access key on a "local" entry, an
-    // unexpected fourth field on either) must never silently pass
-    // through - a typo'd field name would otherwise leave the REAL
-    // required field missing while looking superficially populated.
-    const allowed = new Set(["type", ...required, ...optional]);
-    for (const field of Object.keys(entry)) {
-      if (!allowed.has(field)) {
-        violations.push(`credentials["${ref}"] carries an unexpected field "${field}" for a "${entry.type}" destination`);
-      }
-    }
-    for (const field of optional) {
-      if (field in entry && !isNonEmptyString(entry[field])) {
-        violations.push(`credentials["${ref}"].${field}, when present, must be a non-empty string`);
-      }
-    }
+    violations.push(...validateCredentialEntry(`credentials["${ref}"]`, entry));
   }
 
   return violations;

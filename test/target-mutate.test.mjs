@@ -1047,24 +1047,45 @@ function transportDigest(document) {
   return `sha256:${createHash("sha256").update(Buffer.from(JSON.stringify(document), "utf8")).digest("hex")}`;
 }
 
-function fakeRecoveryKit(overrides = {}) {
-  return {
-    apiVersion: "hof.dev/recovery-kit/v1",
-    installationId: "inst-1",
-    createdAt: "2026-09-16T00:00:00Z",
-    createdForGeneration: 3,
+// PR 3 review, high findings: publishRecoveryKit()/readRecoveryKit() now
+// both enforce schema-validity AND verifyRecoveryKit() unconditionally
+// (see target-mutate.mjs's own comment on that fix) - a hand-built fake
+// document (the old fakeRecoveryKit() this replaces) can no longer reach
+// either function's own success path at all. Every test below now goes
+// through a GENUINELY valid kit instead, built via the real
+// createRecoveryKit() against the same fake-age seam
+// recovery-kit.test.mjs already established (verify for real once by
+// hand, fake for the fast suite - see that fixture's own header comment).
+const fakeAgeDir = path.join(root, "test/fixtures/recovery-kit-fake-age");
+
+async function withFakeAge(fn) {
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${fakeAgeDir}${path.delimiter}${originalPath}`;
+  try {
+    return await fn();
+  } finally {
+    process.env.PATH = originalPath;
+  }
+}
+
+async function realRecoveryKit(payloadOverrides = {}, createdAt) {
+  const { createRecoveryKit } = await import("../scripts/recovery-kit.mjs");
+  return withFakeAge(() => createRecoveryKit({
+    payload: {
+      installationId: "inst-1", generation: 1, sanitizedManifest: {},
+      releaseLock: { document: {}, signature: "s", certificate: "c", signingIdentity: "i", oidcIssuer: "o" },
+      backupToolLock: { document: {}, signature: "s", certificate: "c", signingIdentity: "i", oidcIssuer: "o" },
+      applicationSecrets: { a: "b" }, destinationCredentials: {},
+      ...payloadOverrides,
+    },
     ageRecipient: `age1${"q".repeat(58)}`,
-    ageRecipientFingerprint: `sha256:${"a".repeat(64)}`,
-    contentInventory: ["application-secrets"],
-    ciphertextDigest: `sha256:${"b".repeat(64)}`,
-    ciphertext: "Zm9v".repeat(60),
-    ...overrides,
-  };
+    createdAt,
+  }));
 }
 
 test("publishRecoveryKit: embeds the kit as a base64 payload, a real target-side digest re-check, and runs inside the same lock guard every other atomic create in this module uses", async () => {
-  const kit = fakeRecoveryKit();
-  const expectedDigest = `sha256:${"c".repeat(64)}`;
+  const kit = await realRecoveryKit();
+  const expectedDigest = transportDigest(kit);
   const { run, calls } = mockRun({ sshStdout: "HOF_RECOVERY_PUBLISHED\n" });
   const result = await publishRecoveryKit({ ...SSH_TARGET, run }, kit, expectedDigest);
   assert.deepEqual(result, { published: true });
@@ -1073,26 +1094,55 @@ test("publishRecoveryKit: embeds the kit as a base64 payload, a real target-side
   assert.match(script, /mktemp '.*recovery-kit\.json\.XXXXXX'/, "must use the same mktemp+ln atomic-create discipline, never a fixed tmp name");
   assert.match(script, /sha256sum/, "must recompute the received bytes' own digest target-side before ever committing the create");
   assert.match(script, new RegExp(expectedDigest.replace(/[.+*?^${}()|[\]\\]/g, "\\$&")), "the caller's own expected digest must be embedded for the target-side comparison");
+  // PR 3 review, high finding: the digest check must run BEFORE the
+  // atomic `ln` into the final path, never after - see
+  // publishRecoveryKitScript's own comment. Confirmed here at the
+  // script-shape level: "ln" must never appear before the digest
+  // comparison it's gated behind.
+  assert.ok(script.indexOf("actual_digest=") < script.indexOf(" ln "), "the digest must be verified on the temp file before the atomic ln, never after");
 });
 
 test("publishRecoveryKit: a target that already has a kit (any digest) is never silently overwritten - reports existing", async () => {
-  const kit = fakeRecoveryKit();
-  const existing = fakeRecoveryKit({ createdAt: "2020-01-01T00:00:00Z" });
+  const kit = await realRecoveryKit();
+  const existing = await realRecoveryKit({}, "2020-01-01T00:00:00Z");
   const { run } = mockRun({ sshStdout: `HOF_RECOVERY_EXISTS\n${JSON.stringify(existing)}` });
-  const result = await publishRecoveryKit({ ...SSH_TARGET, run }, kit, `sha256:${"c".repeat(64)}`);
+  const result = await publishRecoveryKit({ ...SSH_TARGET, run }, kit, transportDigest(kit));
   assert.deepEqual(result, { published: false, existing });
 });
 
 test("publishRecoveryKit: a real HOF_RECOVERY_DIGEST_MISMATCH response is refused with a clear, distinct error - never silently treated as success", async () => {
+  const kit = await realRecoveryKit();
   const { run } = mockRun({ sshStdout: "HOF_RECOVERY_DIGEST_MISMATCH\n" });
   await assert.rejects(
-    () => publishRecoveryKit({ ...SSH_TARGET, run }, fakeRecoveryKit(), `sha256:${"c".repeat(64)}`),
+    () => publishRecoveryKit({ ...SSH_TARGET, run }, kit, transportDigest(kit)),
     /recomputed digest of the received bytes did not match/,
   );
 });
 
-test("readRecoveryKit: present/unreadable/absent all parse distinctly, present validated for a real apiVersion", async () => {
-  const kit = fakeRecoveryKit();
+// PR 3 review, critical finding: expectedDigest used to reach a
+// single-quoted root shell script with NO format validation at all - a
+// value containing a literal "'" would close the quote early and inject
+// arbitrary commands into a root-privileged script. Now rejected before
+// any script is ever built (validateDigest(), regex-anchored
+// `^sha256:[0-9a-f]{64}$`) - confirmed here with a real, genuinely valid
+// kit (so the rejection is unambiguously about the digest, not some
+// other, incidental validation failure) and a `run` that throws if ever
+// called, proving the script is never even built, let alone sent.
+test("publishRecoveryKit: a digest string carrying a shell metacharacter is rejected before any script is ever built - the critical command-injection finding's own regression test", async () => {
+  const kit = await realRecoveryKit();
+  const run = async () => { throw new Error("run() must never be called - the injection guard must reject before any script is built"); };
+  await assert.rejects(
+    () => publishRecoveryKit({ ...SSH_TARGET, run }, kit, "sha256:aaaa'; rm -rf / #"),
+    /is not a valid sha256 digest/,
+  );
+  await assert.rejects(
+    () => publishRecoveryKit({ ...SSH_TARGET, run }, kit, `sha256:${"g".repeat(64)}`), // 'g' is not hex
+    /is not a valid sha256 digest/,
+  );
+});
+
+test("readRecoveryKit: present/unreadable/absent all parse distinctly, a genuinely valid present kit returned as-is", async () => {
+  const kit = await realRecoveryKit();
   const present = await readRecoveryKit({ ...SSH_TARGET, run: mockRun({ sshStdout: `HOF_MUTATE_PRESENT\n${JSON.stringify(kit)}` }).run });
   assert.deepEqual(present, { status: "present", kit });
   const unreadable = await readRecoveryKit({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_UNREADABLE\n" }).run });
@@ -1101,11 +1151,36 @@ test("readRecoveryKit: present/unreadable/absent all parse distinctly, present v
   assert.deepEqual(absent, { status: "absent", kit: null });
 });
 
-test("readRecoveryKit: refuses a present document with the wrong apiVersion, rather than returning it as if it were a real recovery kit", async () => {
+test("readRecoveryKit: refuses a present document with the wrong apiVersion (schema-invalid), rather than returning it as if it were a real recovery kit", async () => {
   const wrongDoc = { apiVersion: "hof.dev/operation-lock/v2", operationId: OPERATION_ID };
   await assert.rejects(
     () => readRecoveryKit({ ...SSH_TARGET, run: mockRun({ sshStdout: `HOF_MUTATE_PRESENT\n${JSON.stringify(wrongDoc)}` }).run }),
-    /not a well-formed recovery-kit-v1 document/,
+    /not schema-valid/,
+  );
+});
+
+// PR 3 review, high finding: readRecoveryKit() used to check only a
+// minimal apiVersion match, never the full recovery-kit-v1 schema nor
+// verifyRecoveryKit() - "any direct caller" of this raw primitive could
+// be handed back a schema-valid-shaped but fake (non-age) document as if
+// it were real. Both checks now run unconditionally on every "present"
+// result.
+test("readRecoveryKit: refuses a schema-valid but fake, non-age document - verifyRecoveryKit() now runs unconditionally on every present result", async () => {
+  const fakeCiphertext = Buffer.from("not a real age payload, padded well past the schema's own 200-char minLength requirement on the base64 form - 0123456789".repeat(2), "utf8");
+  const schemaValidButFakeKit = {
+    apiVersion: "hof.dev/recovery-kit/v1",
+    installationId: "inst-1",
+    createdAt: "2026-09-16T00:00:00Z",
+    createdForGeneration: 1,
+    ageRecipient: `age1${"q".repeat(58)}`,
+    ageRecipientFingerprint: `sha256:${createHash("sha256").update(Buffer.from(`age1${"q".repeat(58)}`, "utf8")).digest("hex")}`,
+    contentInventory: ["application-secrets"],
+    ciphertextDigest: `sha256:${createHash("sha256").update(fakeCiphertext).digest("hex")}`,
+    ciphertext: fakeCiphertext.toString("base64"),
+  };
+  await assert.rejects(
+    () => readRecoveryKit({ ...SSH_TARGET, run: mockRun({ sshStdout: `HOF_MUTATE_PRESENT\n${JSON.stringify(schemaValidButFakeKit)}` }).run }),
+    /failed verifyRecoveryKit/,
   );
 });
 
@@ -1120,7 +1195,7 @@ test("readRecoveryKit: refuses a present document with the wrong apiVersion, rat
 test("publishRecoveryKit: a real atomic create - first publish succeeds, a second publish (any content) is refused as existing, root-only permissions, no plaintext ever written", async () => {
   const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-recovery-kit-atomicity-"));
   try {
-    const kit = fakeRecoveryKit();
+    const kit = await realRecoveryKit();
     const expectedDigest = transportDigest(kit);
 
     const first = mockRun({ sshStdout: "HOF_RECOVERY_PUBLISHED\n" });
@@ -1136,7 +1211,7 @@ test("publishRecoveryKit: a real atomic create - first publish succeeds, a secon
     assert.equal((stat.mode & 0o777).toString(8), "600", "the kit file must be root-only (0600), never group/world-readable");
 
     // A second, DIFFERENT kit must never silently replace the first.
-    const secondKit = fakeRecoveryKit({ createdAt: "2030-01-01T00:00:00Z" });
+    const secondKit = await realRecoveryKit({}, "2030-01-01T00:00:00Z");
     const secondDigest = transportDigest(secondKit);
     const second = mockRun({ sshStdout: "HOF_RECOVERY_PUBLISHED\n" });
     await publishRecoveryKit({ ...SSH_TARGET, run: second.run }, secondKit, secondDigest);
@@ -1161,25 +1236,8 @@ test("publishRecoveryKit: a real atomic create - first publish succeeds, a secon
 // createRecoveryKit -> publishRecoveryKit pipeline, not just this one
 // function's own script-building in isolation.
 test("publishRecoveryKit: the generated script carries the kit's own ciphertext only - a real secret value the kit was built around never appears anywhere in it, plaintext", async () => {
-  const { createRecoveryKit } = await import("../scripts/recovery-kit.mjs");
-  const fakeAgeDir = path.join(root, "test/fixtures/recovery-kit-fake-age");
-  const originalPath = process.env.PATH;
-  process.env.PATH = `${fakeAgeDir}${path.delimiter}${originalPath}`;
   const distinctiveSecret = "hof-test-distinctive-plaintext-marker-9f3c7a1e";
-  let kit;
-  try {
-    kit = await createRecoveryKit({
-      payload: {
-        installationId: "inst-1", generation: 1, sanitizedManifest: {},
-        releaseLock: { document: {}, signature: "s", certificate: "c", signingIdentity: "i", oidcIssuer: "o" },
-        backupToolLock: { document: {}, signature: "s", certificate: "c", signingIdentity: "i", oidcIssuer: "o" },
-        applicationSecrets: { marker: distinctiveSecret }, destinationCredentials: {},
-      },
-      ageRecipient: `age1${"q".repeat(58)}`,
-    });
-  } finally {
-    process.env.PATH = originalPath;
-  }
+  const kit = await realRecoveryKit({ applicationSecrets: { marker: distinctiveSecret } });
   const expectedDigest = transportDigest(kit);
   const { run, calls } = mockRun({ sshStdout: "HOF_RECOVERY_PUBLISHED\n" });
   await publishRecoveryKit({ ...SSH_TARGET, run }, kit, expectedDigest);

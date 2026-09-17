@@ -42,8 +42,9 @@ import { fileURLToPath } from "node:url";
 
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
+import YAML from "yaml";
 
-import { hasDuplicates } from "./backup-ids.mjs";
+import { validateBackupCredentials, validateCredentialEntry } from "./backup-credentials.mjs";
 import { verifyRecoveryKit } from "./backup-flow.mjs";
 import { sha256 } from "./digest.mjs";
 import { readSecretsStore, requiredSecrets } from "./secrets.mjs";
@@ -86,6 +87,17 @@ function isPlainObject(value) {
 
 function isNonEmptyString(value) {
   return typeof value === "string" && value.length > 0;
+}
+
+// A real Buffer/Uint8Array with at least one byte - what
+// assembleRecoveryPayload() requires for manifestBytes/releaseLockBytes/
+// backupToolLockBytes, specifically to rule out a caller passing a
+// pre-parsed object (or a plain string, which sha256() would silently
+// digest differently than the real file bytes would) where only the
+// EXACT raw bytes a trusted digest was computed from can ever bind
+// correctly.
+function isByteSource(value) {
+  return (Buffer.isBuffer(value) || value instanceof Uint8Array) && value.length > 0;
 }
 
 const SIGNED_BUNDLE_STRING_FIELDS = ["signature", "certificate", "signingIdentity", "oidcIssuer"];
@@ -159,13 +171,20 @@ export function validateClosedRecoveryPayload(payload) {
     }
   }
 
+  // PR 3 review, high finding: this used to check only entry.type's own
+  // enum, never the per-type required fields (resticPassword; s3 also
+  // needs accessKeyId/secretAccessKey), never closed-field semantics (an
+  // unexpected stray field silently passing through) - a decrypted kit
+  // could pass this check while being genuinely useless for restore
+  // (e.g. an s3 credential missing its own accessKeyId). Reuses
+  // backup-credentials.mjs's own validateCredentialEntry() - the exact
+  // same per-entry shape check validateBackupCredentials() itself runs -
+  // rather than a second, weaker, parallel implementation.
   if (!isPlainObject(payload.destinationCredentials)) {
     violations.push("recovery payload destinationCredentials must be an object");
   } else {
     for (const [ref, entry] of Object.entries(payload.destinationCredentials)) {
-      if (!isPlainObject(entry) || (entry.type !== "local" && entry.type !== "s3")) {
-        violations.push(`recovery payload destinationCredentials["${ref}"] is not a well-typed credential entry`);
-      }
+      violations.push(...validateCredentialEntry(`recovery payload destinationCredentials["${ref}"]`, entry));
     }
   }
 
@@ -337,42 +356,71 @@ export function sanitizeManifest(manifest) {
 // there is deliberately no way to pass those as free-standing, unbound
 // metadata.
 //
-// manifest/catalog: the services.yml/catalog this backup was actually
-// planned against - manifest.tls.mode must be "supplied" (the only mode
-// with any real TLS source material on the workstation at all; see this
-// module's own top comment and ADR 0006's own fixed decision) or this
-// throws before ever touching age, encryption, or any other input.
-// enabledIds: exactly what apply.mjs's own ensureSecretsAvailable()
-// already computes this the same way for - the services actually enabled
-// by this manifest, used to filter applicationSecrets down to only what
-// THIS deployment currently needs (never a whole, possibly-stale secrets
-// store carrying leftovers from a service disabled generations ago).
+// manifestBytes/catalog: the EXACT raw bytes services.yml was actually
+// read as (never a pre-parsed object - see this function's own review-
+// finding comment below on why) and the release-owned catalog needed to
+// resolve public hostnames for TLS. manifest.tls.mode must be "supplied"
+// (the only mode with any real TLS source material on the workstation at
+// all; see this module's own top comment and ADR 0006's own fixed
+// decision) or this throws before ever touching age, encryption, or any
+// other input. enabledIds: exactly what apply.mjs's own
+// ensureSecretsAvailable() already computes this the same way for - the
+// services actually enabled by this manifest, used to filter
+// applicationSecrets down to only what THIS deployment currently needs
+// (never a whole, possibly-stale secrets store carrying leftovers from a
+// service disabled generations ago).
 //
-// releaseLock/releaseLockSignature/releaseLockCertificate/
+// releaseLockBytes/releaseLockSignature/releaseLockCertificate/
 // releaseLockSigningIdentity/releaseLockOidcIssuer,
-// backupToolLock/backupToolLockSignature/backupToolLockCertificate: the
-// exact historical, already-signature-verified artifacts this generation
-// was actually deployed/backed up with - this function accepts and
-// embeds them verbatim (present/non-empty shape only), it does not
-// itself re-verify their Cosign signatures (that is validate-deployment.
-// mjs's own established job, already run once by whichever caller
-// obtained these in the first place - re-running it here would just be a
-// second, redundant trust decision over the same bytes, not a stronger
-// one).
+// backupToolLockBytes/backupToolLockSignature/backupToolLockCertificate/
+// expectedBackupToolLockDigest: the exact historical, already-signature-
+// verified artifacts this generation was actually deployed/backed up
+// with. This function still does not itself re-verify their Cosign
+// signatures (that stays validate-deployment.mjs's own established job,
+// already run once by whichever caller obtained these bytes in the first
+// place - re-running it here would just be a second, redundant trust
+// decision over the same bytes, not a stronger one) - but it DOES now
+// cryptographically bind them to the declared state/generation before
+// ever trusting them as "the" provenance for this kit:
+//
+// PR 3 review, high finding: this function used to accept manifest/
+// releaseLock/backupToolLock as independent, already-parsed objects with
+// NO binding at all to state's own installationId/generation beyond the
+// caller's own say-so - a kit could carry a sanitizedManifest, release
+// lock, and tool lock that were internally well-shaped but had nothing
+// to do with the generation actually being recovered (swapped, stale, or
+// simply mismatched inputs from a confused caller), and nothing here
+// would ever notice. Fixed: manifestBytes/releaseLockBytes are now
+// required as raw bytes, never a pre-parsed object, specifically so this
+// function can independently recompute sha256(bytes) and cross-check it
+// against state.manifestDigest/state.releaseLockDigest - state-v1's own
+// established digest fields, the same formula apply.mjs's own real
+// commit path already uses (sha256 of the raw file bytes, never a
+// canonicalized/re-serialized form). A mismatch means these bytes were
+// NOT what this installation's own trusted state record says was
+// actually applied at this generation, and the whole assembly refuses
+// before ever reaching age. backup-tool-lock has no such state-v1 field
+// of its own (ADR 0006's own decision: it is deliberately independent of
+// any platform generation) - expectedBackupToolLockDigest is instead a
+// required parameter the CALLER supplies from whatever their own trusted
+// source for "the currently-pinned backup tool" is, bound the same way.
 //
 // destinations/destinationCredentials: backup-policy-v1's own
-// destinations array and the already-decrypted typed credentials store
-// (see backup-credentials.mjs's own validateBackupCredentials()) -
-// cross-checked for exact sufficiency before ever being embedded.
+// destinations array and the already-decrypted typed credentials store -
+// validated via backup-credentials.mjs's own validateBackupCredentials()
+// (exact secretRef sufficiency, per-type required fields, no foreign/
+// stale entries) and filtered down to exactly those refs before ever
+// being embedded - see this function's own review-finding comment further
+// below.
 export async function assembleRecoveryPayload({
   state,
-  manifest,
+  manifestBytes,
   catalog,
   enabledIds,
   secretsStorePath,
   secretsIdentityFile,
-  releaseLock, releaseLockSignature, releaseLockCertificate, releaseLockSigningIdentity, releaseLockOidcIssuer,
-  backupToolLock, backupToolLockSignature, backupToolLockCertificate,
+  releaseLockBytes, releaseLockSignature, releaseLockCertificate, releaseLockSigningIdentity, releaseLockOidcIssuer,
+  backupToolLockBytes, backupToolLockSignature, backupToolLockCertificate, expectedBackupToolLockDigest,
   destinations,
   destinationCredentials,
   // Injectable ONLY for readSecretsStore()'s own sake (secrets.mjs's own
@@ -392,6 +440,35 @@ export async function assembleRecoveryPayload({
   if (!isPlainObject(state) || !isNonEmptyString(state.installationId) || !Number.isInteger(state.generation) || state.generation < 1) {
     throw new Error("assembleRecoveryPayload requires a trusted state document with a real installationId and generation - installationId/generation are never accepted as free-standing metadata");
   }
+  if (!isByteSource(manifestBytes) || !isByteSource(releaseLockBytes) || !isByteSource(backupToolLockBytes)) {
+    throw new Error("assembleRecoveryPayload requires manifestBytes/releaseLockBytes/backupToolLockBytes as the exact raw bytes each was actually read as - never a pre-parsed object, which could never be bound to state's own trusted digests");
+  }
+  if (!isNonEmptyString(state.manifestDigest)) {
+    throw new Error("assembleRecoveryPayload requires state.manifestDigest - a trusted state record with no manifestDigest can never bind this kit's own sanitizedManifest to a real, applied generation");
+  }
+  const actualManifestDigest = sha256(manifestBytes);
+  if (actualManifestDigest !== state.manifestDigest) {
+    throw new Error(`assembleRecoveryPayload: manifestBytes does not match state.manifestDigest (state says ${state.manifestDigest}, manifestBytes actually hashes to ${actualManifestDigest}) - refusing to bind a recovery kit's own sanitizedManifest to artifacts that do not actually match the declared generation`);
+  }
+  if (!isNonEmptyString(state.releaseLockDigest)) {
+    throw new Error("assembleRecoveryPayload requires state.releaseLockDigest - a trusted state record with no releaseLockDigest can never bind this kit's own release lock to a real, applied generation");
+  }
+  const actualReleaseLockDigest = sha256(releaseLockBytes);
+  if (actualReleaseLockDigest !== state.releaseLockDigest) {
+    throw new Error(`assembleRecoveryPayload: releaseLockBytes does not match state.releaseLockDigest (state says ${state.releaseLockDigest}, releaseLockBytes actually hashes to ${actualReleaseLockDigest}) - refusing to bind a recovery kit's own release lock to artifacts that do not actually match the declared generation`);
+  }
+  if (!isNonEmptyString(expectedBackupToolLockDigest)) {
+    throw new Error("assembleRecoveryPayload requires expectedBackupToolLockDigest - backup-tool-lock has no state-v1 field of its own to bind against (ADR 0006's own decision: it is independent of any platform generation), so the caller's own trusted digest is this binding's only source");
+  }
+  const actualBackupToolLockDigest = sha256(backupToolLockBytes);
+  if (actualBackupToolLockDigest !== expectedBackupToolLockDigest) {
+    throw new Error(`assembleRecoveryPayload: backupToolLockBytes does not match expectedBackupToolLockDigest (expected ${expectedBackupToolLockDigest}, backupToolLockBytes actually hashes to ${actualBackupToolLockDigest}) - refusing to bind a recovery kit to a tool lock that does not actually match the caller's own trusted digest`);
+  }
+
+  const manifest = YAML.parse(manifestBytes.toString("utf8"));
+  const releaseLock = JSON.parse(releaseLockBytes.toString("utf8"));
+  const backupToolLock = JSON.parse(backupToolLockBytes.toString("utf8"));
+
   if (manifest?.tls?.mode !== "supplied") {
     throw new Error(`assembleRecoveryPayload requires manifest.tls.mode === "supplied" (found ${JSON.stringify(manifest?.tls?.mode)}) - TLS without fully-defined source material on this workstation blocks recovery kit creation before any encryption ever happens; only supplied TLS has real private key material here to recover at all`);
   }
@@ -416,12 +493,33 @@ export async function assembleRecoveryPayload({
   const applicationSecrets = {};
   for (const { name } of requiredSecretsList) applicationSecrets[name] = decryptedStore[name];
 
-  if (hasDuplicates(destinations ?? [], (d) => d.secretRef)) {
-    throw new Error("assembleRecoveryPayload: destinations has a duplicate secretRef");
+  // PR 3 review, high finding: this used to run its own weaker, partial
+  // inline check (duplicates + missing only) and then embed the WHOLE
+  // destinationCredentials object verbatim - never checking for foreign/
+  // stale entries (a credential left over from a destination no longer
+  // in the policy, or simply an unrelated one sitting in a broader
+  // credentials store the caller happens to hold), never checking
+  // per-type required fields or type match against the destination
+  // actually using each ref. Fixed by SCOPING first (copying only the
+  // refs `destinations` itself actually names, ignoring anything else in
+  // the caller's own store - a real caller's own destinationCredentials
+  // may legitimately be broader than what THIS kit needs, e.g. a store
+  // still carrying a since-removed destination's own credential; that
+  // must never block assembly, it must simply never be embedded), THEN
+  // validating that scoped subset via backup-credentials.mjs's own
+  // validateBackupCredentials() (the same strict, policy-derived check
+  // this module was built alongside) - missing/malformed/wrongly-typed
+  // entries for a destination THIS kit actually uses still refuse
+  // assembly outright; anything else in the caller's own broader store
+  // is simply never looked at, and so can never leak into the kit
+  // either way.
+  const scopedDestinationCredentials = {};
+  for (const { secretRef } of destinations ?? []) {
+    if (secretRef in (destinationCredentials ?? {})) scopedDestinationCredentials[secretRef] = destinationCredentials[secretRef];
   }
-  const missingDestinationRefs = (destinations ?? []).map((d) => d.secretRef).filter((ref) => !(ref in (destinationCredentials ?? {})));
-  if (missingDestinationRefs.length > 0) {
-    throw new Error(`assembleRecoveryPayload: destinationCredentials is missing credential(s) for secretRef(s): ${missingDestinationRefs.join(", ")}`);
+  const credentialViolations = validateBackupCredentials(destinations ?? [], scopedDestinationCredentials);
+  if (credentialViolations.length > 0) {
+    throw new Error(`assembleRecoveryPayload: destinationCredentials is not valid for the given destinations: ${credentialViolations.join("; ")}`);
   }
 
   for (const [label, bundle] of [["releaseLock", releaseLock], ["backupToolLock", backupToolLock]]) {
@@ -468,7 +566,7 @@ export async function assembleRecoveryPayload({
       certificatePem: suppliedTlsMaterial.certificatePem,
       privateKeyPem: suppliedTlsMaterial.privateKeyPem,
     },
-    destinationCredentials: destinationCredentials ?? {},
+    destinationCredentials: scopedDestinationCredentials,
   };
 
   const violations = validateClosedRecoveryPayload(payload);

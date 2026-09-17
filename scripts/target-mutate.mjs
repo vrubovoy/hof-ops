@@ -11,9 +11,14 @@
 // Like target-probe.sh, every command here is one of a small fixed
 // vocabulary, never a caller-built shell string - the only value ever
 // embedded into a script is a base64 payload (produced by this module
-// itself from an already schema-validated document) or an operationId
+// itself from an already schema-validated document), an operationId
 // (already regex-validated to a bare UUID before it ever reaches here),
-// both safe to place directly inside single quotes.
+// or (recovery-kit publishing) a sha256 digest string (regex-validated
+// the same way - see DIGEST_PATTERN below; PR 3's own review found this
+// invariant had one real gap: publishRecoveryKit()'s own expectedDigest
+// reached a single-quoted shell context with no validation at all,
+// a genuine command-injection path for any value containing a literal
+// single quote), all safe to place directly inside single quotes.
 //
 // Unlike target-inspector.mjs (which supports both known-hosts-file and
 // host-key-sha256 trust modes, since it runs before any host key has
@@ -34,9 +39,38 @@
 
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { unlink, writeFile } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import Ajv2020 from "ajv/dist/2020.js";
+import addFormats from "ajv-formats";
+
+// PR 3 (item 10) review, high finding: publishRecoveryKit()/
+// readRecoveryKit() used to accept/return a recovery-kit-v1 document
+// with no schema or verifyRecoveryKit() check of their own at all,
+// trusting every caller to have already validated - this module's own
+// "no schema-specific logic" purity (see this file's own top comment)
+// turned out to be a real gap the reviewer found: nothing actually
+// enforced typed, schema-valid persistence at this specific boundary,
+// so a direct caller (bypassing recovery-kit.mjs's own
+// createRecoveryKit()/openRecoveryKit()) could publish, or be handed
+// back, an arbitrary document. Fixed by validating directly here,
+// exactly once, for real - correctness at this specific boundary
+// matters more than the module's own general "stay schema-free"
+// preference, which stays true everywhere else in this file.
+import { verifyRecoveryKit } from "./backup-flow.mjs";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const RECOVERY_KIT_SCHEMA = JSON.parse(await readFile(path.join(root, "schemas/recovery-kit-v1.schema.json"), "utf8"));
+const recoveryKitAjv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false });
+addFormats(recoveryKitAjv);
+const validateRecoveryKitSchema = recoveryKitAjv.compile(RECOVERY_KIT_SCHEMA);
+
+function recoveryKitSchemaErrors() {
+  return (validateRecoveryKitSchema.errors ?? []).map((error) => `${error.instancePath || "/"}: ${error.message}`).join("; ");
+}
 
 const SSH_HARDENING = [
   "-o", "BatchMode=yes",
@@ -65,6 +99,18 @@ const HOST_KEY_SHA256_PATTERN = /^SHA256:[A-Za-z0-9+/]+=*$/;
 // reused) so a caller passing the wrong kind of id to the wrong
 // validator gets a message naming the thing it actually is.
 const MUTEX_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+// PR 3 (item 10) review, critical finding: publishRecoveryKit()'s own
+// expectedDigest string used to reach a single-quoted shell context with
+// no validation at all - a value containing a literal "'" would close
+// the quote early and inject arbitrary commands into a root-privileged
+// script. Validated the same way every other value embedded into a
+// script here already is (see this file's own top comment).
+const DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
+function validateDigest(digest) {
+  if (typeof digest !== "string" || !DIGEST_PATTERN.test(digest)) throw new Error(`"${digest}" is not a valid sha256 digest`);
+  return digest;
+}
 
 function validateSshDestination(host, user, port) {
   if (typeof host !== "string" || !HOSTNAME_PATTERN.test(host)) throw new Error(`refusing to connect: "${host}" is not a valid hostname`);
@@ -660,6 +706,183 @@ export async function readGenerationSnapshotReleaseLock(conn, generation) {
   const stdout = await runScript(conn, readScript(`${generationSnapshotDir(generation)}/release-lock.json`));
   const { status, value } = parseReadResponse(stdout);
   return { status, releaseLock: value };
+}
+
+// PR 3 (item 10, ADR 0006): the recovery kit's own fixed target-side
+// path - one root-only artifact, deliberately not one-per-generation
+// like generations/NNNNNN/ above (a recovery kit is ROTATED, never
+// accumulated - deciding WHEN a new one supersedes the current one is
+// PR 4/5's own runner work; this module only ever exposes "publish this
+// exact kit, atomically, refusing to silently replace a DIFFERENT one"
+// and "read whatever is currently published").
+const RECOVERY_KIT_PATH = "/var/lib/hof/recovery/recovery-kit.json";
+
+// Same mktemp+ln atomic-create discipline as acquireLockAndJournalScript
+// above, but NOT via atomicExclusiveCreateStep's own black-box form -
+// PR 3's own review found a real, high-severity gap in the original
+// version of this script: it called atomicExclusiveCreateStep() (write
+// temp file, `ln` into the FINAL path, THEN check the digest afterward),
+// so the digest check ran only AFTER the kit was already live at
+// RECOVERY_KIT_PATH. A crash (SSH drop, OOM-kill) in the narrow window
+// between that `ln` succeeding and the digest check/removal running left
+// a corrupted, UNVERIFIED kit durably published forever - this module's
+// own "never overwrite an existing kit" rule (see publishRecoveryKit()'s
+// own comment) means nothing would ever replace it again. Fixed by
+// verifying the digest on the TEMP file, BEFORE the `ln` - a crash before
+// verification leaves at most an orphaned temp file (cleaned up by the
+// next invocation's own opportunistic `rm -f *.??????`, exactly like
+// atomicExclusiveCreateStep's own orphan cleanup), never a live,
+// unverified RECOVERY_KIT_PATH. Run inside withLockGuard() for the same
+// mutual-exclusion reason every atomic create in this module is (the
+// orphan cleanup relies on it); withLockGuard() already sets umask 077,
+// so both the recovery/ directory and the kit file land root-only
+// (0700/0600) with no separate chmod needed - never a plaintext write of
+// any kind, only ever the already-encrypted kit document's own base64
+// payload.
+//
+// expectedDigest: a transport-integrity digest ONLY - sha256 of the
+// EXACT bytes b64() below actually transmits
+// (Buffer.from(JSON.stringify(kitDocument), "utf8"), the same plain,
+// insertion-order serialization b64() itself always uses, never
+// canonicalize()'d key-sorted form). Deliberately NOT
+// backup-ids.mjs's own canonicalDocumentDigest(kit) - that formula
+// computes a DIFFERENT byte string (recursively key-sorted) than what
+// gets transmitted here, so comparing a canonical digest against a
+// plain-JSON re-hash of the received bytes would spuriously mismatch
+// every single time, for any document whose own key order isn't already
+// alphabetical (confirmed for real: this exact mismatch was caught by
+// this function's own real-shell-execution regression test before this
+// comment was written). Whatever this document's own canonical identity
+// is for cross-referencing elsewhere (manifest.recoveryKitDigest, in
+// particular) is a completely separate concern the caller computes
+// however that reference needs it - this parameter exists purely to
+// catch a payload corrupted in transit before it ever becomes the
+// durably-published kit, the same class of defense PR 2's own byte-exact
+// CAS checks established (compare encoded forms, never decoded text -
+// see journalCasCheckScript's own comment for why). Validated by
+// validateDigest() (regex-anchored `^sha256:[0-9a-f]{64}$`) in
+// publishRecoveryKit() below before this function ever runs - a review
+// finding caught this value reaching a single-quoted shell context with
+// no format check at all, a real command-injection path.
+function publishRecoveryKitScript(kitPayload, expectedDigest) {
+  return withLockGuard(`kit_payload='${kitPayload}'
+mkdir -p "$(dirname '${RECOVERY_KIT_PATH}')"
+rm -f '${RECOVERY_KIT_PATH}'.??????
+kit_tmp=$(mktemp '${RECOVERY_KIT_PATH}.XXXXXX')
+printf '%s' "$kit_payload" | base64 -d > "$kit_tmp"
+actual_digest="sha256:$(sha256sum < "$kit_tmp" | awk '{print $1}')"
+if [ "$actual_digest" != '${expectedDigest}' ]; then
+  rm -f "$kit_tmp"
+  echo HOF_RECOVERY_DIGEST_MISMATCH
+elif ln "$kit_tmp" '${RECOVERY_KIT_PATH}' 2>/dev/null; then
+  rm -f "$kit_tmp"
+  echo HOF_RECOVERY_PUBLISHED
+else
+  rm -f "$kit_tmp"
+  echo HOF_RECOVERY_EXISTS
+  if [ -r '${RECOVERY_KIT_PATH}' ]; then
+    cat '${RECOVERY_KIT_PATH}'
+  fi
+fi`);
+}
+
+// Publishes kitDocument (a recovery-kit-v1 document - already built by
+// recovery-kit.mjs's own createRecoveryKit(), never plaintext) to the
+// target's own fixed RECOVERY_KIT_PATH, atomically and exclusively:
+//   - a first publish succeeds: { published: true }.
+//   - an attempt to publish while one is ALREADY present is always
+//     refused outright, whether the existing kit is byte-identical or
+//     genuinely different: { published: false, existing } - this module
+//     never treats a retried publish as an implicit no-op comparison of
+//     its own; a caller that wants "idempotent retry" compares
+//     `existing` against the kit it meant to publish itself. Rotation
+//     (replacing an existing kit with a new one) is always an explicit,
+//     separate, out-of-band decision - never a side effect of calling
+//     this function again with different content.
+// expectedDigest: sha256(Buffer.from(JSON.stringify(kitDocument), "utf8"))
+// - a plain, transport-integrity digest over the EXACT bytes this
+// function is about to transmit, never backup-ids.mjs's own
+// canonicalDocumentDigest() (a different, key-sorted byte string - see
+// publishRecoveryKitScript's own comment for why conflating the two is a
+// real, confirmed bug, not a hypothetical one).
+//
+// PR 3 review, high finding: this function used to accept kitDocument
+// with no validation of its own at all, trusting every caller to have
+// already run it through recovery-kit.mjs's own createRecoveryKit() -
+// "any direct caller" bypassing that (a future bug, a test, a PR 4
+// runner shortcut) could publish an arbitrary document, defeating
+// recovery-kit-v1's own schema and verifyRecoveryKit()'s own real-
+// ciphertext check entirely. Both now run here, unconditionally, before
+// the document ever reaches the target - see this file's own new import
+// comment on why this one boundary imports verifyRecoveryKit() despite
+// this module's own general "stay schema-free" preference.
+//
+// PR 3 review (follow-up round), high finding: the check above only ever
+// covered the NEW kitDocument this call is trying to publish - a
+// HOF_RECOVERY_EXISTS response hands back whatever is ALREADY present on
+// the target, parsed and returned as `existing` with no validation of
+// its OWN at all, silently re-opening the exact gap the fix above closed
+// (a corrupt/foreign document already on disk would be returned as if it
+// were a real kit). Both this function's "existing" path and
+// readRecoveryKit()'s "present" path now share the one validator below,
+// so neither can ever hand back a document that isn't genuinely
+// schema-valid AND verifyRecoveryKit()-clean.
+function ensureValidRecoveryKitDocument(document, context) {
+  if (!validateRecoveryKitSchema(document)) {
+    throw new Error(`${context} is not schema-valid: ${recoveryKitSchemaErrors()} - refusing to return it as one`);
+  }
+  const kitViolations = verifyRecoveryKit(document);
+  if (kitViolations.length > 0) {
+    throw new Error(`${context} failed verifyRecoveryKit(): ${kitViolations.join("; ")} - refusing to return it as one`);
+  }
+}
+
+export async function publishRecoveryKit(conn, kitDocument, expectedDigest) {
+  ensureValidRecoveryKitDocument(kitDocument, "refusing to publish a recovery kit that");
+  validateDigest(expectedDigest);
+  const stdout = await runScript(conn, publishRecoveryKitScript(b64(kitDocument), expectedDigest));
+  const [tag, ...rest] = stdout.split("\n");
+  if (tag === "HOF_RECOVERY_PUBLISHED") return { published: true };
+  if (tag === "HOF_RECOVERY_EXISTS") {
+    const existingText = rest.join("\n").trim();
+    const existing = existingText ? JSON.parse(existingText) : null;
+    if (existing !== null) {
+      ensureValidRecoveryKitDocument(existing, `the recovery kit already present at ${RECOVERY_KIT_PATH}`);
+    }
+    return { published: false, existing };
+  }
+  if (tag === "HOF_RECOVERY_DIGEST_MISMATCH") {
+    throw new Error("refusing to publish a recovery kit: the target's own recomputed digest of the received bytes did not match the expected canonical digest - a corrupted transfer, never silently accepted");
+  }
+  throw new Error(`unexpected target-mutate response publishing the recovery kit: ${JSON.stringify(stdout)}`);
+}
+
+// Reads whatever is currently published at RECOVERY_KIT_PATH -
+// present/unreadable/absent, exactly like readLock/readJournal's own
+// status shape.
+//
+// PR 3 review, high finding: this function used to run only a minimal
+// structural check (a real object, the right apiVersion) on a "present"
+// document - the SAME gap as publishRecoveryKit()'s own (above): "any
+// direct caller" of this raw primitive got back an unvalidated document,
+// never actually routed through recovery-kit-v1's own schema or
+// verifyRecoveryKit(). Both now run here too, unconditionally, on any
+// "present" result, before it's ever returned - a target-side file that
+// is schema-invalid, or schema-valid but not a genuine age payload
+// (verifyRecoveryKit()'s own check), is refused exactly like an
+// obviously-wrong document always was, never handed back as if it were
+// a real kit. recovery-kit.mjs's own openRecoveryKit() still performs
+// the FURTHER age-decrypt + closed-payload-shape validation this
+// function never attempts (it has no identity to decrypt with) - this
+// is the schema/verifyRecoveryKit() half of that same discipline, now
+// guaranteed rather than merely expected of a well-behaved caller.
+export async function readRecoveryKit(conn) {
+  const stdout = await runScript(conn, readScript(RECOVERY_KIT_PATH));
+  const { status, value } = parseReadResponse(stdout);
+  if (status === "present") {
+    ensureValidRecoveryKitDocument(value, `the recovery kit at ${RECOVERY_KIT_PATH}`);
+  }
+  return { status, kit: value };
 }
 
 // Atomic write-then-rename (ADR 0004: "only ever atomically") - the

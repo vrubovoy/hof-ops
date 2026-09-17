@@ -437,6 +437,90 @@ third review round found nothing bound a kit's own `installationId`/
 digest to the `recoveryKitDigest` a plan/manifest declares.
 `validateBackupBundle()`/`validateRestoreBundle()` now accept an
 optional `kit` and check exactly that.
+**Implemented in PR 3 (item 10) as `scripts/recovery-kit.mjs`'s
+`createRecoveryKit()`/`openRecoveryKit()`** - the single typed boundary
+every application secret, TLS private key, and backup-destination
+credential this platform ever puts into a recovery kit passes through,
+and nowhere else. Encrypts/decrypts by shelling out to a real, pinned
+`age` binary (never a bundled crypto library - matching
+`backup-tool-lock-v1`'s own `pinnedTools.age`), to the external recipient
+alone, never also to the operator's own day-to-day key the way
+`scripts/secrets.mjs`'s own `writeSecretsStore()` does for application
+secrets. `assembleRecoveryPayload()` builds the closed plaintext payload
+from already-existing, already-validated inputs - `readSecretsStore()`
+for application secrets (filtered to exactly what the current
+manifest/enabledIds actually require, never a whole, possibly-stale
+store), `scripts/supplied-tls.mjs`'s own `readSuppliedTlsMaterial()` for
+TLS (which requires `manifest.tls.mode === "supplied"`; `acme-http01` has
+no real private-key material on the workstation at all, so recovery-kit
+creation is refused before any encryption ever happens - a fixed,
+deliberate limitation this PR does not yet address), and a caller-
+supplied trusted `state-v1` document for `installationId`/`generation`
+(never accepted as free-standing metadata a caller could pass
+inconsistently). A PR3 review round found the original signature accepted
+`manifest`/`releaseLock`/`backupToolLock` as independent, already-parsed
+objects with nothing actually binding them to that trusted `state-v1`
+document - internally well-shaped but stale or swapped provenance could
+still pass. `assembleRecoveryPayload()` now takes raw bytes
+(`manifestBytes`/`releaseLockBytes`/`backupToolLockBytes`, each checked
+via `isByteSource()` to rule out a pre-parsed object) and cryptographically
+binds them before ever parsing: `sha256(manifestBytes)` and
+`sha256(releaseLockBytes)` must equal `state.manifestDigest`/
+`state.releaseLockDigest` - the same raw-bytes formula `apply.mjs`'s own
+commit path uses, not `backup-ids.mjs`'s canonicalized
+`canonicalDocumentDigest()`, which is a genuinely different formula.
+`backup-tool-lock-v1` is deliberately independent of any platform
+generation (its own tag namespace, `backup-tool-vX.Y.Z`), so it carries
+no `state-v1` field to bind against; the caller must instead supply an
+explicit, trusted `expectedBackupToolLockDigest` that `sha256
+(backupToolLockBytes)` is checked against the same way. Only once all
+three bindings hold does the function parse the bytes
+(`YAML.parse`/`JSON.parse`) and proceed. `scripts/backup-credentials.mjs`
+is a second, genuinely separate typed store for backup-destination
+credentials (`resticPassword` plus, for `s3`, `accessKeyId`/
+`secretAccessKey`/an optional `sessionToken`) - deliberately not folded
+into `secrets.mjs`'s own application-secrets vocabulary, since the two
+serve unrelated lifecycles and a name collision between them must never be
+possible. The same review round found `assembleRecoveryPayload()` was
+embedding a caller's whole `destinationCredentials` store verbatim, with
+only a weak inline check - a legitimately broader or stale store could
+leak foreign entries into the kit, and `validateClosedRecoveryPayload()`
+itself only checked the credential `type` enum, never per-type required
+fields. Fixed by extracting a single `validateCredentialEntry(label,
+entry)` (per-type required/optional/closed-field shape check) that both
+`backup-credentials.mjs`'s own `validateBackupCredentials()` and
+`recovery-kit.mjs`'s `validateClosedRecoveryPayload()` now share, and by
+having `assembleRecoveryPayload()` first *scope* the input
+`destinationCredentials` down to only the secretRefs the current
+`destinations` array actually references, then validate that scoped
+subset via `validateBackupCredentials()` - a broader store never blocks
+assembly and never leaks extras into the kit, but anything actually
+referenced and missing or malformed still fails closed.
+`scripts/target-mutate.mjs` gained a matching atomic, root-only
+target-side primitive (`publishRecoveryKit()`/`readRecoveryKit()`, under
+`/var/lib/hof/recovery/`). Unlike `acquireLockAndJournalScript()`'s own
+mktemp+ln-then-check pattern, the recovery-kit publish script verifies
+the target-side re-computed transport-integrity digest (distinct from,
+and in addition to, `verifyRecoveryKit()`'s own internal-consistency
+check) against the temp file *before* the atomic `ln` - the same review
+round found the original ln-then-check ordering could leave an
+unverified, corrupted kit live at the final path forever if the script
+were interrupted between the two steps, since a publish while anything
+already exists there is always refused outright (rotation is always an
+explicit, out-of-band decision a later PR's runner makes, never an
+implicit side effect of calling this again). The digest itself is
+regex-validated (`sha256:` + 64 lowercase hex) before it is ever
+interpolated into the single-quoted shell script - the same round found
+an unvalidated digest reaching that context was a real shell-injection
+vector. `publishRecoveryKit()`/`readRecoveryKit()` both also validate the
+full document against the `recovery-kit-v1` schema and
+`verifyRecoveryKit()` unconditionally (a deliberate, narrowly-scoped
+exception to this module's stated no-schema-logic purity, since these are
+the only functions in it that own a persistence boundary for a specific
+document type) - a caller of either primitive directly can no longer
+bypass either check. No executor, runner, Ansible role, systemd unit, or
+`hofctl backup`/`hofctl restore` CLI surface exists yet - PR 3 delivers
+primitives only, exactly as PR 2 did for the mutex.
 
 **Backup Flow - the fixed, typed operation whitelist
 `backup-plan-v1.schema.json` encodes.** Planning-time (never dispatched

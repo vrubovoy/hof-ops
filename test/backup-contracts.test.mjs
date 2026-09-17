@@ -1382,6 +1382,25 @@ test("validateBackupBundle: a kit is bound to the plan's own installation/genera
   assert.ok(v3.some((v) => v.includes("manifest.recoveryKitDigest does not match the supplied kit")), JSON.stringify(v3));
 });
 
+// PR 3 (item 10): a kit binding to the right plan/installation/generation
+// (and to the manifest's own recoveryKitDigest) is still only a decoy
+// shaped like a real kit unless its own ciphertext is genuinely age
+// output - verifyRecoveryKit() is what actually proves that, and this
+// bundle validator now runs it on every kit it's given (see
+// scripts/backup-flow.mjs's own comment on this exact addition). Before
+// that wiring, a schema-valid document with the right ids but a garbage
+// ciphertext (any base64 string long enough to clear the schema's own
+// minLength) would have sailed straight through this same call with zero
+// violations.
+test("validateBackupBundle: a schema-valid kit with the right bindings but a fake, non-age ciphertext is still refused - id/digest bindings alone are never sufficient", () => {
+  const plan = buildBackupPlan();
+  const fakeCiphertext = Buffer.from("not a real age payload, just long enough to clear the schema's own 200-char minLength requirement - 0123456789", "utf8");
+  const kit = buildRecoveryKit({ ciphertext: fakeCiphertext.toString("base64"), ciphertextDigest: sha256(fakeCiphertext) });
+  const manifest = buildBackupManifest({ recoveryKitDigest: canonicalDocumentDigest(kit) }, { plan });
+  const violations = validateBackupBundle({ plan, manifest, kit });
+  assert.ok(violations.some((v) => v.includes("age-encryption.org/v1 magic header")), JSON.stringify(violations));
+});
+
 test("validateBackupBundle: a genuinely coherent bundle including lock, journal, and events has zero violations", () => {
   const policy = buildBackupPolicy();
   const plan = buildBackupPlan({}, { policy });
@@ -1558,6 +1577,20 @@ test("validateRestoreBundle: a kit is bound to the plan's own source installatio
 
   const planWithStaleKitDigest = buildRestorePlan({ recoveryKitDigest: sha("0") }, { manifest });
   assert.ok(validateRestoreBundle({ plan: planWithStaleKitDigest, kit }).some((v) => v.includes("plan.recoveryKitDigest does not match the supplied kit")));
+});
+
+// PR 3 (item 10): the restore-side equivalent of validateBackupBundle's
+// own identical addition above - a restore is exactly the operation that
+// will decrypt and TRUST this kit's contents, so id/digest bindings
+// alone (which a decoy can satisfy just as easily as a real kit) are
+// even less sufficient here than on the backup side.
+test("validateRestoreBundle: a schema-valid kit with the right bindings but a fake, non-age ciphertext is still refused - id/digest bindings alone are never sufficient", () => {
+  const fakeCiphertext = Buffer.from("not a real age payload, just long enough to clear the schema's own 200-char minLength requirement - 0123456789", "utf8");
+  const kit = buildRecoveryKit({ ciphertext: fakeCiphertext.toString("base64"), ciphertextDigest: sha256(fakeCiphertext) });
+  const manifest = buildRestoreManifest();
+  const plan = buildRestorePlan({ recoveryKitDigest: canonicalDocumentDigest(kit) }, { manifest });
+  const violations = validateRestoreBundle({ plan, kit });
+  assert.ok(violations.some((v) => v.includes("age-encryption.org/v1 magic header")), JSON.stringify(violations));
 });
 
 test("validateRestoreBundle: evidence.source/target are bound to the plan - a forged source or a target on a different host must be flagged", () => {

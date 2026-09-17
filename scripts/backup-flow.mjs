@@ -423,6 +423,14 @@ export function validateBackupBundle({ policy, plan, manifest, evidence, kit, lo
     if (manifest && manifest.recoveryKitDigest !== canonicalDocumentDigest(kit)) {
       violations.push("manifest.recoveryKitDigest does not match the supplied kit's own recomputed digest");
     }
+    // PR 3 (item 10): a kit that binds to the right plan/installation/
+    // generation is still only a decoy shaped like one unless it's also
+    // internally genuine - a schema-valid document with the right ids
+    // but a garbage (or missing-magic-header) ciphertext would otherwise
+    // sail through this bundle check untested. verifyRecoveryKit() is
+    // the actual, pure verifier (see its own comment); every bundle that
+    // carries a kit now runs it, not merely the id/digest bindings above.
+    violations.push(...verifyRecoveryKit(kit));
   }
 
   if (evidence) {
@@ -591,6 +599,11 @@ export function validateRestoreBundle({ plan, manifest, evidence, kit, lock, jou
     if (kit.installationId !== plan.source.installationId) violations.push("kit.installationId does not match plan.source.installationId");
     if (kit.createdForGeneration !== plan.source.generation) violations.push("kit.createdForGeneration does not match plan.source.generation");
     if (plan.recoveryKitDigest !== canonicalDocumentDigest(kit)) violations.push("plan.recoveryKitDigest does not match the supplied kit's own recomputed digest");
+    // PR 3 (item 10): see validateBackupBundle's own identical addition -
+    // a restore is exactly the operation that will decrypt and TRUST this
+    // kit's own contents, so binding checks alone (ids/digests) are even
+    // less sufficient here than on the backup side.
+    violations.push(...verifyRecoveryKit(kit));
   }
 
   if (evidence) {

@@ -212,6 +212,35 @@ value never reaches stdout, a log, or any generated file. `hofctl apply`
 is the only thing that ever reads the store's real values, to deliver
 them to the target's own fixed secret file paths.
 
+### Recovery kits (ADR 0006)
+
+An item 10 backup includes a recovery kit - a single, portable,
+age-encrypted document carrying application secrets, TLS private keys,
+and backup-destination credentials (its own typed store, see
+`scripts/backup-credentials.mjs`, deliberately separate from application
+secrets), so a genuine disaster (the workstation, the target, or both,
+gone) can still be recovered from an off-site snapshot alone.
+`scripts/recovery-kit.mjs`'s own `createRecoveryKit()`/`openRecoveryKit()`
+are the single typed boundary this ever passes through - no other code
+path in this repository ever touches this plaintext. As with
+`secrets ensure` above, `hofctl` never generates the matching private age
+identity itself: it must already exist, external to every artifact this
+platform produces, entirely in the operator's own keeping - a kit
+encrypted to a recipient nobody kept the matching identity for is
+unrecoverable by design, not a bug to work around. Building a kit
+requires `services.yml`'s own `tls.mode` to be `supplied`: `acme-http01`
+leaves no real private-key material on the workstation to recover at
+all, so recovery-kit creation refuses outright rather than silently
+producing a kit that omits TLS. Every artifact a kit carries provenance
+for (the sanitized manifest, the release lock, the backup-tool lock) is
+cryptographically bound to the trusted state generation it was assembled
+from - a digest mismatch against that generation's own recorded digests
+refuses kit creation outright, rather than letting stale or swapped
+artifacts into an otherwise well-formed kit. There is no `hofctl
+backup`/`hofctl restore` CLI yet, and no target-side runner - a recovery
+kit is currently a library-level primitive only, consumed directly by
+later items in this same delivery sequence.
+
 ## Planning a deployment
 
 `hofctl plan` is strictly read-only: it validates the deployment (schema,

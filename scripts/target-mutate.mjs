@@ -816,20 +816,40 @@ fi`);
 // the document ever reaches the target - see this file's own new import
 // comment on why this one boundary imports verifyRecoveryKit() despite
 // this module's own general "stay schema-free" preference.
-export async function publishRecoveryKit(conn, kitDocument, expectedDigest) {
-  if (!validateRecoveryKitSchema(kitDocument)) {
-    throw new Error(`refusing to publish a recovery kit that is not schema-valid: ${recoveryKitSchemaErrors()}`);
+//
+// PR 3 review (follow-up round), high finding: the check above only ever
+// covered the NEW kitDocument this call is trying to publish - a
+// HOF_RECOVERY_EXISTS response hands back whatever is ALREADY present on
+// the target, parsed and returned as `existing` with no validation of
+// its OWN at all, silently re-opening the exact gap the fix above closed
+// (a corrupt/foreign document already on disk would be returned as if it
+// were a real kit). Both this function's "existing" path and
+// readRecoveryKit()'s "present" path now share the one validator below,
+// so neither can ever hand back a document that isn't genuinely
+// schema-valid AND verifyRecoveryKit()-clean.
+function ensureValidRecoveryKitDocument(document, context) {
+  if (!validateRecoveryKitSchema(document)) {
+    throw new Error(`${context} is not schema-valid: ${recoveryKitSchemaErrors()} - refusing to return it as one`);
   }
-  const kitViolations = verifyRecoveryKit(kitDocument);
+  const kitViolations = verifyRecoveryKit(document);
   if (kitViolations.length > 0) {
-    throw new Error(`refusing to publish a recovery kit that failed verifyRecoveryKit(): ${kitViolations.join("; ")}`);
+    throw new Error(`${context} failed verifyRecoveryKit(): ${kitViolations.join("; ")} - refusing to return it as one`);
   }
+}
+
+export async function publishRecoveryKit(conn, kitDocument, expectedDigest) {
+  ensureValidRecoveryKitDocument(kitDocument, "refusing to publish a recovery kit that");
   validateDigest(expectedDigest);
   const stdout = await runScript(conn, publishRecoveryKitScript(b64(kitDocument), expectedDigest));
   const [tag, ...rest] = stdout.split("\n");
   if (tag === "HOF_RECOVERY_PUBLISHED") return { published: true };
   if (tag === "HOF_RECOVERY_EXISTS") {
-    return { published: false, existing: rest.join("\n").trim() ? JSON.parse(rest.join("\n")) : null };
+    const existingText = rest.join("\n").trim();
+    const existing = existingText ? JSON.parse(existingText) : null;
+    if (existing !== null) {
+      ensureValidRecoveryKitDocument(existing, `the recovery kit already present at ${RECOVERY_KIT_PATH}`);
+    }
+    return { published: false, existing };
   }
   if (tag === "HOF_RECOVERY_DIGEST_MISMATCH") {
     throw new Error("refusing to publish a recovery kit: the target's own recomputed digest of the received bytes did not match the expected canonical digest - a corrupted transfer, never silently accepted");
@@ -860,13 +880,7 @@ export async function readRecoveryKit(conn) {
   const stdout = await runScript(conn, readScript(RECOVERY_KIT_PATH));
   const { status, value } = parseReadResponse(stdout);
   if (status === "present") {
-    if (!validateRecoveryKitSchema(value)) {
-      throw new Error(`the recovery kit at ${RECOVERY_KIT_PATH} is not schema-valid: ${recoveryKitSchemaErrors()} - refusing to return it as one`);
-    }
-    const kitViolations = verifyRecoveryKit(value);
-    if (kitViolations.length > 0) {
-      throw new Error(`the recovery kit at ${RECOVERY_KIT_PATH} failed verifyRecoveryKit(): ${kitViolations.join("; ")} - refusing to return it as one`);
-    }
+    ensureValidRecoveryKitDocument(value, `the recovery kit at ${RECOVERY_KIT_PATH}`);
   }
   return { status, kit: value };
 }

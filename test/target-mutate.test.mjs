@@ -1110,6 +1110,27 @@ test("publishRecoveryKit: a target that already has a kit (any digest) is never 
   assert.deepEqual(result, { published: false, existing });
 });
 
+// PR 3 review (follow-up round), high finding: publishRecoveryKit()'s own
+// kitDocument validation (the "critical command-injection" test above)
+// covered only the NEW document a caller is trying to publish - a
+// HOF_RECOVERY_EXISTS response hands back whatever the TARGET already
+// has, parsed and returned as `existing` with no validation of its own
+// at all, silently re-opening the same gap readRecoveryKit()'s own fix
+// closed (below): a caller could receive a schema-valid-shaped but fake,
+// non-age `existing` document as if it were a real kit. Both paths now
+// share one ensureValidRecoveryKitDocument() helper - confirmed here with
+// the exact same fake-but-schema-valid fixture readRecoveryKit()'s own
+// regression test below uses.
+test("publishRecoveryKit: a schema-valid but fake, non-age EXISTING document is refused, not silently returned as `existing` - the same guarantee readRecoveryKit() makes, now also covering the HOF_RECOVERY_EXISTS path", async () => {
+  const kit = await realRecoveryKit();
+  const fakeExisting = schemaValidButFakeKit();
+  const { run } = mockRun({ sshStdout: `HOF_RECOVERY_EXISTS\n${JSON.stringify(fakeExisting)}` });
+  await assert.rejects(
+    () => publishRecoveryKit({ ...SSH_TARGET, run }, kit, transportDigest(kit)),
+    /failed verifyRecoveryKit/,
+  );
+});
+
 test("publishRecoveryKit: a real HOF_RECOVERY_DIGEST_MISMATCH response is refused with a clear, distinct error - never silently treated as success", async () => {
   const kit = await realRecoveryKit();
   const { run } = mockRun({ sshStdout: "HOF_RECOVERY_DIGEST_MISMATCH\n" });
@@ -1165,9 +1186,16 @@ test("readRecoveryKit: refuses a present document with the wrong apiVersion (sch
 // be handed back a schema-valid-shaped but fake (non-age) document as if
 // it were real. Both checks now run unconditionally on every "present"
 // result.
-test("readRecoveryKit: refuses a schema-valid but fake, non-age document - verifyRecoveryKit() now runs unconditionally on every present result", async () => {
+// Schema-valid (real apiVersion, all required fields, ciphertext base64
+// long enough to clear the schema's own 200-char minLength), but not a
+// genuine age payload at all - verifyRecoveryKit() is the only thing
+// that can ever tell the difference, by decoding `ciphertext` and
+// checking for age's own real binary-format magic header. Shared by both
+// readRecoveryKit()'s and publishRecoveryKit()'s own regression tests for
+// this same underlying guarantee (ensureValidRecoveryKitDocument()).
+function schemaValidButFakeKit() {
   const fakeCiphertext = Buffer.from("not a real age payload, padded well past the schema's own 200-char minLength requirement on the base64 form - 0123456789".repeat(2), "utf8");
-  const schemaValidButFakeKit = {
+  return {
     apiVersion: "hof.dev/recovery-kit/v1",
     installationId: "inst-1",
     createdAt: "2026-09-16T00:00:00Z",
@@ -1178,8 +1206,11 @@ test("readRecoveryKit: refuses a schema-valid but fake, non-age document - verif
     ciphertextDigest: `sha256:${createHash("sha256").update(fakeCiphertext).digest("hex")}`,
     ciphertext: fakeCiphertext.toString("base64"),
   };
+}
+
+test("readRecoveryKit: refuses a schema-valid but fake, non-age document - verifyRecoveryKit() now runs unconditionally on every present result", async () => {
   await assert.rejects(
-    () => readRecoveryKit({ ...SSH_TARGET, run: mockRun({ sshStdout: `HOF_MUTATE_PRESENT\n${JSON.stringify(schemaValidButFakeKit)}` }).run }),
+    () => readRecoveryKit({ ...SSH_TARGET, run: mockRun({ sshStdout: `HOF_MUTATE_PRESENT\n${JSON.stringify(schemaValidButFakeKit())}` }).run }),
     /failed verifyRecoveryKit/,
   );
 });

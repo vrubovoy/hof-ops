@@ -21,11 +21,13 @@ import { link, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { acquireExecutionLease, acquireLock, acquireLockAndJournal, acquireMutex, appendEvent, readCurrentState, readEvents, readGenerationSnapshot, readGenerationSnapshotReleaseLock, readGenerationSnapshotTopology, readJournal, readLock, readTopology, releaseLock, updateJournalStatus, writeJournal } from "../scripts/target-mutate.mjs";
+import { acquireExecutionLease, acquireLock, acquireLockAndJournal, acquireMutex, appendEvent, publishRecoveryKit, readCurrentState, readEvents, readGenerationSnapshot, readGenerationSnapshotReleaseLock, readGenerationSnapshotTopology, readJournal, readLock, readRecoveryKit, readTopology, releaseLock, updateJournalStatus, writeJournal } from "../scripts/target-mutate.mjs";
 
 const exec = promisify(execFile);
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const FAKE_PUBKEY_B64 = "AAAAC3NzaC1lZDI1NTE5AAAAIKPZsomeFakeButValidBase64Blob==";
 const HOST_KEY_SHA256 = "SHA256:" + createHash("sha256").update(Buffer.from(FAKE_PUBKEY_B64, "base64")).digest("base64").replace(/=+$/, "");
@@ -1029,4 +1031,159 @@ test("local mode: runs `sudo -n sh -s` directly, with no SSH/known_hosts machine
   assert.equal(calls.length, 1);
   assert.equal(calls[0].command, "sudo");
   assert.deepEqual(calls[0].args, ["-n", "sh", "-s"]);
+});
+
+// --- publishRecoveryKit / readRecoveryKit (item 10 PR 3) -----------------
+
+// publishRecoveryKit's own expectedDigest is a plain transport-integrity
+// digest over the EXACT bytes b64() transmits (JSON.stringify, insertion
+// order) - deliberately NOT backup-ids.mjs's own canonicalDocumentDigest
+// (key-sorted - a genuinely different byte string for any document whose
+// keys aren't already alphabetical, which real recovery-kit-v1 documents
+// never are). See publishRecoveryKitScript's own comment in
+// target-mutate.mjs for the real, confirmed mismatch this distinction
+// exists to prevent.
+function transportDigest(document) {
+  return `sha256:${createHash("sha256").update(Buffer.from(JSON.stringify(document), "utf8")).digest("hex")}`;
+}
+
+function fakeRecoveryKit(overrides = {}) {
+  return {
+    apiVersion: "hof.dev/recovery-kit/v1",
+    installationId: "inst-1",
+    createdAt: "2026-09-16T00:00:00Z",
+    createdForGeneration: 3,
+    ageRecipient: `age1${"q".repeat(58)}`,
+    ageRecipientFingerprint: `sha256:${"a".repeat(64)}`,
+    contentInventory: ["application-secrets"],
+    ciphertextDigest: `sha256:${"b".repeat(64)}`,
+    ciphertext: "Zm9v".repeat(60),
+    ...overrides,
+  };
+}
+
+test("publishRecoveryKit: embeds the kit as a base64 payload, a real target-side digest re-check, and runs inside the same lock guard every other atomic create in this module uses", async () => {
+  const kit = fakeRecoveryKit();
+  const expectedDigest = `sha256:${"c".repeat(64)}`;
+  const { run, calls } = mockRun({ sshStdout: "HOF_RECOVERY_PUBLISHED\n" });
+  const result = await publishRecoveryKit({ ...SSH_TARGET, run }, kit, expectedDigest);
+  assert.deepEqual(result, { published: true });
+  const script = calls.find((c) => c.command === "ssh").input;
+  assert.match(script, /exec 9>'.*lock\.flock'/, "must run inside the same LOCK_GUARD_PATH guard as every other atomic create");
+  assert.match(script, /mktemp '.*recovery-kit\.json\.XXXXXX'/, "must use the same mktemp+ln atomic-create discipline, never a fixed tmp name");
+  assert.match(script, /sha256sum/, "must recompute the received bytes' own digest target-side before ever committing the create");
+  assert.match(script, new RegExp(expectedDigest.replace(/[.+*?^${}()|[\]\\]/g, "\\$&")), "the caller's own expected digest must be embedded for the target-side comparison");
+});
+
+test("publishRecoveryKit: a target that already has a kit (any digest) is never silently overwritten - reports existing", async () => {
+  const kit = fakeRecoveryKit();
+  const existing = fakeRecoveryKit({ createdAt: "2020-01-01T00:00:00Z" });
+  const { run } = mockRun({ sshStdout: `HOF_RECOVERY_EXISTS\n${JSON.stringify(existing)}` });
+  const result = await publishRecoveryKit({ ...SSH_TARGET, run }, kit, `sha256:${"c".repeat(64)}`);
+  assert.deepEqual(result, { published: false, existing });
+});
+
+test("publishRecoveryKit: a real HOF_RECOVERY_DIGEST_MISMATCH response is refused with a clear, distinct error - never silently treated as success", async () => {
+  const { run } = mockRun({ sshStdout: "HOF_RECOVERY_DIGEST_MISMATCH\n" });
+  await assert.rejects(
+    () => publishRecoveryKit({ ...SSH_TARGET, run }, fakeRecoveryKit(), `sha256:${"c".repeat(64)}`),
+    /recomputed digest of the received bytes did not match/,
+  );
+});
+
+test("readRecoveryKit: present/unreadable/absent all parse distinctly, present validated for a real apiVersion", async () => {
+  const kit = fakeRecoveryKit();
+  const present = await readRecoveryKit({ ...SSH_TARGET, run: mockRun({ sshStdout: `HOF_MUTATE_PRESENT\n${JSON.stringify(kit)}` }).run });
+  assert.deepEqual(present, { status: "present", kit });
+  const unreadable = await readRecoveryKit({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_UNREADABLE\n" }).run });
+  assert.deepEqual(unreadable, { status: "unreadable", kit: null });
+  const absent = await readRecoveryKit({ ...SSH_TARGET, run: mockRun({ sshStdout: "HOF_MUTATE_ABSENT\n" }).run });
+  assert.deepEqual(absent, { status: "absent", kit: null });
+});
+
+test("readRecoveryKit: refuses a present document with the wrong apiVersion, rather than returning it as if it were a real recovery kit", async () => {
+  const wrongDoc = { apiVersion: "hof.dev/operation-lock/v2", operationId: OPERATION_ID };
+  await assert.rejects(
+    () => readRecoveryKit({ ...SSH_TARGET, run: mockRun({ sshStdout: `HOF_MUTATE_PRESENT\n${JSON.stringify(wrongDoc)}` }).run }),
+    /not a well-formed recovery-kit-v1 document/,
+  );
+});
+
+// item 10 PR3, real-target atomicity: the same real-shell-execution
+// pattern as "an orphaned hard-linked temp file..." above - capture the
+// REAL script publishRecoveryKit() would send (via mockRun's own
+// capture), path-substitute BOTH real prefixes this script touches
+// (LOCK_GUARD_PATH under /var/lib/hof/state, RECOVERY_KIT_PATH under
+// /var/lib/hof/recovery) for one shared scratch directory, and run that
+// exact script for real. Never touches the real target path, needs no
+// root.
+test("publishRecoveryKit: a real atomic create - first publish succeeds, a second publish (any content) is refused as existing, root-only permissions, no plaintext ever written", async () => {
+  const scratchDir = await mkdtemp(path.join(tmpdir(), "hof-recovery-kit-atomicity-"));
+  try {
+    const kit = fakeRecoveryKit();
+    const expectedDigest = transportDigest(kit);
+
+    const first = mockRun({ sshStdout: "HOF_RECOVERY_PUBLISHED\n" });
+    await publishRecoveryKit({ ...SSH_TARGET, run: first.run }, kit, expectedDigest);
+    const firstScript = first.calls.find((c) => c.command === "ssh").input
+      .replaceAll("/var/lib/hof/state", scratchDir)
+      .replaceAll("/var/lib/hof/recovery", scratchDir);
+    await exec("sh", ["-c", firstScript]);
+
+    const kitPath = path.join(scratchDir, "recovery-kit.json");
+    assert.equal(await readFile(kitPath, "utf8"), JSON.stringify(kit));
+    const stat = await (await import("node:fs/promises")).stat(kitPath);
+    assert.equal((stat.mode & 0o777).toString(8), "600", "the kit file must be root-only (0600), never group/world-readable");
+
+    // A second, DIFFERENT kit must never silently replace the first.
+    const secondKit = fakeRecoveryKit({ createdAt: "2030-01-01T00:00:00Z" });
+    const secondDigest = transportDigest(secondKit);
+    const second = mockRun({ sshStdout: "HOF_RECOVERY_PUBLISHED\n" });
+    await publishRecoveryKit({ ...SSH_TARGET, run: second.run }, secondKit, secondDigest);
+    const secondScript = second.calls.find((c) => c.command === "ssh").input
+      .replaceAll("/var/lib/hof/state", scratchDir)
+      .replaceAll("/var/lib/hof/recovery", scratchDir);
+    await exec("sh", ["-c", secondScript]);
+
+    assert.equal(await readFile(kitPath, "utf8"), JSON.stringify(kit), "the original kit must still be the one on disk - never silently replaced by a later, different publish");
+    const remaining = await readdir(scratchDir);
+    assert.ok(!remaining.some((name) => name.startsWith("recovery-kit.json.") && name !== "recovery-kit.json"), `no stray recovery-kit tmp files should remain: ${remaining.join(", ")}`);
+  } finally {
+    await rm(scratchDir, { recursive: true, force: true });
+  }
+});
+
+// item 10 PR3, secret-leak regression guard: a real recovery kit, built
+// with a genuine (fake-seam) age encryption around a recognizable,
+// distinctive plaintext secret value, must never leave that plaintext
+// value anywhere in the generated script text - only its already-
+// encrypted, base64 ciphertext form. Proves the whole
+// createRecoveryKit -> publishRecoveryKit pipeline, not just this one
+// function's own script-building in isolation.
+test("publishRecoveryKit: the generated script carries the kit's own ciphertext only - a real secret value the kit was built around never appears anywhere in it, plaintext", async () => {
+  const { createRecoveryKit } = await import("../scripts/recovery-kit.mjs");
+  const fakeAgeDir = path.join(root, "test/fixtures/recovery-kit-fake-age");
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${fakeAgeDir}${path.delimiter}${originalPath}`;
+  const distinctiveSecret = "hof-test-distinctive-plaintext-marker-9f3c7a1e";
+  let kit;
+  try {
+    kit = await createRecoveryKit({
+      payload: {
+        installationId: "inst-1", generation: 1, sanitizedManifest: {},
+        releaseLock: { document: {}, signature: "s", certificate: "c", signingIdentity: "i", oidcIssuer: "o" },
+        backupToolLock: { document: {}, signature: "s", certificate: "c", signingIdentity: "i", oidcIssuer: "o" },
+        applicationSecrets: { marker: distinctiveSecret }, destinationCredentials: {},
+      },
+      ageRecipient: `age1${"q".repeat(58)}`,
+    });
+  } finally {
+    process.env.PATH = originalPath;
+  }
+  const expectedDigest = transportDigest(kit);
+  const { run, calls } = mockRun({ sshStdout: "HOF_RECOVERY_PUBLISHED\n" });
+  await publishRecoveryKit({ ...SSH_TARGET, run }, kit, expectedDigest);
+  const script = calls.find((c) => c.command === "ssh").input;
+  assert.doesNotMatch(script, new RegExp(distinctiveSecret), "the real plaintext secret must never appear in the generated script, only its encrypted ciphertext form");
+  assert.match(script, new RegExp(Buffer.from(JSON.stringify(kit)).toString("base64").slice(0, 40)), "the kit's own (already-encrypted) base64 payload must be the thing actually embedded");
 });

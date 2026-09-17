@@ -437,6 +437,45 @@ third review round found nothing bound a kit's own `installationId`/
 digest to the `recoveryKitDigest` a plan/manifest declares.
 `validateBackupBundle()`/`validateRestoreBundle()` now accept an
 optional `kit` and check exactly that.
+**Implemented in PR 3 (item 10) as `scripts/recovery-kit.mjs`'s
+`createRecoveryKit()`/`openRecoveryKit()`** - the single typed boundary
+every application secret, TLS private key, and backup-destination
+credential this platform ever puts into a recovery kit passes through,
+and nowhere else. Encrypts/decrypts by shelling out to a real, pinned
+`age` binary (never a bundled crypto library - matching
+`backup-tool-lock-v1`'s own `pinnedTools.age`), to the external recipient
+alone, never also to the operator's own day-to-day key the way
+`scripts/secrets.mjs`'s own `writeSecretsStore()` does for application
+secrets. `assembleRecoveryPayload()` builds the closed plaintext payload
+from already-existing, already-validated inputs - `readSecretsStore()`
+for application secrets (filtered to exactly what the current
+manifest/enabledIds actually require, never a whole, possibly-stale
+store), `scripts/supplied-tls.mjs`'s own `readSuppliedTlsMaterial()` for
+TLS (which requires `manifest.tls.mode === "supplied"`; `acme-http01` has
+no real private-key material on the workstation at all, so recovery-kit
+creation is refused before any encryption ever happens - a fixed,
+deliberate limitation this PR does not yet address), and a caller-
+supplied trusted `state-v1` document for `installationId`/`generation`
+(never accepted as free-standing metadata a caller could pass
+inconsistently). `scripts/backup-credentials.mjs` is a second, genuinely
+separate typed store for backup-destination credentials (`resticPassword`
+plus, for `s3`, `accessKeyId`/`secretAccessKey`/an optional
+`sessionToken`) - deliberately not folded into `secrets.mjs`'s own
+application-secrets vocabulary, since the two serve unrelated lifecycles
+and a name collision between them must never be possible.
+`scripts/target-mutate.mjs` gained a matching atomic, root-only
+target-side primitive (`publishRecoveryKit()`/`readRecoveryKit()`, under
+`/var/lib/hof/recovery/`) using the exact same mktemp+ln atomic-create
+discipline `acquireLockAndJournalScript()` already established, plus a
+target-side re-verified transport-integrity digest (distinct from, and in
+addition to, `verifyRecoveryKit()`'s own internal-consistency check)
+before ever committing the write - a publish while a kit is already
+present is always refused outright, whether the existing kit is
+byte-identical or genuinely different; rotation is always an explicit,
+out-of-band decision a later PR's runner makes, never an implicit side
+effect of calling this again. No executor, runner, Ansible role, systemd
+unit, or `hofctl backup`/`hofctl restore` CLI surface exists yet - PR 3
+delivers primitives only, exactly as PR 2 did for the mutex.
 
 **Backup Flow - the fixed, typed operation whitelist
 `backup-plan-v1.schema.json` encodes.** Planning-time (never dispatched

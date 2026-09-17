@@ -33,7 +33,8 @@
 //     journal's terminal status is never rewritten - a retry is always a
 //     fresh operationId, see operation-journal-v2.schema.json's own
 //     status description).
-//   - assertBundleBinding - runs scripts/backup-flow.mjs's own
+//   - assertBundleBinding - runs assertPlanValid() (below) against
+//     bundle.plan, THEN scripts/backup-flow.mjs's own
 //     validateBackupBundle()/validateRestoreBundle() over whatever
 //     subset of {policy, plan, manifest, evidence, kit, lock, journal,
 //     events} a caller is about to write, throwing on any violation.
@@ -41,6 +42,18 @@
 //     v1's own cross-document invariants are enforced by prose and by
 //     apply.mjs's own inline checks, never by a shared, reusable
 //     validator every write path can be routed through.
+//   - assertPlanValid - schema-validates a backup/restore plan against
+//     backup-plan-v1/restore-plan-v1 AND runs backup-flow.mjs's own
+//     validateBackupPlanOperations()/validateRestorePlanOperations()
+//     (flow completeness/ordering - a pre-PR4 review found nothing in
+//     this module ever ran either check, so a plan's own operations
+//     array could be incomplete or wrongly ordered and still pass every
+//     v2 write gate). Runs automatically inside assertBundleBinding()
+//     above, so every write (and, since writeJournalStatus/writeEvent
+//     re-validate the PERSISTED journal's own plan on every call, every
+//     resume) is covered without a separate call; also exported on its
+//     own for a later PR's planner to validate a candidate plan before
+//     ever proposing it for approval.
 
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -50,7 +63,7 @@ import { fileURLToPath } from "node:url";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 
-import { validateBackupBundle, validateRestoreBundle } from "./backup-flow.mjs";
+import { validateBackupBundle, validateBackupPlanOperations, validateRestoreBundle, validateRestorePlanOperations } from "./backup-flow.mjs";
 import { currentOperator, newOperationId } from "./operation-journal.mjs";
 
 export { currentOperator, newOperationId };
@@ -62,12 +75,17 @@ async function loadValidators() {
   validators ??= await (async () => {
     const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false });
     addFormats(ajv);
-    const [lock, journal, event] = await Promise.all([
+    const [lock, journal, event, backupPlan, restorePlan] = await Promise.all([
       readFile(path.join(root, "schemas/operation-lock-v2.schema.json"), "utf8").then(JSON.parse),
       readFile(path.join(root, "schemas/operation-journal-v2.schema.json"), "utf8").then(JSON.parse),
       readFile(path.join(root, "schemas/operation-event-v2.schema.json"), "utf8").then(JSON.parse),
+      readFile(path.join(root, "schemas/backup-plan-v1.schema.json"), "utf8").then(JSON.parse),
+      readFile(path.join(root, "schemas/restore-plan-v1.schema.json"), "utf8").then(JSON.parse),
     ]);
-    return { lock: ajv.compile(lock), journal: ajv.compile(journal), event: ajv.compile(event) };
+    return {
+      lock: ajv.compile(lock), journal: ajv.compile(journal), event: ajv.compile(event),
+      backupPlan: ajv.compile(backupPlan), restorePlan: ajv.compile(restorePlan),
+    };
   })();
   return validators;
 }
@@ -102,6 +120,38 @@ export function assertJournalValid(journal) {
 
 export function assertEventValid(event) {
   return assertReadValid("event", event);
+}
+
+// PR 3 review, "pre-PR4 gap" finding: assertBundleBinding() below ran
+// backup-flow.mjs's own validateBackupBundle()/validateRestoreBundle() -
+// cross-document id/digest bindings - but NOTHING in this module ever
+// schema-validated the plan itself against backup-plan-v1/restore-plan-v1,
+// nor ever called validateBackupPlanOperations()/
+// validateRestorePlanOperations() (the flow-completeness/ordering
+// validators - see backup-flow.mjs's own comment on them). A schema-valid
+// LOCK/JOURNAL/EVENT wrapped around a plan whose own operations array was
+// incomplete, wrongly ordered, or carried a duplicate step could still
+// sail through every v2 write gate (writeLockAndJournal/
+// writeJournalStatus/writeEvent all route through assertBundleBinding()
+// below) undetected - the plan-level semantic contract this ADR's own
+// Decision text describes was never actually enforced at the one choke
+// point every v2 write already goes through. Exported on its own,
+// matching assertLockValid/assertJournalValid/assertEventValid's own
+// style, so a later PR's planner (`hofctl backup plan`, in particular)
+// can validate a freshly-built candidate plan before ever proposing it
+// for approval, not only at write time.
+export async function assertPlanValid(operationKind, plan) {
+  requireOperationKind(operationKind, "assertPlanValid");
+  const kind = operationKind === "backup" ? "backupPlan" : "restorePlan";
+  const { [kind]: validate } = await loadValidators();
+  if (!validate(plan)) {
+    throw new Error(`the ${operationKind} plan does not satisfy schemas/${operationKind}-plan-v1.schema.json: ${JSON.stringify(validate.errors)}`);
+  }
+  const violations = operationKind === "backup" ? validateBackupPlanOperations(plan) : validateRestorePlanOperations(plan);
+  if (violations.length > 0) {
+    throw new Error(`refusing to trust this ${operationKind} plan: its own operations sequence is incoherent: ${violations.join("; ")}`);
+  }
+  return plan;
 }
 
 // Lets a caller distinguish "this is a genuine, schema-valid v2
@@ -208,7 +258,9 @@ export async function buildEvent({ operationKind, operationId, step, attempt, ph
   return assertValid("event", event);
 }
 
-// Runs scripts/backup-flow.mjs's own validateBackupBundle()/
+// First runs assertPlanValid() above against bundle.plan (a pre-PR4
+// review found this never ran anywhere - see that function's own
+// comment), THEN scripts/backup-flow.mjs's own validateBackupBundle()/
 // validateRestoreBundle() over whatever subset of the bundle a caller
 // is about to write, and throws on any violation - the "before every
 // write" gate PR 2's own plan calls for, that v1 has no equivalent of.
@@ -219,7 +271,10 @@ export async function buildEvent({ operationKind, operationId, step, attempt, ph
 // each validator simply ignores fields it doesn't know about, the same
 // way it already does when a caller supplies a partial bundle for an
 // in-progress operation that doesn't have a manifest/evidence yet).
-export function assertBundleBinding(operationKind, bundle) {
+export async function assertBundleBinding(operationKind, bundle) {
+  if (bundle.plan) {
+    await assertPlanValid(operationKind, bundle.plan);
+  }
   const violations = operationKind === "backup" ? validateBackupBundle(bundle) : validateRestoreBundle(bundle);
   if (violations.length > 0) {
     throw new Error(`refusing to write: this ${operationKind} operation's own bundle binding is violated: ${violations.join("; ")}`);
@@ -301,7 +356,7 @@ export async function writeLockAndJournal(mutate, conn, lease, { operationKind, 
   await assertLeaseHealthy(lease);
   await assertLockValid(lockDoc);
   await assertJournalValid(journalDoc);
-  assertBundleBinding(operationKind, { ...bundle, plan: journalDoc.plan, lock: lockDoc, journal: journalDoc });
+  await assertBundleBinding(operationKind, { ...bundle, plan: journalDoc.plan, lock: lockDoc, journal: journalDoc });
   return mutate.acquireLockAndJournal(conn, lockDoc, journalDoc, lease.token);
 }
 
@@ -348,7 +403,7 @@ export async function writeJournalStatus(mutate, conn, lease, { operationKind, j
     }
   }
 
-  assertBundleBinding(operationKind, { ...bundle, plan: journal.plan, journal });
+  await assertBundleBinding(operationKind, { ...bundle, plan: journal.plan, journal });
   return mutate.updateJournalStatus(conn, journal, lease.token, persisted);
 }
 
@@ -404,7 +459,7 @@ export async function writeEvent(mutate, conn, lease, { operationKind, operation
   if (persisted.status !== "in-progress") {
     throw new Error(`refusing to write: the persisted journal for operation ${operationId} is already terminal (status: ${persisted.status}) - no further events are ever appended once an operation has genuinely finished`);
   }
-  assertBundleBinding(operationKind, { plan: persisted.plan, journal: persisted });
+  await assertBundleBinding(operationKind, { plan: persisted.plan, journal: persisted });
   if (event.operationId !== operationId) {
     throw new Error(`refusing to write: event.operationId (${event.operationId}) does not match the operationId this write is for (${operationId}) - refusing a possible operation-id substitution`);
   }
